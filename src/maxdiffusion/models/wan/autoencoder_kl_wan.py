@@ -554,7 +554,13 @@ class WanAttentionBlock(nnx.Module):
     k = jnp.transpose(k, (0, 1, 3, 2))
     v = jnp.transpose(v, (0, 1, 3, 2))
 
+    # dot_product_attention axes are (B, T, heads, D): sequence is H*W (not 1),
+    # one head, head_dim = channels. q/k/v are (bt, 1, hw, c) here.
+    q = jnp.transpose(q, (0, 2, 1, 3))
+    k = jnp.transpose(k, (0, 2, 1, 3))
+    v = jnp.transpose(v, (0, 2, 1, 3))
     x = jax.nn.dot_product_attention(q, k, v)
+    x = jnp.transpose(x, (0, 2, 1, 3))
     x = jnp.squeeze(x, 1).reshape(batch_size * time, height, width, channels)
 
     # output projection
@@ -1288,8 +1294,9 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
 
     # First chunk (i=0)
     with jax.named_scope("AutoencoderKLWan_decode_chunk_0"):
+      chunk_in_0 = x[:, 0:1, ...]
       if spatial_sharding is not None:
-        chunk_in_0 = jax.lax.with_sharding_constraint(x[:, 0:1, ...], spatial_sharding)
+        chunk_in_0 = jax.lax.with_sharding_constraint(chunk_in_0, spatial_sharding)
       out_0, dec_feat_map, _ = self.decoder(chunk_in_0, feat_cache=dec_feat_map, feat_idx=0)
       if spatial_sharding is not None:
         out_0 = jax.lax.with_sharding_constraint(out_0, spatial_sharding)
@@ -1297,8 +1304,9 @@ class AutoencoderKLWan(nnx.Module, FlaxModelMixin, ConfigMixin):
     if iter_ > 1:
       # Run chunk 1 outside scan to properly form the cache shape
       with jax.named_scope("AutoencoderKLWan_decode_chunk_1"):
+        chunk_in_1 = x[:, 1:2, ...]
         if spatial_sharding is not None:
-          chunk_in_1 = jax.lax.with_sharding_constraint(x[:, 1:2, ...], spatial_sharding)
+          chunk_in_1 = jax.lax.with_sharding_constraint(chunk_in_1, spatial_sharding)
         out_chunk_1, dec_feat_map, _ = self.decoder(chunk_in_1, feat_cache=dec_feat_map, feat_idx=0)
         if spatial_sharding is not None:
           out_chunk_1 = jax.lax.with_sharding_constraint(out_chunk_1, spatial_sharding)
