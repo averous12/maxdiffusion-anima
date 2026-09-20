@@ -148,6 +148,13 @@ class FlaxAnimaCosmosTransformer(nn.Module):
       padding_mask = jnp.zeros((b, 1, h, w), dtype=hidden_states.dtype)
     if padding_mask.ndim == 3:
       padding_mask = padding_mask[:, None, :, :]
+    # Reference takes the image-resolution mask and nearest-resizes it to the
+    # latent grid before concatenating (transformer_cosmos.py). Accept either.
+    if padding_mask.shape[-2:] != (h, w):
+      ph, pw = padding_mask.shape[-2:]
+      assert ph % h == 0 and pw % w == 0, (padding_mask.shape, (h, w))
+      sh, sw = ph // h, pw // w
+      padding_mask = padding_mask[:, :, : h * sh : sh, : w * sw : sw]
     padding_channel = jnp.repeat(padding_mask[:, :, None, :, :], t, axis=2)
     x = jnp.concatenate([hidden_states, padding_channel], axis=1)
     tokens = cosmos_patchify(x, self.patch_size)
