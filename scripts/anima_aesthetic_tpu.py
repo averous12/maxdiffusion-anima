@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 
 repo = "/content/maxdiffusion"
 venv = repo + "/.venv"
@@ -250,7 +251,5 @@ log(f"WARM {STEPS}-step CFG: {warm:.1f}s = {60.0/warm:.2f} images/min")
 log(f"ALL_DONE total {(time.perf_counter()-t_all)/60:.1f} min")
 '''
 r = subprocess.run([py, "-u", "-c", code], cwd=repo, env=env,
-                   capture_output=True, text=True, timeout=1750)
-print(r.stdout[-5000:])
-print(r.stderr[-2500:])
-print("returncode", r.returncode)
+                   capture_output=False, text=True, timeout=1750)
+print("returncode", r.returncode, flush=True)
