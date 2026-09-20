@@ -153,10 +153,12 @@ else:
 del cv
 gc.collect()
 
-t0 = time.perf_counter()
+log("SERVER: building transformer module...")
 transformer = FlaxAnimaCosmosTransformer(layers=28)
+log("SERVER: transformer module built; initializing dummy variables...")
 tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.bfloat16),
                       jnp.zeros((1,), jnp.bfloat16), jnp.zeros((1, 8, 1024), jnp.bfloat16))
+log("SERVER: transformer dummy init complete")
 t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
 if _cache_valid(t_cache, aesthetic_path, aes_mtime):
     log("transformer: loading from disk cache ...")
@@ -176,6 +178,7 @@ else:
 del tv
 gc.collect()
 
+log("SERVER: transformer params ready; building VAE...")
 t0 = time.perf_counter()
 vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
 vae_marker = os.path.join(snapshot_dir, "vae", "diffusion_pytorch_model.safetensors")
