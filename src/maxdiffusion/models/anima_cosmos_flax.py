@@ -141,6 +141,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   adaln_dim: int = 256
   patch_size: Tuple[int, int, int] = (1, 2, 2)
   rope_scale: Tuple[float, float, float] = (1.0, 4.0, 4.0)
+  active_layers: Optional[int] = None
   @nn.compact
   def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None, padding_mask=None):
     b, c, t, h, w = hidden_states.shape
@@ -174,6 +175,8 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     grid = (t // self.patch_size[0], h // self.patch_size[1], w // self.patch_size[2])
     cos, sin = cosmos_rope(x.shape[1], self.head_dim, x.dtype, self.rope_scale, grid)
     for i in range(self.layers):
+      if self.active_layers is not None and i >= self.active_layers:
+        break
       x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
     # norm_out (CosmosAdaLayerNorm): silu -> lin1 -> lin2(2*hidden), + temb[..., :2h], chunk2
     y = nn.silu(embedded_timestep)
@@ -191,7 +194,7 @@ def _transpose_weight(value):
   return value.T if value.ndim == 2 else value
 
 
-def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28):
+def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True):
   """Strictly map Diffusers Cosmos/Anima names to this Flax module."""
   from safetensors import safe_open
   flat = flatten_dict(flax_params)
@@ -229,6 +232,6 @@ def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat
       put((t, "ff_in", "kernel"), f"{s}.ff.net.0.proj.weight")
       put((t, "ff_out", "kernel"), f"{s}.ff.net.2.weight")
     extras = available - consumed
-    if extras:
+    if strict and extras:
       raise ValueError(f"Unconsumed official transformer keys: {sorted(extras)[:10]}")
   return unflatten_dict(converted)
