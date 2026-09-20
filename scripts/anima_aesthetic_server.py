@@ -156,8 +156,8 @@ gc.collect()
 log("SERVER: building transformer module...")
 transformer = FlaxAnimaCosmosTransformer(layers=28)
 log("SERVER: transformer module built; initializing dummy variables...")
-tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.bfloat16),
-                      jnp.zeros((1,), jnp.bfloat16), jnp.zeros((1, 8, 1024), jnp.bfloat16))
+tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.float32),
+                      jnp.zeros((1,), jnp.float32), jnp.zeros((1, 8, 1024), jnp.float32))
 log("SERVER: transformer dummy init complete")
 t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
 if _cache_valid(t_cache, aesthetic_path, aes_mtime):
