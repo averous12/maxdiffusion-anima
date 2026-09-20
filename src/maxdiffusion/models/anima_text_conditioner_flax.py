@@ -46,7 +46,10 @@ class FlaxAnimaTextConditioner(nn.Module):
   def __call__(self,source_hidden_states,target_input_ids,source_attention_mask=None,target_attention_mask=None):
     c=self.config; x=nn.Embed(c.target_vocab_size,c.target_dim,dtype=c.dtype,param_dtype=c.param_dtype,name='embed')(target_input_ids)
     for i in range(c.num_layers): x=_Block(c,name=f'blocks_{i}')(x,source_hidden_states,target_attention_mask,source_attention_mask)
-    x=nn.Dense(c.target_dim,use_bias=True,dtype=c.dtype,param_dtype=c.param_dtype,name='out_proj')(x); x=_RMSNorm(c.target_dim,name='norm')(x); pad=max(0,c.min_sequence_length-x.shape[1]); return jnp.pad(x,((0,0),(0,pad),(0,0)))[:,:c.min_sequence_length,:]
+    x=nn.Dense(c.target_dim,use_bias=True,dtype=c.dtype,param_dtype=c.param_dtype,name='out_proj')(x); x=_RMSNorm(c.target_dim,name='norm')(x)
+    if target_attention_mask is not None:
+      x=x*target_attention_mask.astype(x.dtype)[...,None]
+    pad=max(0,c.min_sequence_length-x.shape[1]); return jnp.pad(x,((0,0),(0,pad),(0,0)))[:,:c.min_sequence_length,:]
 def load_and_convert_anima_text_conditioner_weights(path,params,dtype=jnp.bfloat16):
   from safetensors import safe_open
   flat=flatten_dict(params); out={}
