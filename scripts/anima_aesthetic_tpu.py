@@ -23,6 +23,9 @@ log("=== STAGE 0: imports ===")
 import os
 import numpy as np
 import gc
+import traceback
+import faulthandler
+faulthandler.dump_traceback_later(600, exit=True)
 import jax
 # Keep default TPU matmul precision for production-speed measurements.
 import jax.numpy as jnp
@@ -98,7 +101,8 @@ qwen_cfg = FlaxQwen3Config(
 qwen3_model = FlaxQwen3Model(qwen_cfg)
 qv = qwen3_model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32), jnp.zeros((1, 8), jnp.int32))
 qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qwen_cfg)
-del qv, qwen3_model
+qwen3_params_host = jax.tree_util.tree_map(np.asarray, qwen3_params)
+del qv, qwen3_model, qwen3_params
 gc.collect()
 log(f"qwen3 converted in {time.perf_counter()-t0:.1f}s")
 
@@ -120,7 +124,12 @@ tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.bfloat1
 log(f"transformer: init done in {time.perf_counter()-t0:.1f}s")
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
 log(f"transformer: converting 685 aesthetic keys from {aesthetic_path} ...")
-t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
+log(f"transformer: file size {os.path.getsize(aesthetic_path)/1e9:.2f} GB, tv leaves {len(jax.tree_util.tree_leaves(tv['params']))}")
+try:
+    t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
+except Exception:
+    log("transformer: conversion raised:\n" + traceback.format_exc())
+    raise
 log("transformer: conversion done")
 del tv
 gc.collect()
