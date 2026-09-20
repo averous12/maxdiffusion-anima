@@ -216,6 +216,20 @@ try:
     _lat.block_until_ready()
     del wqe, wqm, wt5, wt5m, wne, wnm, wnt5, wnt5m, wctx, wnctx, _lat, _pad, _pred
     gc.collect()
+    log("warmup: transformer done; warming VAE decode at 1024 (one-time XLA compile) ...")
+    _w0 = time.perf_counter()
+    _wz = jnp.zeros((1, 16, 1, 128, 128), dtype=jnp.bfloat16)
+    _wlm = jnp.array(vae.latents_mean, dtype=_wz.dtype).reshape(1, 16, 1, 1, 1)
+    _wls = jnp.array(vae.latents_std, dtype=_wz.dtype).reshape(1, 16, 1, 1, 1)
+    _wzz = _wz / (1.0 / _wls) + _wlm
+    _wg, _ws, _wr = nnx.split(vae, nnx.Param, ...)
+    _wm = nnx.merge(_wg, _ws, _wr)
+    _wv = _wm.decode(_wzz, AutoencoderKLWanCache(_wm), return_dict=False)[0]
+    _wv = jnp.clip(_wv / 2.0 + 0.5, 0.0, 1.0)
+    _wv.block_until_ready()
+    log(f"vae warmup done in {time.perf_counter()-_w0:.1f}s; out {tuple(_wv.shape)} mean {float(_wv.mean()):.4f}")
+    del _wz, _wlm, _wls, _wzz, _wg, _ws, _wr, _wm, _wv
+    gc.collect()
     log("warmup done; executables compiled")
 except Exception:
     log("warmup raised:\n" + traceback.format_exc())
@@ -300,6 +314,7 @@ while True:
         latents.block_until_ready()
         write_prog(stage="decode", step=STEPS, steps=STEPS)
         denoise_s = time.perf_counter() - g0
+        v0 = time.perf_counter()
         lmean = jnp.array(vae.latents_mean, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
         lstd = jnp.array(vae.latents_std, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
         z = latents / (1.0 / lstd) + lmean
@@ -317,7 +332,8 @@ while True:
         from PIL import Image
         Image.fromarray(img_u8).save(OUT)
         total_s = time.perf_counter() - g0
-        log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s) = {60.0/total_s:.2f} images/min")
+        decode_s = time.perf_counter() - v0
+        log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s, decode {decode_s:.1f}s) = {60.0/total_s:.2f} images/min")
         write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT, elapsed_s=round(total_s, 1))
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}, open(REQ_PATH, "w"))
     except Exception:
