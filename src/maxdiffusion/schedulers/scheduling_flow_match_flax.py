@@ -112,6 +112,7 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
       denoising_strength: float = 1.0,
       training: bool = False,
       shift: Optional[float] = None,
+      sigmas: Optional[jnp.ndarray] = None,
   ) -> FlowMatchSchedulerState:
     """
     Sets the discrete timesteps used for the diffusion chain.
@@ -129,17 +130,27 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
             Whether the scheduler is being used for training.
         shift (`Optional[float]`):
             An optional shift value to override the one in the config.
+        sigmas (`Optional[jnp.ndarray]`):
+            Custom raw sigmas (pre-shift), mirroring the diffusers
+            `FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=...)` path used by the
+            Anima pipeline (`linspace(1.0, 1/num_steps, num_steps)`). When given,
+            `num_inference_steps` is derived from their length.
 
     Returns:
         `FlowMatchSchedulerState`: The updated scheduler state.
     """
     current_shift = shift if shift is not None else self.config.shift
-    sigma_start = self.config.sigma_min + (self.config.sigma_max - self.config.sigma_min) * denoising_strength
-
-    if self.config.extra_one_step:
-      sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps + 1, dtype=self.dtype)[:-1]
+    if sigmas is not None:
+      sigmas = jnp.asarray(sigmas, dtype=self.dtype)
+      num_inference_steps = sigmas.shape[0]
+      sigma_start = None
     else:
-      sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps, dtype=self.dtype)
+      sigma_start = self.config.sigma_min + (self.config.sigma_max - self.config.sigma_min) * denoising_strength
+
+      if self.config.extra_one_step:
+        sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps + 1, dtype=self.dtype)[:-1]
+      else:
+        sigmas = jnp.linspace(sigma_start, self.config.sigma_min, num_inference_steps, dtype=self.dtype)
 
     if self.config.inverse_timesteps:
       sigmas = jnp.flip(sigmas, dims=[0])
@@ -155,7 +166,15 @@ class FlaxFlowMatchScheduler(FlaxSchedulerMixin, ConfigMixin):
     if self.config.reverse_sigmas:
       sigmas = 1 - sigmas
 
+    # Diffusers' FlowMatchEulerDiscreteScheduler keeps N denoising
+    # timesteps but appends one terminal sigma for the final Euler step.
+    # Without this sentinel, the final step can index past the schedule.
     timesteps = sigmas * self.config.num_train_timesteps
+    terminal_sigma = jnp.asarray(
+        1.0 if (self.config.inverse_timesteps or self.config.reverse_sigmas) else 0.0,
+        dtype=self.dtype,
+    )
+    sigmas = jnp.concatenate([sigmas, terminal_sigma[None]], axis=0)
 
     linear_timesteps_weights = None
     if training:
