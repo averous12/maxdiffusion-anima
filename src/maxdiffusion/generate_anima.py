@@ -75,7 +75,7 @@ def encode_texts(prompts, snapshot_dir, max_qwen_len=512, max_t5_len=512):
         prompt, padding="max_length", max_length=max_t5_len, truncation=True, return_tensors="pt"
       )
       out.append(
-        (qwen_embeds.cpu().numpy(), text_inputs.attention_mask.cpu().numpy(), t5_inputs.input_ids.cpu().numpy())
+        (qwen_embeds.cpu().numpy(), text_inputs.attention_mask.cpu().numpy(), t5_inputs.input_ids.cpu().numpy(), t5_inputs.attention_mask.cpu().numpy())
       )
   del text_encoder
   gc.collect()
@@ -175,17 +175,20 @@ def main(argv):
   prompts = [config.prompt]
   neg_prompts = [config.negative_prompt]
   texts = encode_texts(prompts + neg_prompts, snapshot_dir)
-  (qwen_embeds, qwen_mask, t5_ids) = texts[0]
-  (neg_embeds, neg_mask, neg_t5_ids) = texts[1]
-  _ = qwen_mask, neg_mask  # masks already folded into embeds per reference
+  (qwen_embeds, qwen_mask, t5_ids, t5_mask) = texts[0]
+  (neg_embeds, neg_mask, neg_t5_ids, neg_t5_mask) = texts[1]
+  _ = qwen_mask, neg_mask
 
   trace: dict = {}
   img = pipeline(
     jnp.asarray(qwen_embeds, dtype=jnp.bfloat16),
     jnp.asarray(qwen_mask),
     jnp.asarray(neg_embeds, dtype=jnp.bfloat16),
+    jnp.asarray(neg_mask),
     t5_ids,
+    t5_mask,
     neg_t5_ids,
+    neg_t5_mask,
     height=config.height,
     width=config.width,
     num_inference_steps=config.num_inference_steps,

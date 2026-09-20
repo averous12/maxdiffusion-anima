@@ -85,11 +85,13 @@ class FlaxAnimaPipeline:
       return (last_hidden * mask.astype(last_hidden.dtype)[..., None]).astype(self.dtype)
 
     @jax.jit
-    def conditioner_forward(c_params, source_hidden, target_ids):
+    def conditioner_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
       return self.conditioner.apply(
         {"params": c_params},
         source_hidden_states=source_hidden,
         target_input_ids=target_ids,
+        source_attention_mask=source_mask,
+        target_attention_mask=target_mask,
       ).astype(self.dtype)
 
     @jax.jit
@@ -138,9 +140,21 @@ class FlaxAnimaPipeline:
     out = self._jitted["qwen3"](self.qwen3_params, jnp.asarray(ids), jnp.asarray(mask))
     return out
 
-  def encode_conditioner(self, source_hidden: jax.Array, target_ids: np.ndarray) -> jax.Array:
+  def encode_conditioner(
+      self,
+      source_hidden: jax.Array,
+      source_mask: jax.Array,
+      target_ids: np.ndarray,
+      target_mask: np.ndarray,
+  ) -> jax.Array:
     self._setup_jit_functions()
-    return self._jitted["conditioner"](self.conditioner_params, source_hidden, jnp.asarray(target_ids))
+    return self._jitted["conditioner"](
+      self.conditioner_params,
+      source_hidden,
+      jnp.asarray(source_mask),
+      jnp.asarray(target_ids),
+      jnp.asarray(target_mask),
+    )
 
   def decode_latents(self, latents: jax.Array) -> np.ndarray:
     """Denormalize (latents/std + mean), VAE-decode, return first-frame HWC uint8."""
@@ -164,8 +178,11 @@ class FlaxAnimaPipeline:
       qwen_embeds: jax.Array,
       qwen_mask: jax.Array,
       neg_qwen_embeds: jax.Array,
+      neg_qwen_mask: jax.Array,
       t5_ids: np.ndarray,
+      t5_mask: np.ndarray,
       neg_t5_ids: np.ndarray,
+      neg_t5_mask: np.ndarray,
       height: int,
       width: int,
       num_inference_steps: int = 30,
@@ -176,8 +193,8 @@ class FlaxAnimaPipeline:
     """Run the denoising loop + decode. Text encoding is done outside (or via encode_*)."""
     self._setup_jit_functions()
     t0 = time.perf_counter()
-    context = self.encode_conditioner(qwen_embeds, t5_ids)
-    neg_context = self.encode_conditioner(neg_qwen_embeds, neg_t5_ids)
+    context = self.encode_conditioner(qwen_embeds, qwen_mask, t5_ids, t5_mask)
+    neg_context = self.encode_conditioner(neg_qwen_embeds, neg_qwen_mask, neg_t5_ids, neg_t5_mask)
     if trace is not None:
       trace["conditioning"] = time.perf_counter() - t0
 
