@@ -27,7 +27,7 @@ import traceback
 import faulthandler
 faulthandler.dump_traceback_later(600, exit=True)
 import jax
-# Keep default TPU matmul precision for production-speed measurements.
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 import jax.numpy as jnp
 log(f"devices: {jax.devices()}")
 
@@ -185,16 +185,17 @@ log(f"sigmas head {sigmas[:3]} tail {sigmas[-3:]}")
 
 @jax.jit
 def tf_step(t_params, latents, timestep, ctx, nctx, pad):
-    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
-    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad)
-    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad)
-    # Preserve the guidance delta before bf16 rounding amplifies small differences.
-    pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
-    return nc, nu, pred.astype(jnp.float32)
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.bfloat16)
+    latents = latents.astype(jnp.bfloat16)
+    ctx = ctx.astype(jnp.bfloat16); nctx = nctx.astype(jnp.bfloat16)
+    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad).astype(jnp.bfloat16)
+    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad).astype(jnp.bfloat16)
+    pred = (nu + jnp.bfloat16(GUIDANCE) * (nc - nu)).astype(jnp.bfloat16)
+    return nc, nu, pred
 
 rng = np.random.default_rng(SEED)
-latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
-pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32))
+latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)).astype(jnp.bfloat16)
+pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32)).astype(jnp.bfloat16)
 np.save('/content/dump_latent_initial.npy', np.asarray(latents))
 t0 = time.perf_counter()
 for i in range(STEPS):
@@ -211,7 +212,7 @@ for i in range(STEPS):
         pp = np.asarray(pred, dtype=np.float32)
         log(f'step {i+1} stats nc_rms={np.sqrt(np.mean(np.asarray(nc)**2)):.6g} nu_rms={np.sqrt(np.mean(np.asarray(nu)**2)):.6g} delta_rms={np.sqrt(np.mean(delta**2)):.6g} pred_rms={np.sqrt(np.mean(pp**2)):.6g}')
     sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
-    latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
+    latents = (latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]), dtype=jnp.bfloat16)) * pred).astype(jnp.bfloat16)
     if i % 5 == 0 or i == STEPS - 1:
         latents.block_until_ready()
         log(f"step {i+1}/{STEPS} elapsed {time.perf_counter()-t0:.1f}s")
@@ -244,13 +245,13 @@ log("=== STAGE 6: timed warm reps ===")
 times = []
 for rep in range(3):
     rng = np.random.default_rng(SEED + rep + 1)
-    latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
+    latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)).astype(jnp.bfloat16)
     t0 = time.perf_counter()
     for i in range(STEPS):
         _nc, _nu, pred = tf_step(t_params, latents, jnp.asarray(np.float32(timesteps[i])),
                                   context, neg_context, pad)
         sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
-        latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
+        latents = (latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]), dtype=jnp.bfloat16)) * pred).astype(jnp.bfloat16)
     latents.block_until_ready()
     dt = time.perf_counter() - t0
     times.append(dt)
