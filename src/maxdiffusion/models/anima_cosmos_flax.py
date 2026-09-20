@@ -232,8 +232,8 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
         put((t,norm,"linear_1","kernel"), f"{s}.adaln_modulation_{source}.1.weight")
         put((t,norm,"linear_2","kernel"), f"{s}.adaln_modulation_{source}.2.weight")
       for attn, source in (("attn1","self_attn"),("attn2","cross_attn")):
-        for proj in ("q_proj","k_proj","v_proj"):
-          put((t,attn,proj,"kernel"), f"{s}.{source}.{proj}.weight")
+        for proj, dst_proj in (("q_proj","to_q"),("k_proj","to_k"),("v_proj","to_v")):
+          put((t,attn,dst_proj,"kernel"), f"{s}.{source}.{proj}.weight")
         put((t,attn,"to_out","kernel"), f"{s}.{source}.output_proj.weight")
         put((t,attn,"norm_q"), f"{s}.{source}.q_norm.weight", False)
         put((t,attn,"norm_k"), f"{s}.{source}.k_norm.weight", False)
