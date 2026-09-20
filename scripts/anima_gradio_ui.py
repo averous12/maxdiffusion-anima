@@ -31,14 +31,21 @@ def _read_img(path):
         return None
 
 
+def _atomic_json(path, obj):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
 def start_gen(prompt, neg, height, width, steps, seed, preview_every):
     req = {"prompt": prompt, "negative_prompt": neg,
            "height": int(height), "width": int(width),
            "steps": int(steps), "guidance": 4.0, "seed": int(seed),
            "preview_every": int(preview_every),
            "out": "/content/anima_perstep.png", "go": True}
-    json.dump(req, open(REQ_PATH, "w"))
-    deadline = time.time() + 600
+    _atomic_json(REQ_PATH, req)
+    deadline = time.time() + 900
     seen = None
     while time.time() < deadline:
         prog = _read_prog()
@@ -51,10 +58,11 @@ def start_gen(prompt, neg, height, width, steps, seed, preview_every):
         if prog.get("stage") == "error":
             yield final, snap, "error — see anima_server.log"
             return
-        if (snap, status) != seen:
-            seen = (snap, status)
+        marker = (prog.get('t'), prog.get('step'), prog.get('stage'))
+        if marker != seen:
+            seen = marker
             yield final, snap, status
-        time.sleep(1.0)
+        time.sleep(0.5)
     prog = _read_prog()
     yield _read_img("/content/anima_perstep.png"), _read_img(SNAP_PATH), f"timeout at {prog}"
 

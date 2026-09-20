@@ -36,6 +36,8 @@ from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, co
 from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
     convert_anima_aesthetic_adapter_weights)
+from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
+from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
 from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
 from maxdiffusion.schedulers.scheduling_flow_match_flax import (
@@ -78,30 +80,58 @@ shutil.copyfile(os.path.join(aesthetic_snapshot, "split_files/diffusion_models/a
 aes_mtime = os.path.getmtime(aesthetic_path)
 log(f"weights at {snapshot_dir}; aesthetic staged")
 
-log("=== SERVER: torch text-encoder load (once) ===")
+log("=== SERVER: torch tokenizer + TPU Qwen3 load (once) ===")
 t0 = time.perf_counter()
-import torch
-from transformers import AutoModel, AutoTokenizer
-tok = AutoTokenizer.from_pretrained(os.path.join(snapshot_dir, "tokenizer"))
+from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
 from tokenizers import Tokenizer as _RawTokenizer
+tok = AutoTokenizer.from_pretrained(os.path.join(snapshot_dir, "tokenizer"))
 _t5 = _RawTokenizer.from_file(os.path.join(snapshot_dir, "t5_tokenizer", "tokenizer.json"))
 _t5.enable_padding(pad_id=0, pad_token="<pad>", length=512)
 _t5.enable_truncation(max_length=512)
-te = AutoModel.from_pretrained(os.path.join(snapshot_dir, "text_encoder"), torch_dtype=torch.float32).eval()
-log(f"text encoder ready in {time.perf_counter()-t0:.1f}s")
+pc = HFAutoConfig.from_pretrained(os.path.join(snapshot_dir, "text_encoder"))
+rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
+qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
+    intermediate_size=pc.intermediate_size, num_hidden_layers=pc.num_hidden_layers,
+    num_attention_heads=pc.num_attention_heads, num_key_value_heads=pc.num_key_value_heads,
+    head_dim=getattr(pc, "head_dim", pc.hidden_size // pc.num_attention_heads),
+    rms_norm_eps=pc.rms_norm_eps, rope_theta=rope_theta,
+    max_position_embeddings=pc.max_position_embeddings, dtype=jnp.bfloat16,
+    max_layer_to_run=None, is_causal=True)
+qwen3_model = FlaxQwen3Model(qcfg)
+qwen_cache = os.path.join(CACHE_DIR, "qwen3_params.msgpack")
+qv = qwen3_model.init(jax.random.key(0), jnp.zeros((1, 512), jnp.int32), jnp.zeros((1, 512), jnp.int32))
+q_marker = os.path.join(snapshot_dir, "text_encoder", "model.safetensors")
+q_mtime = os.path.getmtime(q_marker)
+if _cache_valid(qwen_cache, q_marker, q_mtime):
+    log("Qwen3: loading TPU params from disk cache ...")
+    with open(qwen_cache, "rb") as f:
+        qwen3_params = flax_serialization.from_bytes(qv["params"], f.read())
+else:
+    qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qcfg)
+    with open(qwen_cache, "wb") as f:
+        f.write(flax_serialization.to_bytes(qwen3_params))
+    _cache_mark(qwen_cache, q_marker, q_mtime)
+del qv
+qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
+log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s")
 
 def encode_texts(prompt, neg):
-    with torch.no_grad():
-        out = []
-        for p in [prompt, neg]:
-            ti = tok(p, padding="max_length", max_length=512, truncation=True, return_tensors="pt")
-            emb = te(input_ids=ti.input_ids, attention_mask=ti.attention_mask).last_hidden_state
-            emb = emb * ti.attention_mask.to(emb.dtype).unsqueeze(-1)
-            _enc = _t5.encode(p)
-            out.append((emb.cpu().numpy(), ti.attention_mask.cpu().numpy(),
-                        np.asarray([_enc.ids], dtype=np.int32),
-                        np.asarray([_enc.attention_mask], dtype=np.int32)))
+    ids=[]; masks=[]
+    for p in [prompt, neg]:
+        ti=tok(p,padding="max_length",max_length=512,truncation=True,return_tensors="np")
+        enc=_t5.encode(p)
+        ids.append(ti.input_ids[0]); masks.append(ti.attention_mask[0])
+    qids=jnp.asarray(np.stack(ids),dtype=jnp.int32)
+    qmask=jnp.asarray(np.stack(masks),dtype=jnp.int32)
+    qhidden=qwen3_jit(qwen3_params,qids,qmask)
+    qhidden=(qhidden*qmask[...,None].astype(qhidden.dtype)).astype(jnp.float32)
+    out=[]
+    for b,p in enumerate([prompt,neg]):
+        enc=_t5.encode(p)
+        out.append((np.asarray(qhidden[b:b+1]), np.asarray(qmask[b:b+1]),
+                    np.asarray([enc.ids],dtype=np.int32), np.asarray([enc.attention_mask],dtype=np.int32)))
     return out
+log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
 
 log("=== SERVER: weight conversion (cached) ===")
 t0 = time.perf_counter()
