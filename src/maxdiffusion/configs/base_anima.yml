@@ -1,0 +1,42 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+run_name: 'anima_test_run'
+
+metrics_file: ""
+write_metrics: False
+write_timing_metrics: False
+timing: False
+gcs_metrics: False
+save_config_to_gcs: False
+log_period: 100
+
+pretrained_model_name_or_path: 'circlestone-labs/Anima-Base-v1.0-Diffusers'
+
+# Anima is bf16 end-to-end (T5 ids stay int32).
+weights_dtype: 'bfloat16'
+
+seed: 0
+output_dir: 'output/'
+
+prompt: "masterpiece, best quality, 1girl, solo, city lights"
+negative_prompt: "low quality, blurry, worst quality"
+
+guidance_scale: 4.0
+num_inference_steps: 30
+num_reps: 3
+
+height: 1024
+width: 1024
+batch_size: 1
