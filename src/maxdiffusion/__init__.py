@@ -77,7 +77,10 @@ _import_structure = {
 if is_flax_available():
   from flax import config as flax_config
 
-  flax_config.update("flax_always_shard_variable", False)
+  try:
+    flax_config.update("flax_always_shard_variable", False)
+  except LookupError:
+    pass  # older Flax lacks this option; server runs without it
 
 try:
   if not is_onnx_available():
