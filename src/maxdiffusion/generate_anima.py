@@ -147,11 +147,25 @@ def main(argv):
     num_layers=28,
   )
 
-  # ---- VAE ----
+  # ---- VAE (proven merge: string-path match + from_flat_path + update) ----
+  from flax.traverse_util import flatten_dict as _flatten_dict
   vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
-  eval_shapes = nnx.state(vae, nnx.Param)
-  vae_params = load_qwen_image_vae(repo_id, eval_shapes)
-  nnx.update(vae, vae_params)
+  _state = nnx.state(vae, nnx.Param)
+  _flat_state = _state.flat_state()
+  _flat_target = {k: v.value for k, v in _flat_state.items()}
+  _converted = load_qwen_image_vae(repo_id, _flat_target)
+  _conv_flat = _flatten_dict(_converted)
+  _new_flat = {}
+  _missing = []
+  for _k, _vs in _flat_state.items():
+    _p = "/".join(str(x) for x in _k)
+    if _p in _conv_flat:
+      _new_flat[_k] = _vs.replace(jnp.asarray(_conv_flat[_p], dtype=_vs.value.dtype))
+    else:
+      _missing.append(_p)
+  if _missing:
+    raise KeyError(f"VAE merge incomplete: {_missing[:8]}")
+  nnx.update(vae, nnx.State.from_flat_path(_new_flat))
 
   scheduler = FlaxFlowMatchScheduler()
   pipeline = FlaxAnimaPipeline(

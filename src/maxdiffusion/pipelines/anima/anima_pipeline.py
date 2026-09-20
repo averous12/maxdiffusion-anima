@@ -143,20 +143,21 @@ class FlaxAnimaPipeline:
     return self._jitted["conditioner"](self.conditioner_params, source_hidden, jnp.asarray(target_ids))
 
   def decode_latents(self, latents: jax.Array) -> np.ndarray:
-    """Denormalize (latents/std + mean), VAE-decode, return first-frame HWC float32."""
+    """Denormalize (latents/std + mean), VAE-decode, return first-frame HWC uint8."""
     latents_mean = jnp.array(self.vae.latents_mean, dtype=latents.dtype).reshape(1, self.vae.z_dim, 1, 1, 1)
     latents_std = jnp.array(self.vae.latents_std, dtype=latents.dtype).reshape(1, self.vae.z_dim, 1, 1, 1)
     z = latents / (1.0 / latents_std) + latents_mean
     graphdef, state, rest = nnx.split(self.vae, nnx.Param, ...)
-    feat_cache = AutoencoderKLWanCache.create(z.shape)
-    decoded = graphdef.merge(state, rest).decode(z, feat_cache, return_dict=False)[0]
-    img = np.asarray(decoded)
+    merged = nnx.merge(graphdef, state, rest)
+    video = merged.decode(z, AutoencoderKLWanCache(merged), return_dict=False)[0]
+    video = jnp.clip(video / 2.0 + 0.5, 0.0, 1.0)
+    img = np.asarray(video)
     # channels-last (B, T, H, W, C) -> first frame HWC
     if img.ndim == 5:
       img = img[:, 0]
     if img.shape[-1] not in (1, 3):
       img = np.moveaxis(img, 1, -1)
-    return np.asarray(img[0], dtype=np.float32)
+    return (img[0] * 255.0).round().astype(np.uint8)
 
   def __call__(
       self,
@@ -209,8 +210,7 @@ class FlaxAnimaPipeline:
       trace["denoise"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    img = self.decode_latents(denoised)
+    img_u8 = self.decode_latents(denoised)
     if trace is not None:
       trace["vae_decode"] = time.perf_counter() - t2
-    img = np.clip(img * 0.5 + 0.5, 0.0, 1.0)
-    return Image.fromarray((img * 255).round().astype(np.uint8))
+    return Image.fromarray(img_u8)
