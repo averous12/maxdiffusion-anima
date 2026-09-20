@@ -154,8 +154,9 @@ del cv
 gc.collect()
 
 log("SERVER: building transformer module...")
+t0t = time.perf_counter()
 transformer = FlaxAnimaCosmosTransformer(layers=28)
-log("SERVER: transformer module built; initializing dummy variables...")
+log(f"SERVER: transformer module built in {time.perf_counter()-t0t:.1f}s; initializing dummy variables...")
 tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.float32),
                       jnp.zeros((1,), jnp.float32), jnp.zeros((1, 8, 1024), jnp.float32))
 log("SERVER: transformer dummy init complete")
