@@ -194,9 +194,9 @@ def _transpose_weight(value):
   return value.T if value.ndim == 2 else value
 
 
-def _aesthetic_get(tensors, name):
+def _aesthetic_get(available, name):
   key = f"model.diffusion_model.{name}"
-  if key not in tensors:
+  if key not in available:
     raise KeyError(f"Missing Anima aesthetic key: {key}")
   return key
 
@@ -207,9 +207,10 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
   flat = flatten_dict(flax_params)
   converted = {}
   with safe_open(safetensors_path, framework="pt", device="cpu") as tensors:
+    available = set(tensors.keys())
     consumed = set()
     def put(dst, src, tr=True):
-      src = _aesthetic_get(tensors, src)
+      src = _aesthetic_get(available, src)
       value = tensors.get_tensor(src).float().numpy()
       value = value.T if tr and value.ndim == 2 else value
       value = jnp.asarray(value, dtype=dtype)
