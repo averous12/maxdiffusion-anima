@@ -135,7 +135,13 @@ def load_and_convert_qwen3_weights(safetensors_path: str, jax_params: dict, conf
   def get_w(name: str, transpose: bool = True) -> np.ndarray:
     nonlocal torch_weights
     if name not in torch_weights:
-      raise KeyError(f"Weight '{name}' not found in safetensors!")
+      # Anima's Diffusers text encoder stores the Qwen3 base model without
+      # the `model.` prefix used by causal-LM checkpoints.
+      unprefixed = name[6:] if name.startswith("model.") else name
+      if unprefixed in torch_weights:
+        name = unprefixed
+      else:
+        raise KeyError(f"Weight '{name}' not found in safetensors!")
     t = torch_weights[name]
     if len(t.shape) == 2 and transpose:
       t = t.T
