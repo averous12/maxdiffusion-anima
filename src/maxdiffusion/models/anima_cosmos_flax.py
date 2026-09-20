@@ -194,6 +194,58 @@ def _transpose_weight(value):
   return value.T if value.ndim == 2 else value
 
 
+def _aesthetic_get(tensors, name):
+  key = f"model.diffusion_model.{name}"
+  if key not in tensors:
+    raise KeyError(f"Missing Anima aesthetic key: {key}")
+  return key
+
+
+def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfloat16):
+  """Convert official single-file Anima-Aesthetic transformer weights."""
+  from safetensors import safe_open
+  flat = flatten_dict(flax_params)
+  converted = {}
+  with safe_open(safetensors_path, framework="pt", device="cpu") as tensors:
+    consumed = set()
+    def put(dst, src, tr=True):
+      src = _aesthetic_get(tensors, src)
+      value = tensors.get_tensor(src).float().numpy()
+      value = value.T if tr and value.ndim == 2 else value
+      value = jnp.asarray(value, dtype=dtype)
+      if tuple(value.shape) != tuple(flat[dst].shape):
+        raise ValueError(f"Shape mismatch {src}: {value.shape} != {dst}: {flat[dst].shape}")
+      converted[dst] = value; consumed.add(src)
+    put(("patch_embed", "kernel"), "x_embedder.proj.1.weight")
+    put(("time_embed_linear_1", "kernel"), "t_embedder.1.linear_1.weight")
+    put(("time_embed_linear_2", "kernel"), "t_embedder.1.linear_2.weight")
+    put(("time_embed_norm",), "t_embedding_norm.weight", False)
+    put(("norm_out_linear_1", "kernel"), "final_layer.adaln_modulation.1.weight")
+    put(("norm_out_linear_2", "kernel"), "final_layer.adaln_modulation.2.weight")
+    put(("proj_out", "kernel"), "final_layer.linear.weight")
+    for i in range(28):
+      s=f"blocks.{i}"; t=f"transformer_blocks_{i}"
+      for norm, source in (("norm1","self_attn"),("norm2","cross_attn"),("norm3","mlp")):
+        put((t,norm,"linear_1","kernel"), f"{s}.adaln_modulation_{source}.1.weight")
+        put((t,norm,"linear_2","kernel"), f"{s}.adaln_modulation_{source}.2.weight")
+      for attn, source in (("attn1","self_attn"),("attn2","cross_attn")):
+        for proj in ("q_proj","k_proj","v_proj"):
+          put((t,attn,proj,"kernel"), f"{s}.{source}.{proj}.weight")
+        put((t,attn,"to_out","kernel"), f"{s}.{source}.output_proj.weight")
+        put((t,attn,"norm_q"), f"{s}.{source}.q_norm.weight", False)
+        put((t,attn,"norm_k"), f"{s}.{source}.k_norm.weight", False)
+      put((t,"ff_in","kernel"), f"{s}.mlp.layer1.weight")
+      put((t,"ff_out","kernel"), f"{s}.mlp.layer2.weight")
+    extras = set(tensors.keys()) - consumed
+    if extras:
+      extras = {x for x in extras if x != "__metadata__" and ".llm_adapter." in x}
+      # The LLM adapter is validated by its separate converter.
+      all_extras = set(tensors.keys()) - consumed - {"__metadata__"}
+      all_extras = {x for x in all_extras if not x.startswith("model.diffusion_model.llm_adapter.")}
+      if all_extras:
+        raise ValueError(f"Unconsumed aesthetic transformer keys: {sorted(all_extras)[:10]}")
+  return unflatten_dict(converted)
+
 def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True):
   """Strictly map Diffusers Cosmos/Anima names to this Flax module."""
   from safetensors import safe_open

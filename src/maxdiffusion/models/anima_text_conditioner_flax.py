@@ -67,3 +67,31 @@ def load_and_convert_anima_text_conditioner_weights(path,params,dtype=jnp.bfloat
       for n in ('norm_self_attn','norm_cross_attn','norm_mlp'): put((t,n,'weight'),f'{p}.{n}.weight')
       put((t,'mlp_in','kernel'),f'{p}.mlp.0.weight',True); put((t,'mlp_in','bias'),f'{p}.mlp.0.bias'); put((t,'mlp_out','kernel'),f'{p}.mlp.2.weight',True); put((t,'mlp_out','bias'),f'{p}.mlp.2.bias')
   return unflatten_dict(out)
+
+
+def convert_anima_aesthetic_adapter_weights(path, params, dtype=jnp.bfloat16):
+  """Convert the embedded `model.diffusion_model.llm_adapter` weights."""
+  from safetensors import safe_open
+  flat = flatten_dict(params); out = {}
+  prefix = "model.diffusion_model.llm_adapter."
+  with safe_open(path, framework="pt", device="cpu") as f:
+    keys = set(f.keys())
+    def put(dst, src, tr=False):
+      key = prefix + src
+      if key not in keys: raise KeyError(f"Missing aesthetic adapter key: {key}")
+      v = f.get_tensor(key).float().numpy(); v = v.T if tr and v.ndim == 2 else v
+      v = jnp.asarray(v, dtype=dtype)
+      if tuple(v.shape) != tuple(flat[dst].shape): raise ValueError(f"Shape mismatch {key}: {v.shape} != {dst}: {flat[dst].shape}")
+      out[dst] = v
+    put(('embed','embedding'),'embed.weight')
+    put(('norm','weight'),'norm.weight')
+    put(('out_proj','kernel'),'out_proj.weight',True); put(('out_proj','bias'),'out_proj.bias',False)
+    for i in range(6):
+      p=f'blocks.{i}'; t=f'blocks_{i}'
+      for a in ('self_attn','cross_attn'):
+        for q in ('q_proj','k_proj','v_proj','o_proj'): put((t,a,q,'kernel'),f'{p}.{a}.{q}.weight',True)
+        for n in ('q_norm','k_norm'): put((t,a,n,'weight'),f'{p}.{a}.{n}.weight')
+      for n in ('norm_self_attn','norm_cross_attn','norm_mlp'): put((t,n,'weight'),f'{p}.{n}.weight')
+      put((t,'mlp_in','kernel'),f'{p}.mlp.0.weight',True); put((t,'mlp_in','bias'),f'{p}.mlp.0.bias')
+      put((t,'mlp_out','kernel'),f'{p}.mlp.2.weight',True); put((t,'mlp_out','bias'),f'{p}.mlp.2.bias')
+  return unflatten_dict(out)
