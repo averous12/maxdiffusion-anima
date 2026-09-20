@@ -45,7 +45,15 @@ from huggingface_hub import snapshot_download
 
 CACHE_DIR = "/content/anima_cache"
 REQ_PATH = "/content/anima_request.json"
+PROG_PATH = "/content/anima_progress.json"
+SNAP_PATH = "/content/anima_snap.png"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+def write_prog(**kw):
+    try:
+        json.dump({"t": time.time(), **kw}, open(PROG_PATH, "w"))
+    except Exception:
+        pass
 
 def _cache_valid(path, src, src_mtime):
     if not os.path.exists(path):
@@ -214,6 +222,7 @@ except Exception:
     raise
 
 log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
+write_prog(stage="ready")
 
 def default_req():
     return {"prompt": "masterpiece, best quality, 1girl",
@@ -244,13 +253,17 @@ while True:
         continue
     d = default_req(); d.update({k: v for k, v in req.items() if k != "go"})
     json.dump({**d, "go": False, "status": "running"}, open(REQ_PATH, "w"))
+    write_prog(stage="starting", step=0, steps=d.get("steps", 30))
     last_mtime = os.path.getmtime(REQ_PATH)
     try:
         PROMPT, NEG = d["prompt"], d["negative_prompt"]
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
+        PREV_EVERY = int(d.get("preview_every", 5))
         g0 = time.perf_counter()
+        write_prog(stage="text-encoding", step=0, steps=STEPS)
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
+        write_prog(stage="conditioning", step=0, steps=STEPS)
         context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
         neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
         context.block_until_ready(); neg_context.block_until_ready()
@@ -265,14 +278,27 @@ while True:
         rng = np.random.default_rng(SEED)
         latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
         pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32))
+        snap_every = max(1, PREV_EVERY)
         for i in range(STEPS):
             pred = tf_step(t_params, latents, jnp.asarray(np.float32(timesteps[i])),
                            context, neg_context, pad)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
             latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
-            if i % 5 == 0 or i == STEPS - 1:
+            if i % 2 == 0 or i == STEPS - 1:
                 latents.block_until_ready()
+                write_prog(stage="denoise", step=i + 1, steps=STEPS)
+            if (i + 1) % snap_every == 0 or i == STEPS - 1:
+                try:
+                    snap = np.asarray(latents, dtype=np.float32)
+                    snap = snap[0].mean(axis=0)[0]
+                    snap = snap - snap.min()
+                    snap = snap / (snap.max() + 1e-8)
+                    from PIL import Image as _PILImage
+                    _PILImage.fromarray((snap * 255.0).round().astype(np.uint8)).save(SNAP_PATH)
+                except Exception as _e:
+                    log(f"snap failed at step {i+1}: {_e}")
         latents.block_until_ready()
+        write_prog(stage="decode", step=STEPS, steps=STEPS)
         denoise_s = time.perf_counter() - g0
         lmean = jnp.array(vae.latents_mean, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
         lstd = jnp.array(vae.latents_std, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
@@ -292,9 +318,11 @@ while True:
         Image.fromarray(img_u8).save(OUT)
         total_s = time.perf_counter() - g0
         log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s) = {60.0/total_s:.2f} images/min")
+        write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT, elapsed_s=round(total_s, 1))
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}, open(REQ_PATH, "w"))
     except Exception:
         log("gen raised:\n" + traceback.format_exc())
+        write_prog(stage="error")
         try:
             json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
         except Exception:

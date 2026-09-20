@@ -19,6 +19,6 @@ Path("/content/anima_setup_v5e.sh").write_text(setup)
 subprocess.run(["bash", "/content/anima_setup_v5e.sh", "MODE=stable", "DEVICE=tpu"], cwd=REPO, env=env, check=True)
 subprocess.run(["uv", "pip", "install", "-q", "--python", str(PY),
                 "transformers", "tokenizers", "accelerate", "safetensors",
-                "huggingface_hub", "absl-py", "Pillow", "einops"],
+                "huggingface_hub", "absl-py", "Pillow", "einops", "gradio"],
                check=True, env=env)
 print("ANIMA_SETUP_DONE")
