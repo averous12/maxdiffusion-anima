@@ -27,7 +27,7 @@ import traceback
 import faulthandler
 faulthandler.dump_traceback_later(600, exit=True)
 import jax
-jax.config.update("jax_default_matmul_precision", "bfloat16")
+# Keep default TPU matmul precision (proven Fern image used this).
 import jax.numpy as jnp
 log(f"devices: {jax.devices()}")
 
@@ -35,13 +35,12 @@ from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, co
 from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
     load_and_convert_anima_text_conditioner_weights, convert_anima_aesthetic_adapter_weights)
-from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
-from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
 from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, AutoencoderKLWanCache
 from maxdiffusion.schedulers.scheduling_flow_match_flax import (
     FlaxFlowMatchScheduler, FlowMatchSchedulerState)
 from flax import nnx
+from flax import serialization as flax_serialization
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
@@ -86,35 +85,43 @@ log(f"text encoding done in {time.perf_counter()-t0:.1f}s; qe {qe.shape} {qe.dty
 np.save('/content/dump_qe.npy', qe); np.save('/content/dump_ne.npy', ne); np.save('/content/dump_qm.npy', qm); np.save('/content/dump_nm.npy', nm); np.save('/content/dump_t5.npy', t5ids); np.save('/content/dump_nt5.npy', nt5ids)
 
 log("=== STAGE 2: weight conversion ===")
-t0 = time.perf_counter()
-from transformers import AutoConfig as HFAutoConfig
-pc = HFAutoConfig.from_pretrained(os.path.join(snapshot_dir, "text_encoder"))
-rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
-qwen_cfg = FlaxQwen3Config(
-    vocab_size=pc.vocab_size, hidden_size=pc.hidden_size, intermediate_size=pc.intermediate_size,
-    num_hidden_layers=pc.num_hidden_layers, num_attention_heads=pc.num_attention_heads,
-    num_key_value_heads=pc.num_key_value_heads,
-    head_dim=getattr(pc, "head_dim", pc.hidden_size // pc.num_attention_heads),
-    rms_norm_eps=pc.rms_norm_eps, rope_theta=rope_theta,
-    max_position_embeddings=pc.max_position_embeddings,
-    dtype=jnp.bfloat16, max_layer_to_run=None, is_causal=True)
-qwen3_model = FlaxQwen3Model(qwen_cfg)
-qv = qwen3_model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32), jnp.zeros((1, 8), jnp.int32))
-qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qwen_cfg)
-qwen3_params_host = jax.tree_util.tree_map(np.asarray, qwen3_params)
-del qv, qwen3_model, qwen3_params
-gc.collect()
-log(f"qwen3 converted in {time.perf_counter()-t0:.1f}s")
+CACHE_DIR = "/content/anima_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+import hashlib
+def _cache_valid(path, src, src_mtime):
+    if not os.path.exists(path):
+        return False
+    try:
+        import json
+        meta = json.load(open(path + ".meta"))
+        return meta.get("src_mtime") == src_mtime and meta.get("src_size") == os.path.getsize(src)
+    except Exception:
+        return False
+def _cache_mark(path, src, src_mtime):
+    import json
+    json.dump({"src_mtime": src_mtime, "src_size": os.path.getsize(src)},
+              open(path + ".meta", "w"))
 
 t0 = time.perf_counter()
 cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
 conditioner = FlaxAnimaTextConditioner(cond_cfg)
 cv = conditioner.init(jax.random.key(1), jnp.zeros((1, 8, 1024), jnp.float32), np.zeros((1, 8), np.int32))
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
-cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
+aes_mtime = os.path.getmtime(aesthetic_path)
+cond_cache = os.path.join(CACHE_DIR, "cond_params.msgpack")
+if _cache_valid(cond_cache, aesthetic_path, aes_mtime):
+    log("conditioner: loading from disk cache ...")
+    with open(cond_cache, "rb") as f:
+        cond_params = flax_serialization.from_bytes(cv["params"], f.read())
+    log(f"conditioner loaded from cache in {time.perf_counter()-t0:.1f}s")
+else:
+    cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
+    with open(cond_cache, "wb") as f:
+        f.write(flax_serialization.to_bytes(cond_params))
+    _cache_mark(cond_cache, aesthetic_path, aes_mtime)
+    log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 del cv
 gc.collect()
-log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 
 t0 = time.perf_counter()
 transformer = FlaxAnimaCosmosTransformer(layers=28)
@@ -125,48 +132,76 @@ log(f"transformer: init done in {time.perf_counter()-t0:.1f}s")
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
 log(f"transformer: converting 685 aesthetic keys from {aesthetic_path} ...")
 log(f"transformer: file size {os.path.getsize(aesthetic_path)/1e9:.2f} GB, tv leaves {len(jax.tree_util.tree_leaves(tv['params']))}")
-try:
-    t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
-except Exception:
-    log("transformer: conversion raised:\n" + traceback.format_exc())
-    raise
-log("transformer: conversion done")
+t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
+if _cache_valid(t_cache, aesthetic_path, aes_mtime):
+    log("transformer: loading from disk cache ...")
+    with open(t_cache, "rb") as f:
+        t_params = flax_serialization.from_bytes(tv["params"], f.read())
+    log("transformer: loaded from cache")
+else:
+    try:
+        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
+    except Exception:
+        log("transformer: conversion raised:\n" + traceback.format_exc())
+        raise
+    log("transformer: conversion done")
+    with open(t_cache, "wb") as f:
+        f.write(flax_serialization.to_bytes(t_params))
+    _cache_mark(t_cache, aesthetic_path, aes_mtime)
 del tv
 gc.collect()
 log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
 
 t0 = time.perf_counter()
 vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
+vae_marker = os.path.join(snapshot_dir, "vae", "diffusion_pytorch_model.safetensors")
+vae_mtime = os.path.getmtime(vae_marker) if os.path.exists(vae_marker) else 0.0
+vae_cache = os.path.join(CACHE_DIR, "vae_flat.msgpack")
 _st = nnx.state(vae, nnx.Param)
 _fs = dict(nnx.to_flat_state(_st))
-_ft = {k: v.value for k, v in _fs.items()}
-_conv = load_qwen_image_vae(snapshot_dir, _ft)
-_cf = _flatten_dict(_conv)
-_cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-_nf, _miss = {}, []
-for _k, _vs in _fs.items():
-    _p = "/".join(str(x) for x in _k)
-    if _p in _cf_by_path:
-        _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-    else:
-        _miss.append(_p)
-assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
-nnx.update(vae, nnx.State.from_flat_path(_nf))
-del _st, _fs, _ft, _conv, _cf, _cf_by_path, _nf
+if _cache_valid(vae_cache, vae_marker if os.path.exists(vae_marker) else aesthetic_path, vae_mtime or aes_mtime):
+    log("vae: loading from disk cache ...")
+    with open(vae_cache, "rb") as f:
+        _nf = flax_serialization.from_bytes(_fs, f.read())
+    nnx.update(vae, nnx.State.from_flat_path(_nf))
+    del _nf
+else:
+    _ft = {k: v.value for k, v in _fs.items()}
+    _conv = load_qwen_image_vae(snapshot_dir, _ft)
+    _cf = _flatten_dict(_conv)
+    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+    _nf, _miss = {}, []
+    for _k, _vs in _fs.items():
+        _p = "/".join(str(x) for x in _k)
+        if _p in _cf_by_path:
+            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+        else:
+            _miss.append(_p)
+    assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
+    nnx.update(vae, nnx.State.from_flat_path(_nf))
+    with open(vae_cache, "wb") as f:
+        f.write(flax_serialization.to_bytes(nnx.State.from_flat_path(_nf)))
+    _cache_mark(vae_cache, vae_marker if os.path.exists(vae_marker) else aesthetic_path, vae_mtime or aes_mtime)
+    del _ft, _conv, _cf, _cf_by_path, _nf
+del _st, _fs
 gc.collect()
 log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
 
 log("=== STAGE 3: encode conditioner (jax) ===")
-@jax.jit
-def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
-    return conditioner.apply({"params": c_params}, source_hidden_states=source_hidden,
-                             target_input_ids=target_ids,
-                             source_attention_mask=source_mask,
-                             target_attention_mask=target_mask)
-t0 = time.perf_counter()
-context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
-neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
-context.block_until_ready(); neg_context.block_until_ready()
+try:
+    @jax.jit
+    def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
+        return conditioner.apply({"params": c_params}, source_hidden_states=source_hidden,
+                                 target_input_ids=target_ids,
+                                 source_attention_mask=source_mask,
+                                 target_attention_mask=target_mask)
+    t0 = time.perf_counter()
+    context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
+    neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
+    context.block_until_ready(); neg_context.block_until_ready()
+except Exception:
+    log("conditioner encode raised:\n" + traceback.format_exc())
+    raise
 np.save('/content/dump_context.npy', np.asarray(context)); np.save('/content/dump_neg_context.npy', np.asarray(neg_context))
 log(f"conditioning encoded in {time.perf_counter()-t0:.1f}s; ctx {context.shape}")
 # free conditioner device params (encode done; keep host copy? we only need conv later inside jit scope? no)
@@ -185,37 +220,40 @@ log(f"sigmas head {sigmas[:3]} tail {sigmas[-3:]}")
 
 @jax.jit
 def tf_step(t_params, latents, timestep, ctx, nctx, pad):
-    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.bfloat16)
-    latents = latents.astype(jnp.bfloat16)
-    ctx = ctx.astype(jnp.bfloat16); nctx = nctx.astype(jnp.bfloat16)
-    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad).astype(jnp.bfloat16)
-    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad).astype(jnp.bfloat16)
-    pred = (nu + jnp.bfloat16(GUIDANCE) * (nc - nu)).astype(jnp.bfloat16)
-    return nc, nu, pred
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
+    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad)
+    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad)
+    # Preserve the guidance delta before bf16 rounding amplifies small differences.
+    pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
+    return nc, nu, pred.astype(jnp.float32)
 
 rng = np.random.default_rng(SEED)
-latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)).astype(jnp.bfloat16)
-pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32)).astype(jnp.bfloat16)
+latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
+pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32))
 np.save('/content/dump_latent_initial.npy', np.asarray(latents))
 t0 = time.perf_counter()
-for i in range(STEPS):
-    step_input = latents
-    nc, nu, pred = tf_step(t_params, step_input, jnp.asarray(np.float32(timesteps[i])),
-                           context, neg_context, pad)
-    if i in (0, 9, 19, 29):
-        nc.block_until_ready(); nu.block_until_ready(); pred.block_until_ready(); step_input.block_until_ready()
-        np.save(f'/content/dump_latent_in_{i:02d}.npy', np.asarray(step_input))
-        np.save(f'/content/dump_nc_{i:02d}.npy', np.asarray(nc))
-        np.save(f'/content/dump_nu_{i:02d}.npy', np.asarray(nu))
-        np.save(f'/content/dump_pred_{i:02d}.npy', np.asarray(pred))
-        delta = np.asarray(nc, dtype=np.float32) - np.asarray(nu, dtype=np.float32)
-        pp = np.asarray(pred, dtype=np.float32)
-        log(f'step {i+1} stats nc_rms={np.sqrt(np.mean(np.asarray(nc)**2)):.6g} nu_rms={np.sqrt(np.mean(np.asarray(nu)**2)):.6g} delta_rms={np.sqrt(np.mean(delta**2)):.6g} pred_rms={np.sqrt(np.mean(pp**2)):.6g}')
-    sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
-    latents = (latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]), dtype=jnp.bfloat16)) * pred).astype(jnp.bfloat16)
-    if i % 5 == 0 or i == STEPS - 1:
-        latents.block_until_ready()
-        log(f"step {i+1}/{STEPS} elapsed {time.perf_counter()-t0:.1f}s")
+try:
+    for i in range(STEPS):
+        step_input = latents
+        nc, nu, pred = tf_step(t_params, step_input, jnp.asarray(np.float32(timesteps[i])),
+                               context, neg_context, pad)
+        if i in (0, 9, 19, 29):
+            nc.block_until_ready(); nu.block_until_ready(); pred.block_until_ready(); step_input.block_until_ready()
+            np.save(f'/content/dump_latent_in_{i:02d}.npy', np.asarray(step_input))
+            np.save(f'/content/dump_nc_{i:02d}.npy', np.asarray(nc))
+            np.save(f'/content/dump_nu_{i:02d}.npy', np.asarray(nu))
+            np.save(f'/content/dump_pred_{i:02d}.npy', np.asarray(pred))
+            delta = np.asarray(nc, dtype=np.float32) - np.asarray(nu, dtype=np.float32)
+            pp = np.asarray(pred, dtype=np.float32)
+            log(f'step {i+1} stats nc_rms={np.sqrt(np.mean(np.asarray(nc)**2)):.6g} nu_rms={np.sqrt(np.mean(np.asarray(nu)**2)):.6g} delta_rms={np.sqrt(np.mean(delta**2)):.6g} pred_rms={np.sqrt(np.mean(pp**2)):.6g}')
+        sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
+        latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
+        if i % 5 == 0 or i == STEPS - 1:
+            latents.block_until_ready()
+            log(f"step {i+1}/{STEPS} elapsed {time.perf_counter()-t0:.1f}s")
+except Exception:
+    log("denoise raised:\n" + traceback.format_exc())
+    raise
 latents.block_until_ready()
 np.save('/content/dump_latent_final.npy', np.asarray(latents))
 denoise_total = time.perf_counter() - t0
@@ -245,13 +283,13 @@ log("=== STAGE 6: timed warm reps ===")
 times = []
 for rep in range(3):
     rng = np.random.default_rng(SEED + rep + 1)
-    latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)).astype(jnp.bfloat16)
+    latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
     t0 = time.perf_counter()
     for i in range(STEPS):
         _nc, _nu, pred = tf_step(t_params, latents, jnp.asarray(np.float32(timesteps[i])),
                                   context, neg_context, pad)
         sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
-        latents = (latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]), dtype=jnp.bfloat16)) * pred).astype(jnp.bfloat16)
+        latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
     latents.block_until_ready()
     dt = time.perf_counter() - t0
     times.append(dt)
