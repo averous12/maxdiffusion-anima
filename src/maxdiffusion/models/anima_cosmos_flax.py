@@ -48,7 +48,7 @@ def _rotate_pairs(x):
 
 def _rms(x, weight, eps=1e-6):
   xf = x.astype(jnp.float32)
-  return (xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps) * weight).astype(x.dtype)
+  return (xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps) * weight.astype(jnp.float32)).astype(jnp.float32)
 
 
 def cosmos_rope(seq_len, head_dim, dtype, rope_scale=(1.0, 4.0, 4.0), grid=None):
@@ -81,13 +81,15 @@ class _AdaLN(nn.Module):
   adaln_dim: int
   @nn.compact
   def __call__(self, x, embedded_timestep, temb):
-    h = nn.silu(embedded_timestep)
-    h = nn.Dense(self.adaln_dim, use_bias=False, name="linear_1")(h)
-    h = nn.Dense(3 * self.hidden, use_bias=False, name="linear_2")(h)
-    h = h + temb
+    et = embedded_timestep.astype(jnp.float32)
+    tb = temb.astype(jnp.float32)
+    h = nn.silu(et)
+    h = nn.Dense(self.adaln_dim, use_bias=False, dtype=jnp.float32, param_dtype=jnp.float32, name="linear_1")(h)
+    h = nn.Dense(3 * self.hidden, use_bias=False, dtype=jnp.float32, param_dtype=jnp.float32, name="linear_2")(h)
+    h = h + tb
     shift, scale, gate = jnp.split(h, 3, axis=-1)
-    y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x)
-    return y * (1 + scale[:, None, :]) + shift[:, None, :], gate[:, None, :]
+    y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x.astype(jnp.float32))
+    return (y * (1 + scale[:, None, :]) + shift[:, None, :]).astype(x.dtype), gate[:, None, :].astype(x.dtype)
 
 
 class _Attention(nn.Module):
@@ -105,13 +107,15 @@ class _Attention(nn.Module):
     q = _rms(q, self.param("norm_q", nn.initializers.ones, (d,)))
     k = _rms(k, self.param("norm_k", nn.initializers.ones, (d,)))
     if not self.cross and cos is not None:
+      cos = cos.astype(jnp.float32); sin = sin.astype(jnp.float32)
+      q = q.astype(jnp.float32); k = k.astype(jnp.float32)
       q = q * cos[None, :, None, :] + _rotate_pairs(q) * sin[None, :, None, :]
       k = k * cos[None, :, None, :] + _rotate_pairs(k) * sin[None, :, None, :]
     scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) / math.sqrt(d)
     if mask is not None:
       scores = jnp.where(mask[:, None, None, :].astype(bool), scores, -1e4)
-    y = jnp.einsum("bhqk,bkhd->bqhd", nn.softmax(scores, axis=-1).astype(x.dtype), v)
-    return nn.Dense(self.hidden, use_bias=False, name="to_out")(y.reshape(x.shape[0], x.shape[1], self.hidden))
+    y = jnp.einsum("bhqk,bkhd->bqhd", nn.softmax(scores, axis=-1).astype(jnp.float32), v.astype(jnp.float32))
+    return nn.Dense(self.hidden, use_bias=False, name="to_out")(y)
 
 
 class _Block(nn.Module):
@@ -121,14 +125,16 @@ class _Block(nn.Module):
   adaln_dim: int
   @nn.compact
   def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask=None):
-    h, gate1 = _AdaLN(self.hidden, self.adaln_dim, name="norm1")(x, embedded_timestep, temb)
-    x = x + gate1 * _Attention(self.hidden, self.heads, name="attn1")(h, cos=cos, sin=sin)
+    h, gate1 = _AdaLN(self.hidden, self.adaln_dim, name="norm1")(x.astype(jnp.float32), embedded_timestep, temb)
+    # fp32 residual accumulation: bf16 activations in, fp32 adds out.
+    x = x.astype(jnp.float32) + gate1 * _Attention(self.hidden, self.heads, name="attn1")(h, cos=cos, sin=sin).astype(jnp.float32)
     h, gate2 = _AdaLN(self.hidden, self.adaln_dim, name="norm2")(x, embedded_timestep, temb)
-    x = x + gate2 * _Attention(self.hidden, self.heads, self.context_dim, cross=True, name="attn2")(h, context=context, mask=mask)
+    x = x + gate2 * _Attention(self.hidden, self.heads, self.context_dim, cross=True, name="attn2")(h, context=context, mask=mask).astype(jnp.float32)
     h, gate3 = _AdaLN(self.hidden, self.adaln_dim, name="norm3")(x, embedded_timestep, temb)
     h = nn.Dense(self.hidden * 4, use_bias=False, name="ff_in")(h)
     h = nn.gelu(h, approximate=False)
-    return x + gate3 * nn.Dense(self.hidden, use_bias=False, name="ff_out")(h)
+    x = x.astype(jnp.float32) + gate3.astype(jnp.float32) * nn.Dense(self.hidden, use_bias=False, name="ff_out")(h).astype(jnp.float32)
+    return x
 
 
 class FlaxAnimaCosmosTransformer(nn.Module):
@@ -165,28 +171,28 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     # time_proj: flip_sin_to_cos=True, downscale_freq_shift=0.0 -> exponent / half, concat [cos, sin]
     freqs = jnp.exp(-jnp.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / half)
     tfeat = timestep.astype(jnp.float32)[:, None] * freqs[None, :]
-    tproj = jnp.concatenate([jnp.cos(tfeat), jnp.sin(tfeat)], axis=-1).astype(x.dtype)
+    tproj = jnp.concatenate([jnp.cos(tfeat), jnp.sin(tfeat)], axis=-1).astype(jnp.float32)
     # Stream 1: t_embedder(tproj) = linear_1 -> silu -> linear_2(3*hidden); added in every AdaLN
-    temb = nn.Dense(hidden, use_bias=False, name="time_embed_linear_1")(tproj)
+    temb = nn.Dense(hidden, use_bias=False, name="time_embed_linear_1", dtype=jnp.float32, param_dtype=jnp.float32)(tproj)
     temb = nn.silu(temb)
-    temb = nn.Dense(3 * hidden, use_bias=False, name="time_embed_linear_2")(temb)
+    temb = nn.Dense(3 * hidden, use_bias=False, name="time_embed_linear_2", dtype=jnp.float32, param_dtype=jnp.float32)(temb)
     # Stream 2: embedded_timestep = RMS(tproj); flows through each AdaLN's own MLP
     embedded_timestep = _rms(tproj, self.param("time_embed_norm", nn.initializers.ones, (hidden,)))
     grid = (t // self.patch_size[0], h // self.patch_size[1], w // self.patch_size[2])
-    cos, sin = cosmos_rope(x.shape[1], self.head_dim, x.dtype, self.rope_scale, grid)
+    cos, sin = cosmos_rope(x.shape[1], self.head_dim, jnp.float32, self.rope_scale, grid)
     for i in range(self.layers):
       if self.active_layers is not None and i >= self.active_layers:
         break
       x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
     # norm_out (CosmosAdaLayerNorm): silu -> lin1 -> lin2(2*hidden), + temb[..., :2h], chunk2
     y = nn.silu(embedded_timestep)
-    y = nn.Dense(self.adaln_dim, use_bias=False, name="norm_out_linear_1")(y)
-    y = nn.Dense(2 * hidden, use_bias=False, name="norm_out_linear_2")(y)
+    y = nn.Dense(self.adaln_dim, use_bias=False, name="norm_out_linear_1", dtype=jnp.float32, param_dtype=jnp.float32)(y)
+    y = nn.Dense(2 * hidden, use_bias=False, name="norm_out_linear_2", dtype=jnp.float32, param_dtype=jnp.float32)(y)
     y = y + temb[:, : 2 * hidden]
     shift, scale = jnp.split(y, 2, axis=-1)
-    y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x)
+    y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x.astype(jnp.float32))
     y = y * (1 + scale[:, None, :]) + shift[:, None, :]
-    y = nn.Dense(self.out_channels * self.patch_size[0] * self.patch_size[1] * self.patch_size[2], use_bias=False, name="proj_out")(y)
+    y = nn.Dense(self.out_channels * self.patch_size[0] * self.patch_size[1] * self.patch_size[2], use_bias=False, name="proj_out", dtype=jnp.float32, param_dtype=jnp.float32)(y)
     return cosmos_unpatchify(y, self.out_channels, (t, h, w), self.patch_size)
 
 
