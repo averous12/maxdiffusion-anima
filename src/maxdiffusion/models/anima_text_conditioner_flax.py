@@ -87,6 +87,7 @@ def convert_anima_aesthetic_adapter_weights(path, params, dtype=jnp.bfloat16):
     put(('norm','weight'),'norm.weight')
     put(('out_proj','kernel'),'out_proj.weight',True); put(('out_proj','bias'),'out_proj.bias',False)
     for i in range(6):
+      print(f"[aesthetic] adapter block {i+1}/6", flush=True)
       p=f'blocks.{i}'; t=f'blocks_{i}'
       for a in ('self_attn','cross_attn'):
         for q in ('q_proj','k_proj','v_proj','o_proj'): put((t,a,q,'kernel'),f'{p}.{a}.{q}.weight',True)

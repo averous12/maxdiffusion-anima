@@ -216,6 +216,7 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
       if tuple(value.shape) != tuple(flat[dst].shape):
         raise ValueError(f"Shape mismatch {src}: {value.shape} != {dst}: {flat[dst].shape}")
       converted[dst] = value; consumed.add(src)
+    print("[aesthetic] core embeddings", flush=True)
     put(("patch_embed", "kernel"), "x_embedder.proj.1.weight")
     put(("time_embed_linear_1", "kernel"), "t_embedder.1.linear_1.weight")
     put(("time_embed_linear_2", "kernel"), "t_embedder.1.linear_2.weight")
@@ -224,6 +225,7 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
     put(("norm_out_linear_2", "kernel"), "final_layer.adaln_modulation.2.weight")
     put(("proj_out", "kernel"), "final_layer.linear.weight")
     for i in range(28):
+      print(f"[aesthetic] transformer block {i+1}/28", flush=True)
       s=f"blocks.{i}"; t=f"transformer_blocks_{i}"
       for norm, source in (("norm1","self_attn"),("norm2","cross_attn"),("norm3","mlp")):
         put((t,norm,"linear_1","kernel"), f"{s}.adaln_modulation_{source}.1.weight")

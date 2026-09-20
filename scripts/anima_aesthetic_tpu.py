@@ -113,10 +113,14 @@ log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 
 t0 = time.perf_counter()
 transformer = FlaxAnimaCosmosTransformer(layers=28)
+log("transformer: init on dummy (1,16,1,8,8) shapes...")
 tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.bfloat16),
                       jnp.zeros((1,), jnp.bfloat16), jnp.zeros((1, 8, 1024), jnp.bfloat16))
+log(f"transformer: init done in {time.perf_counter()-t0:.1f}s")
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
+log(f"transformer: converting 685 aesthetic keys from {aesthetic_path} ...")
 t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
+log("transformer: conversion done")
 del tv
 gc.collect()
 log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
