@@ -183,7 +183,8 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     x = jnp.concatenate([hidden_states, padding_channel], axis=1)
     tokens = cosmos_patchify(x, self.patch_size)
     hidden = self.heads * self.head_dim
-    x = nn.Dense(hidden, use_bias=False, name="patch_embed")(tokens)
+    x = nn.Dense(hidden, use_bias=False, name="patch_embed", dtype=jnp.float32, param_dtype=jnp.bfloat16)(tokens)
+    x = x.astype(jnp.float32)
     half = hidden // 2
     # time_proj: flip_sin_to_cos=True, downscale_freq_shift=0.0 -> exponent / half, concat [cos, sin]
     freqs = jnp.exp(-jnp.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / half)
@@ -201,6 +202,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
       if self.active_layers is not None and i >= self.active_layers:
         break
       x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+      x = x.astype(jnp.float32)
       if self.diag_sync:
         try:
           x.block_until_ready()
