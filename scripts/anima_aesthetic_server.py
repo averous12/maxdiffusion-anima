@@ -27,9 +27,9 @@ import traceback
 import faulthandler
 faulthandler.dump_traceback_later(600, exit=True)
 import jax
-jax.config.update("jax_default_matmul_precision", "bfloat16")
+jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 import jax.numpy as jnp
-log("matmul precision: bfloat16 (single-change bf16 test; activations stay fp32)")
+log("matmul precision: BF16_BF16_F32 (bf16 operands, fp32 accumulate; activations stay fp32)")
 log(f"devices: {jax.devices()}")
 
 from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, convert_anima_aesthetic_weights

@@ -51,6 +51,22 @@ def _rms(x, weight, eps=1e-6):
   return (xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + eps) * weight.astype(jnp.float32)).astype(jnp.float32)
 
 
+class AnimaDtypePolicy:
+  """One-knob bf16 ladder: flip fields individually, never rewrite the model.
+
+  Baseline (all fp32): proven Fern run. Stage 1 flips only MATMUL_PRECISION.
+  Later stages flip ACT/RESIDUAL/etc. one at a time.
+  """
+  ACT_DTYPE = jnp.float32        # latent/ctx/pad in/out of transformer
+  RESIDUAL_DTYPE = jnp.float32   # block residual adds
+  TEMB_DTYPE = jnp.float32       # timestep embedding streams
+  ROPE_DTYPE = jnp.float32       # RoPE cos/sin
+  ATTN_SCORE_DTYPE = jnp.float32 # QK scores + softmax
+  NORM_DTYPE = jnp.float32       # RMS/LayerNorm + norm_out
+  PARAM_DTYPE = jnp.bfloat16     # stored weights (memory win, no arithmetic change)
+  MATMUL_PRECISION = "BF16_BF16_F32"  # bf16 operands, fp32 accumulation
+
+
 def cosmos_rope(seq_len, head_dim, dtype, rope_scale=(1.0, 4.0, 4.0), grid=None):
   if grid is None:
     pos = jnp.arange(seq_len, dtype=jnp.float32)[:, None]
@@ -148,6 +164,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   patch_size: Tuple[int, int, int] = (1, 2, 2)
   rope_scale: Tuple[float, float, float] = (1.0, 4.0, 4.0)
   active_layers: Optional[int] = None
+  diag_sync: bool = False  # diagnostic only: block_until_ready per stage (destroys perf)
   @nn.compact
   def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None, padding_mask=None):
     b, c, t, h, w = hidden_states.shape
@@ -184,6 +201,11 @@ class FlaxAnimaCosmosTransformer(nn.Module):
       if self.active_layers is not None and i >= self.active_layers:
         break
       x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+      if self.diag_sync:
+        try:
+          x.block_until_ready()
+        except Exception:
+          pass
     # norm_out (CosmosAdaLayerNorm): silu -> lin1 -> lin2(2*hidden), + temb[..., :2h], chunk2
     y = nn.silu(embedded_timestep)
     y = nn.Dense(self.adaln_dim, use_bias=False, name="norm_out_linear_1", dtype=jnp.float32, param_dtype=jnp.float32)(y)
