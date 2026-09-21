@@ -157,8 +157,10 @@ log("SERVER: building transformer module...")
 t0t = time.perf_counter()
 transformer = FlaxAnimaCosmosTransformer(layers=28)
 log(f"SERVER: transformer module built in {time.perf_counter()-t0t:.1f}s; initializing dummy variables...")
-tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.float32),
-                      jnp.zeros((1,), jnp.float32), jnp.zeros((1, 8, 1024), jnp.float32))
+with jax.default_device(jax.devices("cpu")[0]):
+    tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.float32),
+                          jnp.zeros((1,), jnp.float32), jnp.zeros((1, 8, 1024), jnp.float32))
+log("SERVER: transformer variables initialized on CPU")
 log("SERVER: transformer dummy init complete")
 t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
 if _cache_valid(t_cache, aesthetic_path, aes_mtime):
