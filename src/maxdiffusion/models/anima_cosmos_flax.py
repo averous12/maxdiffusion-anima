@@ -118,17 +118,11 @@ class _Attention(nn.Module):
     ctx = x if context is None else context
     d = self.hidden // self.heads
     qd = self.hidden // self.heads
-    print(f"[ATTN] cross={self.cross} x={x.shape} ctx={ctx.shape} hidden={self.hidden} heads={self.heads} context_dim={self.context_dim}", flush=True)
     q = nn.Dense(self.hidden, use_bias=False, name="to_q")(x).reshape(x.shape[0], x.shape[1], self.heads, qd)
-    if self.cross and self.context_dim is not None:
-      ctxd = self.context_dim // self.heads
-      k = nn.Dense(self.context_dim, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, ctxd)
-      v = nn.Dense(self.context_dim, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, ctxd)
-    else:
-      k = nn.Dense(self.hidden, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
-      v = nn.Dense(self.hidden, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    k = nn.Dense(self.hidden, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    v = nn.Dense(self.hidden, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
     q = _rms(q, self.param("norm_q", nn.initializers.ones, (qd,)))
-    k = _rms(k, self.param("norm_k", nn.initializers.ones, (qd if not (self.cross and self.context_dim is not None) else ctxd,)))
+    k = _rms(k, self.param("norm_k", nn.initializers.ones, (qd,)))
     if not self.cross and cos is not None:
       cos = cos.astype(jnp.float32); sin = sin.astype(jnp.float32)
       q = q.astype(jnp.float32); k = k.astype(jnp.float32)
@@ -138,6 +132,8 @@ class _Attention(nn.Module):
     if mask is not None:
       scores = jnp.where(mask[:, None, None, :].astype(bool), scores, -1e4)
     y = jnp.einsum("bhqk,bkhd->bqhd", nn.softmax(scores, axis=-1).astype(jnp.float32), v.astype(jnp.float32))
+    b, q_len, h, d = y.shape
+    y = y.reshape(b, q_len, h * d)
     return nn.Dense(self.hidden, use_bias=False, name="to_out")(y)
 
 
