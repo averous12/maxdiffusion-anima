@@ -118,6 +118,7 @@ class _Attention(nn.Module):
     ctx = x if context is None else context
     d = self.hidden // self.heads
     qd = self.hidden // self.heads
+    print(f"[ATTN] cross={self.cross} x={x.shape} ctx={ctx.shape} hidden={self.hidden} heads={self.heads} context_dim={self.context_dim}", flush=True)
     q = nn.Dense(self.hidden, use_bias=False, name="to_q")(x).reshape(x.shape[0], x.shape[1], self.heads, qd)
     if self.cross and self.context_dim is not None:
       ctxd = self.context_dim // self.heads
