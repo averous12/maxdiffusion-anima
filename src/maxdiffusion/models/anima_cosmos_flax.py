@@ -117,11 +117,17 @@ class _Attention(nn.Module):
   def __call__(self, x, context=None, cos=None, sin=None, mask=None):
     ctx = x if context is None else context
     d = self.hidden // self.heads
-    q = nn.Dense(self.hidden, use_bias=False, name="to_q")(x).reshape(x.shape[0], x.shape[1], self.heads, d)
-    k = nn.Dense(self.hidden, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, d)
-    v = nn.Dense(self.hidden, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, d)
-    q = _rms(q, self.param("norm_q", nn.initializers.ones, (d,)))
-    k = _rms(k, self.param("norm_k", nn.initializers.ones, (d,)))
+    qd = self.hidden // self.heads
+    q = nn.Dense(self.hidden, use_bias=False, name="to_q")(x).reshape(x.shape[0], x.shape[1], self.heads, qd)
+    if self.cross and self.context_dim is not None:
+      ctxd = self.context_dim // self.heads
+      k = nn.Dense(self.context_dim, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, ctxd)
+      v = nn.Dense(self.context_dim, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, ctxd)
+    else:
+      k = nn.Dense(self.hidden, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+      v = nn.Dense(self.hidden, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    q = _rms(q, self.param("norm_q", nn.initializers.ones, (qd,)))
+    k = _rms(k, self.param("norm_k", nn.initializers.ones, (qd if not (self.cross and self.context_dim is not None) else ctxd,)))
     if not self.cross and cos is not None:
       cos = cos.astype(jnp.float32); sin = sin.astype(jnp.float32)
       q = q.astype(jnp.float32); k = k.astype(jnp.float32)
