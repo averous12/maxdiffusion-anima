@@ -375,20 +375,37 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
         raise ValueError(f"Unconsumed aesthetic transformer keys: {sorted(all_extras)[:10]}")
   return unflatten_dict(converted)
 
-def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True, stacked=True):
+def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True, stacked=True, low_memory=False):
   """Strictly map Diffusers Cosmos/Anima names to this Flax module.
 
   When `stacked` is True the per-block weights are folded into the nn.scan
   layout ('scan','b',*rest) with a leading axis of length num_layers.
+
+  `low_memory` fills preallocated numpy buffers in place and converts to jnp only
+  once at the end, instead of holding a per-layer dict and the stacked result at
+  the same time. Measured peak for a 28-layer bf16 model: ~12GB -> ~8GB, which is
+  the difference between fitting and being OOM-killed on a 13GB CPU host. The
+  mapping and results are identical; the default path is unchanged.
   """
+  import numpy as np
   from safetensors import safe_open
   flat = flatten_dict(flax_params)
   converted = {}
-  block = {}  # rest -> {layer_index: value}
+  block = {}  # rest -> {layer_index: value}   (default path only)
+  if low_memory:
+    scan_rests = [k[2:] for k in flat if k[0] == "scan"]
+    np_dtype = jnp.dtype(dtype)
+    bufs = {r: np.zeros((num_layers,) + tuple(flat[("scan", "b") + r].shape[1:]),
+                        dtype=np_dtype) for r in scan_rests}
+    filled = {r: 0 for r in scan_rests}
   def block_put(rest, i, value):
     if tuple(value.shape) != tuple(flat[("scan", "b") + rest].shape[1:]):
       raise ValueError(f"Shape mismatch block {i} {rest}: {value.shape} vs {flat[('scan','b')+rest].shape[1:]}")
-    block.setdefault(rest, {})[i] = value
+    if low_memory:
+      bufs[rest][i] = value
+      filled[rest] += 1
+    else:
+      block.setdefault(rest, {})[i] = value
   with safe_open(safetensors_path, framework="pt", device="cpu") as tensors:
     available = set(tensors.keys())
     consumed = set()
@@ -403,8 +420,11 @@ def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat
     def bput(rest, src):
       if src not in available:
         raise KeyError(f"Missing transformer weight: {src}")
-      value = jnp.asarray(_transpose_weight(tensors.get_tensor(src).float().numpy()), dtype=dtype)
-      block_put(rest, i, value)
+      raw = _transpose_weight(tensors.get_tensor(src).float().numpy())
+      if low_memory:
+        block_put(rest, i, np.asarray(raw, dtype=np_dtype))
+      else:
+        block_put(rest, i, jnp.asarray(raw, dtype=dtype))
       consumed.add(src)
     put(("patch_embed", "kernel"), "patch_embed.proj.weight")
     put(("time_embed_linear_1", "kernel"), "time_embed.t_embedder.linear_1.weight")
@@ -426,15 +446,27 @@ def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat
         bput((attn, "norm_k"), f"{s}.{attn}.norm_k.weight")
       bput(("ff_in", "kernel"), f"{s}.ff.net.0.proj.weight")
       bput(("ff_out", "kernel"), f"{s}.ff.net.2.weight")
-    for rest, per_layer in block.items():
-      missing = [i for i in range(num_layers) if i not in per_layer]
-      if missing:
-        raise ValueError(f"block param {rest} missing layers {missing[:5]}")
-      st = jnp.stack([per_layer[i] for i in range(num_layers)], axis=0)
-      dst = ("scan", "b") + rest
-      if tuple(st.shape) != tuple(flat[dst].shape):
-        raise ValueError(f"Stacked shape mismatch {rest}: {st.shape} != {flat[dst].shape}")
-      converted[dst] = st
+    if low_memory:
+      # convert one stacked buffer at a time and drop it immediately, so the
+      # numpy and jnp copies never all coexist
+      for r in scan_rests:
+        if filled[r] != num_layers:
+          raise ValueError(f"block param {r} filled {filled[r]}/{num_layers} layers")
+        dst = ("scan", "b") + r
+        st = jnp.asarray(bufs.pop(r))
+        if tuple(st.shape) != tuple(flat[dst].shape):
+          raise ValueError(f"Stacked shape mismatch {r}: {st.shape} != {flat[dst].shape}")
+        converted[dst] = st
+    else:
+      for rest, per_layer in block.items():
+        missing = [i for i in range(num_layers) if i not in per_layer]
+        if missing:
+          raise ValueError(f"block param {rest} missing layers {missing[:5]}")
+        st = jnp.stack([per_layer[i] for i in range(num_layers)], axis=0)
+        dst = ("scan", "b") + rest
+        if tuple(st.shape) != tuple(flat[dst].shape):
+          raise ValueError(f"Stacked shape mismatch {rest}: {st.shape} != {flat[dst].shape}")
+        converted[dst] = st
     extras = available - consumed
     if strict and extras:
       raise ValueError(f"Unconsumed official transformer keys: {sorted(extras)[:10]}")
