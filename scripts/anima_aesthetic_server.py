@@ -174,6 +174,11 @@ def encode_texts(prompt, neg):
 log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
 
 log("=== SERVER: weight conversion (cached) ===")
+# All conversion/merge work happens with CPU as the default device. The converters
+# build their trees leaf-by-leaf with jnp.asarray; with the TPU as default device
+# every leaf becomes its own host->TPU transfer (measured: 227.9s for the
+# transformer instead of ~10s). One explicit device_put at the end is far cheaper.
+_CPU = jax.devices("cpu")[0]
 t0 = time.perf_counter()
 cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
 conditioner = FlaxAnimaTextConditioner(cond_cfg)
@@ -187,7 +192,8 @@ if _cache_valid(cond_cache, aesthetic_path, aes_mtime):
         cond_params = flax_serialization.from_bytes(cv["params"], f.read())
     log(f"conditioner loaded from cache in {time.perf_counter()-t0:.1f}s")
 else:
-    cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
+    with jax.default_device(_CPU):
+        cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
     with open(cond_cache, "wb") as f:
         f.write(flax_serialization.to_bytes(cond_params))
     _cache_mark(cond_cache, aesthetic_path, aes_mtime)
@@ -217,8 +223,9 @@ if _cache_valid(t_cache, aesthetic_path, aes_mtime):
     log(f"transformer loaded from cache in {time.perf_counter()-t0:.1f}s")
 else:
     try:
-        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
-                                                  dtype=jnp.bfloat16, num_layers=28)
+        with jax.default_device(_CPU):
+            t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
+                                                       dtype=jnp.bfloat16, num_layers=28)
     except Exception:
         log("transformer: conversion raised:\n" + traceback.format_exc())
         raise
@@ -249,16 +256,17 @@ if _cache_valid(vae_cache, vae_src, vae_mtime):
     log(f"vae loaded from cache in {time.perf_counter()-t0:.1f}s")
 else:
     _ft = {k: v.value for k, v in _fs.items()}
-    _conv = load_qwen_image_vae(snapshot_dir, _ft)
-    _cf = _flatten_dict(_conv)
-    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-    _nf, _miss = {}, []
-    for _k, _vs in _fs.items():
-        _p = "/".join(str(x) for x in _k)
-        if _p in _cf_by_path:
-            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-        else:
-            _miss.append(_p)
+    with jax.default_device(_CPU):
+        _conv = load_qwen_image_vae(snapshot_dir, _ft)
+        _cf = _flatten_dict(_conv)
+        _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+        _nf, _miss = {}, []
+        for _k, _vs in _fs.items():
+            _p = "/".join(str(x) for x in _k)
+            if _p in _cf_by_path:
+                _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+            else:
+                _miss.append(_p)
     assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
     nnx.update(vae, nnx.State.from_flat_path(_nf))
     with open(vae_cache, "wb") as f:
