@@ -128,4 +128,22 @@ def build():
 
 
 if __name__ == "__main__":
-    build().launch(share=True)
+    # No Gradio tunnel: `anima_cloudflared.py` publishes this port instead.
+    # Runs as a long-lived subprocess, so block after launch() returns.
+    import os
+    import time
+    _port = int(os.environ.get("ANIMA_UI_PORT", "7860"))
+    demo = build()
+    demo.launch(
+        server_name=os.environ.get("ANIMA_UI_HOST", "0.0.0.0"),
+        server_port=_port,
+        share=False,
+        prevent_thread_lock=True,
+        show_error=True,
+    )
+    print(f"ANIMA_UI_UP on port {_port}", flush=True)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
