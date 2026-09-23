@@ -25,7 +25,10 @@ import numpy as np
 import gc
 import traceback
 import faulthandler
-faulthandler.dump_traceback_later(600, exit=True)
+# exit=False: a diagnostic stack dump must never be able to kill the process.
+# With exit=True this fires on a timer regardless of load and terminates the run,
+# which is indistinguishable from a real hang.
+faulthandler.dump_traceback_later(1800, exit=False)
 import jax
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 import jax.numpy as jnp
@@ -41,7 +44,6 @@ from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, Autoenc
 from maxdiffusion.schedulers.scheduling_flow_match_flax import (
     FlaxFlowMatchScheduler, FlowMatchSchedulerState)
 from flax import nnx
-from flax import serialization as flax_serialization
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
@@ -86,41 +88,25 @@ log(f"text encoding done in {time.perf_counter()-t0:.1f}s; qe {qe.shape} {qe.dty
 np.save('/content/dump_qe.npy', qe); np.save('/content/dump_ne.npy', ne); np.save('/content/dump_qm.npy', qm); np.save('/content/dump_nm.npy', nm); np.save('/content/dump_t5.npy', t5ids); np.save('/content/dump_nt5.npy', nt5ids)
 
 log("=== STAGE 2: weight conversion ===")
-CACHE_DIR = "/content/anima_cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-import hashlib
-def _cache_valid(path, src, src_mtime):
-    if not os.path.exists(path):
-        return False
-    try:
-        import json
-        meta = json.load(open(path + ".meta"))
-        return meta.get("src_mtime") == src_mtime and meta.get("src_size") == os.path.getsize(src)
-    except Exception:
-        return False
-def _cache_mark(path, src, src_mtime):
-    import json
-    json.dump({"src_mtime": src_mtime, "src_size": os.path.getsize(src)},
-              open(path + ".meta", "w"))
+# No parameter cache. Measured on the real tree: flax serialization costs 76s to
+# write the 6.6 GB stacked transformer tree (45.9s serialize + 30.1s write) against
+# ~10s to re-convert from the checkpoint, so caching is a net loss. It was also a
+# latent crash -- serializing an nnx.State raised
+# "TypeError: can not serialize 'State' object" and killed the process, which then
+# looked like a hang because the launcher redirects stderr to a separate file.
+# Converters build trees leaf-by-leaf with jnp.asarray, so pin CPU as the default
+# device during conversion: otherwise every leaf becomes its own host->TPU transfer
+# (measured 227.9s for the transformer instead of 60.6s).
+_CPU = jax.devices("cpu")[0]
 
 t0 = time.perf_counter()
 cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
 conditioner = FlaxAnimaTextConditioner(cond_cfg)
 cv = conditioner.init(jax.random.key(1), jnp.zeros((1, 8, 1024), jnp.float32), np.zeros((1, 8), np.int32))
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
-aes_mtime = os.path.getmtime(aesthetic_path)
-cond_cache = os.path.join(CACHE_DIR, "cond_params.msgpack")
-if _cache_valid(cond_cache, aesthetic_path, aes_mtime):
-    log("conditioner: loading from disk cache ...")
-    with open(cond_cache, "rb") as f:
-        cond_params = flax_serialization.from_bytes(cv["params"], f.read())
-    log(f"conditioner loaded from cache in {time.perf_counter()-t0:.1f}s")
-else:
+with jax.default_device(_CPU):
     cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
-    with open(cond_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(cond_params))
-    _cache_mark(cond_cache, aesthetic_path, aes_mtime)
-    log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
+log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 del cv
 gc.collect()
 
@@ -133,22 +119,13 @@ log(f"transformer: init done in {time.perf_counter()-t0:.1f}s")
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
 log(f"transformer: converting 685 aesthetic keys from {aesthetic_path} ...")
 log(f"transformer: file size {os.path.getsize(aesthetic_path)/1e9:.2f} GB, tv leaves {len(jax.tree_util.tree_leaves(tv['params']))}")
-t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
-if _cache_valid(t_cache, aesthetic_path, aes_mtime):
-    log("transformer: loading from disk cache ...")
-    with open(t_cache, "rb") as f:
-        t_params = flax_serialization.from_bytes(tv["params"], f.read())
-    log("transformer: loaded from cache")
-else:
-    try:
+try:
+    with jax.default_device(_CPU):
         t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
-    except Exception:
-        log("transformer: conversion raised:\n" + traceback.format_exc())
-        raise
-    log("transformer: conversion done")
-    with open(t_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(t_params))
-    _cache_mark(t_cache, aesthetic_path, aes_mtime)
+except Exception:
+    log("transformer: conversion raised:\n" + traceback.format_exc())
+    raise
+log("transformer: conversion done")
 del tv
 gc.collect()
 log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
@@ -158,18 +135,19 @@ vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat
 _st = nnx.state(vae, nnx.Param)
 _fs = dict(nnx.to_flat_state(_st))
 _ft = {k: v.value for k, v in _fs.items()}
-_conv = load_qwen_image_vae(snapshot_dir, _ft)
-_cf = _flatten_dict(_conv)
-_cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-_nf, _miss = {}, []
-for _k, _vs in _fs.items():
-    _p = "/".join(str(x) for x in _k)
-    if _p in _cf_by_path:
-        _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-    else:
-        _miss.append(_p)
-assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
-nnx.update(vae, nnx.State.from_flat_path(_nf))
+with jax.default_device(_CPU):
+    _conv = load_qwen_image_vae(snapshot_dir, _ft)
+    _cf = _flatten_dict(_conv)
+    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+    _nf, _miss = {}, []
+    for _k, _vs in _fs.items():
+        _p = "/".join(str(x) for x in _k)
+        if _p in _cf_by_path:
+            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+        else:
+            _miss.append(_p)
+    assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
+    nnx.update(vae, nnx.State.from_flat_path(_nf))
 # No msgpack cache: to_bytes+write on the transformer tree measured 76s vs ~10s to
 # re-convert, and serializing an nnx.State here crashed outright
 # ("TypeError: can not serialize 'State' object") whenever the cache was invalid.
