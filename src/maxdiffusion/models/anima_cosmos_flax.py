@@ -4,6 +4,7 @@ from typing import Any, Optional, Tuple
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.core.axes_scan import broadcast as _scan_broadcast
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 
@@ -156,6 +157,23 @@ class _Block(nn.Module):
     return x
 
 
+class _ScannedBlock(nn.Module):
+  """One transformer block, in the shape nn.scan needs.
+
+  Returns (carry, output) — identical here — so the residual stream threads
+  through the scan. Params get a leading axis of length `layers`.
+  """
+  hidden: int
+  heads: int
+  context_dim: int
+  adaln_dim: int
+  @nn.compact
+  def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask):
+    out = _Block(self.hidden, self.heads, self.context_dim, self.adaln_dim, name="b")(
+        x, embedded_timestep, temb, context, cos, sin, mask)
+    return out, out
+
+
 class FlaxAnimaCosmosTransformer(nn.Module):
   in_channels: int = 16
   out_channels: int = 16
@@ -167,6 +185,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   patch_size: Tuple[int, int, int] = (1, 2, 2)
   rope_scale: Tuple[float, float, float] = (1.0, 4.0, 4.0)
   active_layers: Optional[int] = None
+  scan_blocks: bool = True  # lax.scan over blocks: one compiled body, not 28
   diag_sync: bool = False  # diagnostic only: block_until_ready per stage (destroys perf)
   @nn.compact
   def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None, padding_mask=None):
@@ -201,16 +220,31 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     embedded_timestep = _rms(tproj, self.param("time_embed_norm", nn.initializers.ones, (hidden,)))
     grid = (t // self.patch_size[0], h // self.patch_size[1], w // self.patch_size[2])
     cos, sin = cosmos_rope(x.shape[1], self.head_dim, jnp.float32, self.rope_scale, grid)
-    for i in range(self.layers):
-      if self.active_layers is not None and i >= self.active_layers:
-        break
-      x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+    if self.scan_blocks:
+      # One block body compiled once and looped, instead of 28 unrolled
+      # subgraphs. This is what keeps host compile memory bounded.
+      n = self.layers if self.active_layers is None else self.active_layers
+      ScanBlock = nn.scan(
+          _ScannedBlock,
+          variable_axes={"params": 0},
+          split_rngs={"params": False},
+          length=n,
+          in_axes=(_scan_broadcast,) * 6,
+      )
+      x, _ = ScanBlock(hidden, self.heads, self.context_dim, self.adaln_dim, name="scan")(
+          x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
       x = x.astype(jnp.float32)
-      if self.diag_sync:
-        try:
-          x.block_until_ready()
-        except Exception:
-          pass
+    else:
+      for i in range(self.layers):
+        if self.active_layers is not None and i >= self.active_layers:
+          break
+        x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+        x = x.astype(jnp.float32)
+        if self.diag_sync:
+          try:
+            x.block_until_ready()
+          except Exception:
+            pass
     # norm_out (CosmosAdaLayerNorm): silu -> lin1 -> lin2(2*hidden), + temb[..., :2h], chunk2
     y = nn.silu(embedded_timestep)
     y = nn.Dense(self.adaln_dim, use_bias=False, name="norm_out_linear_1", dtype=jnp.float32, param_dtype=jnp.float32)(y)
@@ -227,6 +261,39 @@ def _transpose_weight(value):
   return value.T if value.ndim == 2 else value
 
 
+def stack_block_params(converted, num_layers):
+  """Fold per-block unrolled params into the nn.scan layout.
+
+  ('transformer_blocks_i', *rest) for i in 0..N-1  ->  ('scan', 'b', *rest)
+  with a leading axis of length N. Leaves non-block entries untouched.
+  """
+  out = {}
+  block_keys = None
+  for i in range(num_layers):
+    prefix = f"transformer_blocks_{i}"
+    for k, v in converted.items():
+      if k[0] != prefix:
+        continue
+      rest = k[1:]
+      if block_keys is None:
+        block_keys = set()
+      block_keys.add(rest)
+      out.setdefault(("scan", "b") + rest, []).append((i, v))
+  if block_keys is None:
+    raise ValueError("stack_block_params: no per-block params found")
+  stacked = {}
+  for k, vals in out.items():
+    vals.sort(key=lambda t: t[0])
+    if len(vals) != num_layers:
+      raise ValueError(f"{k}: expected {num_layers} layers, got {len(vals)}")
+    stacked[k] = jnp.stack([v for _, v in vals], axis=0)
+  for k, v in converted.items():
+    if k[0].startswith("transformer_blocks_"):
+      continue
+    stacked[k] = v
+  return stacked
+
+
 def _aesthetic_get(available, name):
   key = f"model.diffusion_model.{name}"
   if key not in available:
@@ -234,11 +301,20 @@ def _aesthetic_get(available, name):
   return key
 
 
-def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfloat16):
-  """Convert official single-file Anima-Aesthetic transformer weights."""
+def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, stacked=True):
+  """Convert official single-file Anima-Aesthetic transformer weights.
+
+  When `stacked` is True the per-block weights are folded into the nn.scan
+  layout ('scan','b',*rest) with a leading axis of length num_layers.
+  """
   from safetensors import safe_open
   flat = flatten_dict(flax_params)
   converted = {}
+  block = {}  # rest -> {layer_index: value}
+  def block_put(rest, i, value):
+    if tuple(value.shape) != tuple(flat[("scan", "b") + rest].shape[1:]):
+      raise ValueError(f"Shape mismatch block {i} {rest}: {value.shape} vs {flat[('scan','b')+rest].shape[1:]}")
+    block.setdefault(rest, {})[i] = value
   with safe_open(safetensors_path, framework="pt", device="cpu") as tensors:
     available = set(tensors.keys())
     consumed = set()
@@ -258,35 +334,61 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
     put(("norm_out_linear_1", "kernel"), "final_layer.adaln_modulation.1.weight")
     put(("norm_out_linear_2", "kernel"), "final_layer.adaln_modulation.2.weight")
     put(("proj_out", "kernel"), "final_layer.linear.weight")
-    for i in range(28):
-      print(f"[aesthetic] transformer block {i+1}/28", flush=True)
-      s=f"blocks.{i}"; t=f"transformer_blocks_{i}"
+    for i in range(num_layers):
+      print(f"[aesthetic] transformer block {i+1}/{num_layers}", flush=True)
+      s=f"blocks.{i}"
       for norm, source in (("norm1","self_attn"),("norm2","cross_attn"),("norm3","mlp")):
-        put((t,norm,"linear_1","kernel"), f"{s}.adaln_modulation_{source}.1.weight")
-        put((t,norm,"linear_2","kernel"), f"{s}.adaln_modulation_{source}.2.weight")
+        for lin in ("linear_1", "linear_2"):
+          src = _aesthetic_get(available, f"{s}.adaln_modulation_{source}.{lin[-1]}.weight")
+          v = jnp.asarray(tensors.get_tensor(src).float().numpy().T, dtype=dtype)
+          block_put((norm, lin, "kernel"), i, v); consumed.add(src)
       for attn, source in (("attn1","self_attn"),("attn2","cross_attn")):
         for proj, dst_proj in (("q_proj","to_q"),("k_proj","to_k"),("v_proj","to_v")):
-          put((t,attn,dst_proj,"kernel"), f"{s}.{source}.{proj}.weight")
-        put((t,attn,"to_out","kernel"), f"{s}.{source}.output_proj.weight")
-        put((t,attn,"norm_q"), f"{s}.{source}.q_norm.weight", False)
-        put((t,attn,"norm_k"), f"{s}.{source}.k_norm.weight", False)
-      put((t,"ff_in","kernel"), f"{s}.mlp.layer1.weight")
-      put((t,"ff_out","kernel"), f"{s}.mlp.layer2.weight")
+          src = _aesthetic_get(available, f"{s}.{source}.{proj}.weight")
+          v = jnp.asarray(tensors.get_tensor(src).float().numpy().T, dtype=dtype)
+          block_put((attn, dst_proj, "kernel"), i, v); consumed.add(src)
+        src = _aesthetic_get(available, f"{s}.{source}.output_proj.weight")
+        v = jnp.asarray(tensors.get_tensor(src).float().numpy().T, dtype=dtype)
+        block_put((attn, "to_out", "kernel"), i, v); consumed.add(src)
+        for nrm in ("q_norm", "k_norm"):
+          src = _aesthetic_get(available, f"{s}.{source}.{nrm}.weight")
+          v = jnp.asarray(tensors.get_tensor(src).float().numpy(), dtype=dtype)
+          block_put((attn, "norm_q" if nrm == "q_norm" else "norm_k"), i, v); consumed.add(src)
+      for dst_name, src_name in (("ff_in", "layer1"), ("ff_out", "layer2")):
+        src = _aesthetic_get(available, f"{s}.mlp.{src_name}.weight")
+        v = jnp.asarray(tensors.get_tensor(src).float().numpy().T, dtype=dtype)
+        block_put((dst_name, "kernel"), i, v); consumed.add(src)
+    for rest, per_layer in block.items():
+      missing = [i for i in range(num_layers) if i not in per_layer]
+      if missing:
+        raise ValueError(f"block param {rest} missing layers {missing[:5]}")
+      st = jnp.stack([per_layer[i] for i in range(num_layers)], axis=0)
+      dst = ("scan", "b") + rest
+      if tuple(st.shape) != tuple(flat[dst].shape):
+        raise ValueError(f"Stacked shape mismatch {rest}: {st.shape} != {flat[dst].shape}")
+      converted[dst] = st
     extras = set(tensors.keys()) - consumed
     if extras:
-      extras = {x for x in extras if x != "__metadata__" and ".llm_adapter." in x}
       # The LLM adapter is validated by its separate converter.
-      all_extras = set(tensors.keys()) - consumed - {"__metadata__"}
-      all_extras = {x for x in all_extras if not x.startswith("model.diffusion_model.llm_adapter.")}
+      all_extras = {x for x in extras if x != "__metadata__" and not x.startswith("model.diffusion_model.llm_adapter.")}
       if all_extras:
         raise ValueError(f"Unconsumed aesthetic transformer keys: {sorted(all_extras)[:10]}")
   return unflatten_dict(converted)
 
-def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True):
-  """Strictly map Diffusers Cosmos/Anima names to this Flax module."""
+def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, strict=True, stacked=True):
+  """Strictly map Diffusers Cosmos/Anima names to this Flax module.
+
+  When `stacked` is True the per-block weights are folded into the nn.scan
+  layout ('scan','b',*rest) with a leading axis of length num_layers.
+  """
   from safetensors import safe_open
   flat = flatten_dict(flax_params)
   converted = {}
+  block = {}  # rest -> {layer_index: value}
+  def block_put(rest, i, value):
+    if tuple(value.shape) != tuple(flat[("scan", "b") + rest].shape[1:]):
+      raise ValueError(f"Shape mismatch block {i} {rest}: {value.shape} vs {flat[('scan','b')+rest].shape[1:]}")
+    block.setdefault(rest, {})[i] = value
   with safe_open(safetensors_path, framework="pt", device="cpu") as tensors:
     available = set(tensors.keys())
     consumed = set()
@@ -298,6 +400,12 @@ def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat
         raise ValueError(f"Shape mismatch {src}: {value.shape} != {dst}: {flat[dst].shape}")
       converted[dst] = value
       consumed.add(src)
+    def bput(rest, src):
+      if src not in available:
+        raise KeyError(f"Missing transformer weight: {src}")
+      value = jnp.asarray(_transpose_weight(tensors.get_tensor(src).float().numpy()), dtype=dtype)
+      block_put(rest, i, value)
+      consumed.add(src)
     put(("patch_embed", "kernel"), "patch_embed.proj.weight")
     put(("time_embed_linear_1", "kernel"), "time_embed.t_embedder.linear_1.weight")
     put(("time_embed_linear_2", "kernel"), "time_embed.t_embedder.linear_2.weight")
@@ -307,18 +415,26 @@ def convert_anima_cosmos_weights(safetensors_path, flax_params, dtype=jnp.bfloat
     put(("proj_out", "kernel"), "proj_out.weight")
     for i in range(num_layers):
       s = f"transformer_blocks.{i}"
-      t = f"transformer_blocks_{i}"
       for norm in ("norm1", "norm2", "norm3"):
-        put((t, norm, "linear_1", "kernel"), f"{s}.{norm}.linear_1.weight")
-        put((t, norm, "linear_2", "kernel"), f"{s}.{norm}.linear_2.weight")
+        bput((norm, "linear_1", "kernel"), f"{s}.{norm}.linear_1.weight")
+        bput((norm, "linear_2", "kernel"), f"{s}.{norm}.linear_2.weight")
       for attn in ("attn1", "attn2"):
         for proj in ("to_q", "to_k", "to_v"):
-          put((t, attn, proj, "kernel"), f"{s}.{attn}.{proj}.weight")
-        put((t, attn, "to_out", "kernel"), f"{s}.{attn}.to_out.0.weight")
-        put((t, attn, "norm_q"), f"{s}.{attn}.norm_q.weight")
-        put((t, attn, "norm_k"), f"{s}.{attn}.norm_k.weight")
-      put((t, "ff_in", "kernel"), f"{s}.ff.net.0.proj.weight")
-      put((t, "ff_out", "kernel"), f"{s}.ff.net.2.weight")
+          bput((attn, proj, "kernel"), f"{s}.{attn}.{proj}.weight")
+        bput((attn, "to_out", "kernel"), f"{s}.{attn}.to_out.0.weight")
+        bput((attn, "norm_q"), f"{s}.{attn}.norm_q.weight")
+        bput((attn, "norm_k"), f"{s}.{attn}.norm_k.weight")
+      bput(("ff_in", "kernel"), f"{s}.ff.net.0.proj.weight")
+      bput(("ff_out", "kernel"), f"{s}.ff.net.2.weight")
+    for rest, per_layer in block.items():
+      missing = [i for i in range(num_layers) if i not in per_layer]
+      if missing:
+        raise ValueError(f"block param {rest} missing layers {missing[:5]}")
+      st = jnp.stack([per_layer[i] for i in range(num_layers)], axis=0)
+      dst = ("scan", "b") + rest
+      if tuple(st.shape) != tuple(flat[dst].shape):
+        raise ValueError(f"Stacked shape mismatch {rest}: {st.shape} != {flat[dst].shape}")
+      converted[dst] = st
     extras = available - consumed
     if strict and extras:
       raise ValueError(f"Unconsumed official transformer keys: {sorted(extras)[:10]}")
