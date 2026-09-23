@@ -325,7 +325,8 @@ def default_req():
     return {"prompt": "masterpiece, best quality, 1girl",
             "negative_prompt": "worst quality, low quality, blurry",
             "height": 1024, "width": 1024, "steps": 30, "guidance": 4.0,
-            "seed": 0, "preview_every": 5, "out": "/content/anima_perstep.png"}
+            # -1 = pick a random seed; the server resolves it and reports the value.
+            "seed": -1, "preview_every": 5, "out": "/content/anima_perstep.png"}
 
 if not os.path.exists(REQ_PATH):
     json.dump({**default_req(), "go": False}, open(REQ_PATH, "w"))
@@ -370,10 +371,17 @@ while True:
         if (H, W) != (H0, W0):
             log(f"requested {H0}x{W0} is not a multiple of {_MULT}; using {H}x{W} "
                 f"(VAE stride 8, patchify stride 2)")
+        # A negative seed means "pick one", so the UI can offer random by default.
+        # The resolved value goes into the log and the progress file; without that a
+        # random run cannot be reproduced.
+        _seed_req = int(SEED)
+        if _seed_req < 0:
+            SEED = int(np.random.default_rng().integers(0, 2**31 - 1))
+            log(f"seed {_seed_req} requested; using random seed {SEED}")
         g0 = time.perf_counter()
-        write_prog(stage="text-encoding", step=0, steps=STEPS)
+        write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED))
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
-        write_prog(stage="conditioning", step=0, steps=STEPS)
+        write_prog(stage="conditioning", step=0, steps=STEPS, seed=int(SEED))
         context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
         neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
         context.block_until_ready(); neg_context.block_until_ready()
@@ -398,7 +406,7 @@ while True:
             if i % 2 == 0 or i == STEPS - 1:
                 write_prog(stage="denoise", step=i + 1, steps=STEPS,
                            ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
-                           guidance=GUIDANCE)
+                           guidance=GUIDANCE, seed=int(SEED))
             if PREV_EVERY and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
                 try:
                     p0 = time.perf_counter()
@@ -406,7 +414,8 @@ while True:
                     prev_total += time.perf_counter() - p0
                     write_prog(stage="denoise", step=i + 1, steps=STEPS,
                                preview_step=i + 1, preview_s=round(prev_total, 2),
-                               ms_per_step=round(step_s / (i + 1) * 1000.0, 1), guidance=GUIDANCE)
+                               ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
+                               guidance=GUIDANCE, seed=int(SEED))
                 except Exception as _e:
                     log(f"preview decode failed at step {i+1}: {_e}")
         latents.block_until_ready()
@@ -420,11 +429,11 @@ while True:
         save_u8(decode_latents(latents), OUT)
         decode_s = time.perf_counter() - v0
         total_s = time.perf_counter() - g0
-        log(f"GEN DONE {OUT} {H}x{W} in {total_s:.1f}s (text+cond {pre_s:.1f}s, "
+        log(f"GEN DONE {OUT} {H}x{W} seed {SEED} in {total_s:.1f}s (text+cond {pre_s:.1f}s, "
             f"denoise {denoise_s:.1f}s = {denoise_s / max(1, STEPS) * 1000.0:.0f} ms/step, "
             f"previews {prev_total:.1f}s, decode {decode_s:.1f}s) "
             f"= {60.0/total_s:.2f} images/min; {hbm_stats()}; RSS {rss_gb():.2f} GB")
-        write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT,
+        write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT, seed=int(SEED),
                    elapsed_s=round(total_s, 1), pre_s=round(pre_s, 1),
                    denoise_s=round(denoise_s, 1), decode_s=round(decode_s, 1),
                    height=H, width=W, hbm=hbm_stats())

@@ -10,6 +10,7 @@ channel-mean snapshot), so it costs one warm decode (~0.5 s) per preview.
 import io
 import json
 import os
+import shutil
 import time
 
 from PIL import Image
@@ -18,6 +19,11 @@ REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
 FINAL_PATH = "/content/anima_perstep.png"
+
+# Where finished images are archived (Drive, usually). Empty disables archiving.
+SAVE_ENV = "ANIMA_SAVE_DIR"
+# The server resolves a negative seed into a real one and reports it back.
+RANDOM_SEED = -1
 
 FERN_PROMPT = "masterpiece, best quality, 1girl, fern (sousou no frieren), sousou no frieren, @izei1337, purple hair, black robe, lips, sidelocks, feet out of frame, very long hair, puffy sleeves, white dress, butterfly on hand, eyelashes, simple background, closed mouth, mage staff, arm at side, straight hair, blush, solo, purple eyes, chromatic aberration, purple pupils, looking at viewer, hand up, standing, bug, robe, black background, signature, bright pupils, black coat, coat, long sleeves, blue butterfly, upturned eyes, wide sleeves, blunt bangs, from above, dress, blunt ends, long hair, purple butterfly, butterfly, tsurime, half updo"
 FERN_NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts"
@@ -61,11 +67,50 @@ def _atomic_json(path, obj):
     os.replace(tmp, path)
 
 
+def save_dir():
+    """Archive directory for finished images, or "" when archiving is disabled.
+
+    Read at call time (not import time) so a caller can set the env var after import.
+    """
+    return os.environ.get(SAVE_ENV, "").strip()
+
+
+def save_outputs(src_path, req):
+    """Copy a finished image into the archive dir under a collision-free name.
+
+    The name carries the timestamp, the resolved seed, the step count and the size, so
+    a directory of runs stays self-describing and no two runs overwrite each other. A
+    .json sidecar records the full request so any image can be reproduced exactly.
+    Returns the destination path, or None when archiving is disabled.
+    """
+    d = save_dir()
+    if not d:
+        return None
+    try:
+        os.makedirs(d, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        base = (f"anima_{ts}_seed{req.get('seed')}_steps{req.get('steps')}"
+                f"_{req.get('width')}x{req.get('height')}")
+        dst = os.path.join(d, base + ".png")
+        n = 1
+        while os.path.exists(dst):          # same second, same params -> suffix
+            dst = os.path.join(d, f"{base}_{n}.png")
+            n += 1
+        shutil.copy2(src_path, dst)
+        with open(os.path.splitext(dst)[0] + ".json", "w") as f:
+            json.dump(req, f, indent=2, sort_keys=True)
+        return dst
+    except Exception as e:  # noqa: BLE001 - never let archiving break a generation
+        return f"<archive failed: {type(e).__name__}: {e}>"
+
+
 def _status_line(prog, fallback_steps):
     stage = prog.get("stage", "?")
     step = prog.get("step", 0)
     steps = prog.get("steps") or fallback_steps
     bits = [f"{stage} {step}/{steps}"]
+    if prog.get("seed") is not None:
+        bits.append(f"seed {prog['seed']}")
     if prog.get("ms_per_step"):
         bits.append(f"{prog['ms_per_step']} ms/step")
     if prog.get("rss_gb"):
@@ -83,10 +128,12 @@ def _status_line(prog, fallback_steps):
 
 
 def start_gen(prompt, neg, height, width, steps, seed, guidance, preview_every):
+    # A cleared gr.Number yields None; fall back to a random seed rather than raising.
     req = {"prompt": prompt, "negative_prompt": neg,
            "height": int(height), "width": int(width),
-           "steps": int(steps), "guidance": float(guidance), "seed": int(seed),
-           "preview_every": int(preview_every),
+           "steps": int(steps), "guidance": float(guidance),
+           "seed": int(seed) if seed is not None else RANDOM_SEED,
+           "preview_every": int(preview_every or 0),
            "out": FINAL_PATH, "go": True}
     _atomic_json(REQ_PATH, req)
     deadline = time.time() + 1800
@@ -99,6 +146,11 @@ def start_gen(prompt, neg, height, width, steps, seed, guidance, preview_every):
         status = _status_line(prog, req["steps"])
         stage = prog.get("stage")
         if stage == "done":
+            # The server resolves a negative seed into a real one; archive under that
+            # value so the filename identifies the run that actually happened.
+            saved = save_outputs(FINAL_PATH, {**req, "seed": prog.get("seed", req["seed"])})
+            if saved:
+                status += f" | saved {saved}"
             yield final, snap, status
             return
         if stage == "error":
@@ -119,7 +171,9 @@ def build():
         gr.Markdown("# Anima Aesthetic v1.1 (TPU v5e)\n"
                     "Transformer + conditioner: Anima Aesthetic v1.1 | "
                     "Qwen3 text encoder, tokenizers, VAE: Anima-Base-v1.0-Diffusers | "
-                    "BF16_BF16_F32")
+                    "BF16_BF16_F32\n\n"
+                    f"Seed `-1` picks a random seed and reports the value used. "
+                    f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
         with gr.Row():
             with gr.Column():
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=8, label="Prompt")
@@ -131,7 +185,7 @@ def build():
                     steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
                     guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5, label="CFG guidance")
                 with gr.Row():
-                    seed = gr.Number(value=0, label="Seed")
+                    seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)")
                     preview_every = gr.Slider(0, 10, value=5, step=1,
                                              label="VAE preview every N steps (0 = off)")
                 btn = gr.Button("Generate", variant="primary")
