@@ -357,15 +357,19 @@ while True:
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
         PREV_EVERY = int(d.get("preview_every", 5) or 0)
-        # The VAE has stride 8, so the latent grid is H//8 x W//8. A dimension that is
-        # not a multiple of 8 silently loses the remainder pixels (1108 -> 1104) and
-        # used to crash the mask resize. Round to the nearest multiple of 8 and say so.
+        # H and W must be multiples of 16. The VAE downsamples by 8, and the transformer
+        # patchifies the latent grid by 2, so the latent dimensions must stay even
+        # (cosmos_patchify raises "Input dimensions must be divisible by patch_size"
+        # otherwise -- a 1000px request gives a 125-wide latent grid). A non-multiple also
+        # silently loses the remainder pixels (1108 -> 1104) and used to crash the mask
+        # resize. Round to the nearest multiple of 16 and say so.
+        _MULT = 16
         H0, W0 = int(H), int(W)
-        H = max(8, int(round(H0 / 8.0)) * 8)
-        W = max(8, int(round(W0 / 8.0)) * 8)
+        H = max(_MULT, int(round(H0 / _MULT)) * _MULT)
+        W = max(_MULT, int(round(W0 / _MULT)) * _MULT)
         if (H, W) != (H0, W0):
-            log(f"requested {H0}x{W0} is not a multiple of 8; using {H}x{W} "
-                f"(the VAE downsamples by 8)")
+            log(f"requested {H0}x{W0} is not a multiple of {_MULT}; using {H}x{W} "
+                f"(VAE stride 8, patchify stride 2)")
         g0 = time.perf_counter()
         write_prog(stage="text-encoding", step=0, steps=STEPS)
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
