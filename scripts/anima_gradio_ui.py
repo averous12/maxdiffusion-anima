@@ -7,9 +7,12 @@ device, and this UI only writes /content/anima_request.json and polls
 The live preview is a real VAE decode of the in-progress latent (not a
 channel-mean snapshot), so it costs one warm decode (~0.5 s) per preview.
 """
+import io
 import json
 import os
 import time
+
+from PIL import Image
 
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
@@ -29,9 +32,24 @@ def _read_prog():
 
 
 def _read_img(path):
+    """Return the image at `path` as a PIL image, or None if it is not there yet.
+
+    Gradio's Image postprocess accepts np.ndarray | PIL.Image.Image | str | Path |
+    None -- NOT raw bytes. Returning f.read() raised
+        ValueError: Cannot process this value as an Image, it is of type: <class 'bytes'>
+    on every yield, so the UI displayed nothing even though the server was generating
+    correctly. A PIL image is used rather than the path itself so the live preview
+    cannot be served from a stale path-keyed cache: the snapshot is rewritten in place
+    at the same path on every preview, and each poll must show the current contents.
+    """
     try:
         with open(path, "rb") as f:
-            return f.read()
+            data = f.read()
+        if not data:
+            return None
+        img = Image.open(io.BytesIO(data))
+        img.load()  # decode now; nothing should depend on the buffer afterwards
+        return img
     except Exception:
         return None
 
