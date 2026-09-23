@@ -155,36 +155,25 @@ log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
 
 t0 = time.perf_counter()
 vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
-vae_marker = os.path.join(snapshot_dir, "vae", "diffusion_pytorch_model.safetensors")
-vae_mtime = os.path.getmtime(vae_marker) if os.path.exists(vae_marker) else 0.0
-vae_cache = os.path.join(CACHE_DIR, "vae_flat.msgpack")
 _st = nnx.state(vae, nnx.Param)
 _fs = dict(nnx.to_flat_state(_st))
-if _cache_valid(vae_cache, vae_marker if os.path.exists(vae_marker) else aesthetic_path, vae_mtime or aes_mtime):
-    log("vae: loading from disk cache ...")
-    with open(vae_cache, "rb") as f:
-        _nf = flax_serialization.from_bytes(_fs, f.read())
-    nnx.update(vae, nnx.State.from_flat_path(_nf))
-    del _nf
-else:
-    _ft = {k: v.value for k, v in _fs.items()}
-    _conv = load_qwen_image_vae(snapshot_dir, _ft)
-    _cf = _flatten_dict(_conv)
-    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-    _nf, _miss = {}, []
-    for _k, _vs in _fs.items():
-        _p = "/".join(str(x) for x in _k)
-        if _p in _cf_by_path:
-            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-        else:
-            _miss.append(_p)
-    assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
-    nnx.update(vae, nnx.State.from_flat_path(_nf))
-    with open(vae_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(nnx.State.from_flat_path(_nf)))
-    _cache_mark(vae_cache, vae_marker if os.path.exists(vae_marker) else aesthetic_path, vae_mtime or aes_mtime)
-    del _ft, _conv, _cf, _cf_by_path, _nf
-del _st, _fs
+_ft = {k: v.value for k, v in _fs.items()}
+_conv = load_qwen_image_vae(snapshot_dir, _ft)
+_cf = _flatten_dict(_conv)
+_cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+_nf, _miss = {}, []
+for _k, _vs in _fs.items():
+    _p = "/".join(str(x) for x in _k)
+    if _p in _cf_by_path:
+        _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+    else:
+        _miss.append(_p)
+assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
+nnx.update(vae, nnx.State.from_flat_path(_nf))
+# No msgpack cache: to_bytes+write on the transformer tree measured 76s vs ~10s to
+# re-convert, and serializing an nnx.State here crashed outright
+# ("TypeError: can not serialize 'State' object") whenever the cache was invalid.
+del _ft, _conv, _cf, _cf_by_path, _nf, _st, _fs
 gc.collect()
 log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
 

@@ -54,7 +54,9 @@ import numpy as np
 import gc
 import traceback
 import faulthandler
-faulthandler.dump_traceback_later(900, exit=True)
+# Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
+# It dumps the live stack of every thread once, which is what localizes a stall.
+faulthandler.dump_traceback_later(1800, exit=False)
 import jax
 jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 import jax.numpy as jnp
@@ -71,18 +73,33 @@ from maxdiffusion.models.wan.autoencoder_kl_wan import AutoencoderKLWan, Autoenc
 from maxdiffusion.schedulers.scheduling_flow_match_flax import (
     FlaxFlowMatchScheduler, FlowMatchSchedulerState)
 from flax import nnx
-from flax import serialization as flax_serialization
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
 log(f"devices: {jax.devices()}")
 log(f"HBM at boot: {hbm_stats()}")
 
-CACHE_DIR = "/content/anima_cache"
+# ---------------------------------------------------------------------------
+# All weight conversion runs with CPU as the default device.
+#
+# The converters build their trees leaf-by-leaf with jnp.asarray. With the TPU as
+# the default device each leaf becomes its own host->TPU transfer: measured 227.9s
+# for the transformer instead of 60.6s. One explicit device_put at the end is far
+# cheaper, and it keeps the HBM peak at 3.91 GB instead of 10.21 GB.
+#
+# There is deliberately NO msgpack parameter cache here. Measured on the real tree,
+# flax_serialization.to_bytes + write costs 76s for the 6.6 GB stacked transformer
+# tree (45.9s serialize + 30.1s write) while re-converting the whole thing takes
+# ~10s, so caching is a net loss. The old VAE cache write was also a latent crash
+# ("TypeError: can not serialize 'State' object") that killed the server outright
+# whenever the cache was invalid.
+# ---------------------------------------------------------------------------
+_CPU = jax.devices("cpu")[0]
+
+CACHE_DIR = "/content/anima_cache"  # retained for the HF cache only; no param cache
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
-os.makedirs(CACHE_DIR, exist_ok=True)
 
 def write_prog(**kw):
     try:
@@ -93,18 +110,6 @@ def write_prog(**kw):
     except Exception:
         pass
 
-def _cache_valid(path, src, src_mtime):
-    if not os.path.exists(path):
-        return False
-    try:
-        meta = json.load(open(path + ".meta"))
-        return meta.get("src_mtime") == src_mtime and meta.get("src_size") == os.path.getsize(src)
-    except Exception:
-        return False
-def _cache_mark(path, src, src_mtime):
-    json.dump({"src_mtime": src_mtime, "src_size": os.path.getsize(src)},
-              open(path + ".meta", "w"))
-
 t_all = time.perf_counter()
 snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers", cache_dir="/content/hf_cache")
 aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", cache_dir="/content/hf_cache",
@@ -114,7 +119,6 @@ aesthetic_path = "/content/aesthetic_v1.1.safetensors"
 _src = os.path.join(aesthetic_snapshot, "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors")
 if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
     shutil.copyfile(_src, aesthetic_path)
-aes_mtime = os.path.getmtime(aesthetic_path)
 log(f"base weights at {snapshot_dir}")
 log(f"aesthetic transformer+conditioner: {aesthetic_path} ({os.path.getsize(aesthetic_path)/1e9:.2f} GB)")
 
@@ -136,25 +140,16 @@ qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
     max_position_embeddings=pc.max_position_embeddings, dtype=jnp.bfloat16,
     max_layer_to_run=None, is_causal=True)
 qwen3_model = FlaxQwen3Model(qcfg)
-qwen_cache = os.path.join(CACHE_DIR, "qwen3_params.msgpack")
 qv = jax.eval_shape(qwen3_model.init, jax.random.key(0),
                     jax.ShapeDtypeStruct((1, 512), jnp.int32),
                     jax.ShapeDtypeStruct((1, 512), jnp.int32))
-q_marker = os.path.join(snapshot_dir, "text_encoder", "model.safetensors")
-q_mtime = os.path.getmtime(q_marker)
-if _cache_valid(qwen_cache, q_marker, q_mtime):
-    log("Qwen3: loading TPU params from disk cache ...")
-    with open(qwen_cache, "rb") as f:
-        qwen3_params = flax_serialization.from_bytes(qv["params"], f.read())
-else:
+with jax.default_device(_CPU):
     qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qcfg)
-    with open(qwen_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(qwen3_params))
-    _cache_mark(qwen_cache, q_marker, q_mtime)
 del qv
 gc.collect()
+qwen3_params = jax.device_put(qwen3_params, jax.devices()[0])
 qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
-log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s")
+log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
 
 def encode_texts(prompt, neg):
     ids=[]; masks=[]
@@ -173,35 +168,20 @@ def encode_texts(prompt, neg):
     return out
 log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
 
-log("=== SERVER: weight conversion (cached) ===")
-# All conversion/merge work happens with CPU as the default device. The converters
-# build their trees leaf-by-leaf with jnp.asarray; with the TPU as default device
-# every leaf becomes its own host->TPU transfer (measured: 227.9s for the
-# transformer instead of ~10s). One explicit device_put at the end is far cheaper.
-_CPU = jax.devices("cpu")[0]
+log("=== SERVER: conditioner ===")
 t0 = time.perf_counter()
 cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
 conditioner = FlaxAnimaTextConditioner(cond_cfg)
 cv = jax.eval_shape(conditioner.init, jax.random.key(1),
                     jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
                     jax.ShapeDtypeStruct((1, 8), jnp.int32))
-cond_cache = os.path.join(CACHE_DIR, "cond_params.msgpack")
-if _cache_valid(cond_cache, aesthetic_path, aes_mtime):
-    log("conditioner: loading from disk cache ...")
-    with open(cond_cache, "rb") as f:
-        cond_params = flax_serialization.from_bytes(cv["params"], f.read())
-    log(f"conditioner loaded from cache in {time.perf_counter()-t0:.1f}s")
-else:
-    with jax.default_device(_CPU):
-        cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
-    with open(cond_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(cond_params))
-    _cache_mark(cond_cache, aesthetic_path, aes_mtime)
-    log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
+with jax.default_device(_CPU):
+    cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
 del cv
 gc.collect()
+log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 
-log("SERVER: building transformer module (scan_blocks=True)...")
+log("=== SERVER: transformer (scan_blocks=True) ===")
 t0 = time.perf_counter()
 transformer = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True)
 # Shape-only init: the converters read .shape, never values, so eval_shape gives the
@@ -212,70 +192,45 @@ tv = jax.eval_shape(
     jax.ShapeDtypeStruct((1,), jnp.float32),
     jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
 )
-log(f"SERVER: transformer shape tree via eval_shape in {time.perf_counter()-t0:.1f}s")
-# NOTE: cache name carries the layout. The nn.scan refactor changed the transformer
-# parameter layout to stacked ('scan','b',...); an old unstacked msgpack must not load.
-t_cache = os.path.join(CACHE_DIR, "transformer_params_scan.msgpack")
-if _cache_valid(t_cache, aesthetic_path, aes_mtime):
-    log("transformer: loading from disk cache ...")
-    with open(t_cache, "rb") as f:
-        t_params = flax_serialization.from_bytes(tv["params"], f.read())
-    log(f"transformer loaded from cache in {time.perf_counter()-t0:.1f}s")
-else:
-    try:
-        with jax.default_device(_CPU):
-            t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
-                                                       dtype=jnp.bfloat16, num_layers=28)
-    except Exception:
-        log("transformer: conversion raised:\n" + traceback.format_exc())
-        raise
-    with open(t_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(t_params))
-    _cache_mark(t_cache, aesthetic_path, aes_mtime)
-    log(f"transformer converted (stacked scan layout) in {time.perf_counter()-t0:.1f}s")
+t_shape = time.perf_counter() - t0
+t0 = time.perf_counter()
+try:
+    with jax.default_device(_CPU):
+        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
+                                                   dtype=jnp.bfloat16, num_layers=28)
+except Exception:
+    log("transformer: conversion raised:\n" + traceback.format_exc())
+    raise
+t_conv = time.perf_counter() - t0
 del tv
 gc.collect()
+log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
+t0 = time.perf_counter()
 t_params = jax.device_put(t_params, jax.devices()[0])
-log(f"SERVER: transformer params resident on TPU; {hbm_stats()}")
+log(f"transformer params -> TPU in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
 
-log("SERVER: transformer params ready; building VAE...")
+log("=== SERVER: VAE ===")
 t0 = time.perf_counter()
 vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
-vae_marker = os.path.join(snapshot_dir, "vae", "diffusion_pytorch_model.safetensors")
-vae_src = vae_marker if os.path.exists(vae_marker) else aesthetic_path
-vae_mtime = os.path.getmtime(vae_src)
-vae_cache = os.path.join(CACHE_DIR, "vae_flat.msgpack")
 _st = nnx.state(vae, nnx.Param)
 _fs = dict(nnx.to_flat_state(_st))
-if _cache_valid(vae_cache, vae_src, vae_mtime):
-    log("vae: loading from disk cache ...")
-    with open(vae_cache, "rb") as f:
-        _nf = flax_serialization.from_bytes(_fs, f.read())
-    nnx.update(vae, nnx.State.from_flat_path(_nf))
-    del _nf
-    log(f"vae loaded from cache in {time.perf_counter()-t0:.1f}s")
-else:
-    _ft = {k: v.value for k, v in _fs.items()}
-    with jax.default_device(_CPU):
-        _conv = load_qwen_image_vae(snapshot_dir, _ft)
-        _cf = _flatten_dict(_conv)
-        _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-        _nf, _miss = {}, []
-        for _k, _vs in _fs.items():
-            _p = "/".join(str(x) for x in _k)
-            if _p in _cf_by_path:
-                _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-            else:
-                _miss.append(_p)
-    assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
-    nnx.update(vae, nnx.State.from_flat_path(_nf))
-    with open(vae_cache, "wb") as f:
-        f.write(flax_serialization.to_bytes(nnx.State.from_flat_path(_nf)))
-    _cache_mark(vae_cache, vae_src, vae_mtime)
-    del _ft, _conv, _cf, _cf_by_path, _nf
-    log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
-del _st, _fs
+_ft = {k: v.value for k, v in _fs.items()}
+with jax.default_device(_CPU):
+    _conv = load_qwen_image_vae(snapshot_dir, _ft)
+    _cf = _flatten_dict(_conv)
+    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+    _nf, _miss = {}, []
+    for _k, _vs in _fs.items():
+        _p = "/".join(str(x) for x in _k)
+        if _p in _cf_by_path:
+            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+        else:
+            _miss.append(_p)
+assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
+nnx.update(vae, nnx.State.from_flat_path(_nf))
+del _ft, _conv, _cf, _cf_by_path, _nf, _st, _fs
 gc.collect()
+log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
 
 @jax.jit
 def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
