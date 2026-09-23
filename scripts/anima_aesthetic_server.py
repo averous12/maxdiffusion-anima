@@ -1,13 +1,23 @@
 import os
 import subprocess
+import sys
 
 repo = "/content/maxdiffusion"
 venv = repo + "/.venv"
-py = venv + "/bin/python"
-env = {**os.environ, "PATH": venv + "/bin:/usr/local/bin:" + os.environ["PATH"],
+# Prefer the repo venv when it exists; otherwise fall back to the running
+# interpreter so the server also works in sessions that pip-installed into the
+# system Python (the E2E runner path).
+if os.path.exists(venv + "/bin/python"):
+    py = venv + "/bin/python"
+    _path_prefix = venv + "/bin:"
+else:
+    py = sys.executable
+    _path_prefix = ""
+env = {**os.environ, "PATH": _path_prefix + "/usr/local/bin:" + os.environ["PATH"],
        "PYTHONPATH": repo + "/src", "HF_HOME": "/content/hf_cache",
        "PYTHONUNBUFFERED": "1", "MPLBACKEND": "agg"}
 env.pop("UV_SYSTEM_PYTHON", None)
+print("server interpreter:", py, flush=True)
 
 code = r'''
 import time
@@ -18,6 +28,25 @@ def log(msg):
     print(line, flush=True)
     LOG.write(line + "\n")
 
+def rss_gb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        pass
+    return 0.0
+
+def hbm_stats():
+    try:
+        ms = jax.devices()[0].memory_stats() or {}
+        return {"in_use_gb": round(ms.get("bytes_in_use", 0) / 1e9, 2),
+                "peak_gb": round(ms.get("peak_bytes_in_use", 0) / 1e9, 2),
+                "limit_gb": round(ms.get("bytes_limit", 0) / 1e9, 2)}
+    except Exception:
+        return {}
+
 log("=== SERVER boot: imports ===")
 import os
 import json
@@ -25,12 +54,11 @@ import numpy as np
 import gc
 import traceback
 import faulthandler
-faulthandler.dump_traceback_later(600, exit=True)
+faulthandler.dump_traceback_later(900, exit=True)
 import jax
 jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 import jax.numpy as jnp
 log("matmul precision: BF16_BF16_F32 (bf16 operands, fp32 accumulate; activations stay fp32)")
-log(f"devices: {jax.devices()}")
 
 from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, convert_anima_aesthetic_weights
 from maxdiffusion.models.anima_text_conditioner_flax import (
@@ -47,6 +75,9 @@ from flax import serialization as flax_serialization
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
+log(f"devices: {jax.devices()}")
+log(f"HBM at boot: {hbm_stats()}")
+
 CACHE_DIR = "/content/anima_cache"
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
@@ -55,7 +86,10 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 def write_prog(**kw):
     try:
-        json.dump({"t": time.time(), **kw}, open(PROG_PATH, "w"))
+        tmp = PROG_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"t": time.time(), "rss_gb": round(rss_gb(), 2), **kw}, f)
+        os.replace(tmp, PROG_PATH)
     except Exception:
         pass
 
@@ -72,23 +106,27 @@ def _cache_mark(path, src, src_mtime):
               open(path + ".meta", "w"))
 
 t_all = time.perf_counter()
-snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers")
-aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", allow_patterns=["split_files/diffusion_models/anima-aesthetic-v1.1.safetensors"])
+snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers", cache_dir="/content/hf_cache")
+aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", cache_dir="/content/hf_cache",
+                                       allow_patterns=["split_files/diffusion_models/anima-aesthetic-v1.1.safetensors"])
 import shutil
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
-shutil.copyfile(os.path.join(aesthetic_snapshot, "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors"), aesthetic_path)
+_src = os.path.join(aesthetic_snapshot, "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors")
+if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
+    shutil.copyfile(_src, aesthetic_path)
 aes_mtime = os.path.getmtime(aesthetic_path)
-log(f"weights at {snapshot_dir}; aesthetic staged")
+log(f"base weights at {snapshot_dir}")
+log(f"aesthetic transformer+conditioner: {aesthetic_path} ({os.path.getsize(aesthetic_path)/1e9:.2f} GB)")
 
 log("=== SERVER: torch tokenizer + TPU Qwen3 load (once) ===")
 t0 = time.perf_counter()
 from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
 from tokenizers import Tokenizer as _RawTokenizer
-tok = AutoTokenizer.from_pretrained(os.path.join(snapshot_dir, "tokenizer"))
+tok = AutoTokenizer.from_pretrained("circlestone-labs/Anima-Base-v1.0-Diffusers", subfolder="tokenizer")
 _t5 = _RawTokenizer.from_file(os.path.join(snapshot_dir, "t5_tokenizer", "tokenizer.json"))
 _t5.enable_padding(pad_id=0, pad_token="<pad>", length=512)
 _t5.enable_truncation(max_length=512)
-pc = HFAutoConfig.from_pretrained(os.path.join(snapshot_dir, "text_encoder"))
+pc = HFAutoConfig.from_pretrained("circlestone-labs/Anima-Base-v1.0-Diffusers", subfolder="text_encoder")
 rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
 qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
     intermediate_size=pc.intermediate_size, num_hidden_layers=pc.num_hidden_layers,
@@ -99,7 +137,9 @@ qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
     max_layer_to_run=None, is_causal=True)
 qwen3_model = FlaxQwen3Model(qcfg)
 qwen_cache = os.path.join(CACHE_DIR, "qwen3_params.msgpack")
-qv = qwen3_model.init(jax.random.key(0), jnp.zeros((1, 512), jnp.int32), jnp.zeros((1, 512), jnp.int32))
+qv = jax.eval_shape(qwen3_model.init, jax.random.key(0),
+                    jax.ShapeDtypeStruct((1, 512), jnp.int32),
+                    jax.ShapeDtypeStruct((1, 512), jnp.int32))
 q_marker = os.path.join(snapshot_dir, "text_encoder", "model.safetensors")
 q_mtime = os.path.getmtime(q_marker)
 if _cache_valid(qwen_cache, q_marker, q_mtime):
@@ -112,6 +152,7 @@ else:
         f.write(flax_serialization.to_bytes(qwen3_params))
     _cache_mark(qwen_cache, q_marker, q_mtime)
 del qv
+gc.collect()
 qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
 log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s")
 
@@ -119,7 +160,6 @@ def encode_texts(prompt, neg):
     ids=[]; masks=[]
     for p in [prompt, neg]:
         ti=tok(p,padding="max_length",max_length=512,truncation=True,return_tensors="np")
-        enc=_t5.encode(p)
         ids.append(ti.input_ids[0]); masks.append(ti.attention_mask[0])
     qids=jnp.asarray(np.stack(ids),dtype=jnp.int32)
     qmask=jnp.asarray(np.stack(masks),dtype=jnp.int32)
@@ -137,7 +177,9 @@ log("=== SERVER: weight conversion (cached) ===")
 t0 = time.perf_counter()
 cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
 conditioner = FlaxAnimaTextConditioner(cond_cfg)
-cv = conditioner.init(jax.random.key(1), jnp.zeros((1, 8, 1024), jnp.float32), np.zeros((1, 8), np.int32))
+cv = jax.eval_shape(conditioner.init, jax.random.key(1),
+                    jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
+                    jax.ShapeDtypeStruct((1, 8), jnp.int32))
 cond_cache = os.path.join(CACHE_DIR, "cond_params.msgpack")
 if _cache_valid(cond_cache, aesthetic_path, aes_mtime):
     log("conditioner: loading from disk cache ...")
@@ -153,16 +195,21 @@ else:
 del cv
 gc.collect()
 
-log("SERVER: building transformer module...")
-t0t = time.perf_counter()
-transformer = FlaxAnimaCosmosTransformer(layers=28)
-log(f"SERVER: transformer module built in {time.perf_counter()-t0t:.1f}s; initializing dummy variables...")
-with jax.default_device(jax.devices("cpu")[0]):
-    tv = transformer.init(jax.random.key(2), jnp.zeros((1, 16, 1, 8, 8), jnp.float32),
-                          jnp.zeros((1,), jnp.float32), jnp.zeros((1, 8, 1024), jnp.float32))
-log("SERVER: transformer variables initialized on CPU")
-log("SERVER: transformer dummy init complete")
-t_cache = os.path.join(CACHE_DIR, "transformer_params.msgpack")
+log("SERVER: building transformer module (scan_blocks=True)...")
+t0 = time.perf_counter()
+transformer = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True)
+# Shape-only init: the converters read .shape, never values, so eval_shape gives the
+# full parameter tree in ~0.2s with negligible RSS (vs ~40s and a multi-GB dummy tree).
+tv = jax.eval_shape(
+    transformer.init, jax.random.key(2),
+    jax.ShapeDtypeStruct((1, 16, 1, 8, 8), jnp.float32),
+    jax.ShapeDtypeStruct((1,), jnp.float32),
+    jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
+)
+log(f"SERVER: transformer shape tree via eval_shape in {time.perf_counter()-t0:.1f}s")
+# NOTE: cache name carries the layout. The nn.scan refactor changed the transformer
+# parameter layout to stacked ('scan','b',...); an old unstacked msgpack must not load.
+t_cache = os.path.join(CACHE_DIR, "transformer_params_scan.msgpack")
 if _cache_valid(t_cache, aesthetic_path, aes_mtime):
     log("transformer: loading from disk cache ...")
     with open(t_cache, "rb") as f:
@@ -170,16 +217,19 @@ if _cache_valid(t_cache, aesthetic_path, aes_mtime):
     log(f"transformer loaded from cache in {time.perf_counter()-t0:.1f}s")
 else:
     try:
-        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"], dtype=jnp.bfloat16)
+        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
+                                                  dtype=jnp.bfloat16, num_layers=28)
     except Exception:
         log("transformer: conversion raised:\n" + traceback.format_exc())
         raise
     with open(t_cache, "wb") as f:
         f.write(flax_serialization.to_bytes(t_params))
     _cache_mark(t_cache, aesthetic_path, aes_mtime)
-    log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
+    log(f"transformer converted (stacked scan layout) in {time.perf_counter()-t0:.1f}s")
 del tv
 gc.collect()
+t_params = jax.device_put(t_params, jax.devices()[0])
+log(f"SERVER: transformer params resident on TPU; {hbm_stats()}")
 
 log("SERVER: transformer params ready; building VAE...")
 t0 = time.perf_counter()
@@ -226,61 +276,83 @@ def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
                              source_attention_mask=source_mask,
                              target_attention_mask=target_mask)
 
+# Only the transformer forward is jitted. CFG (two calls + combine) stays eager: a nested
+# jit over both calls duplicates a large HLO and was what previously blew up compile memory.
 @jax.jit
-def tf_step(t_params, latents, timestep, ctx, nctx, pad):
-    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
-    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad)
-    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad)
-    pred = nu.astype(jnp.float32) + jnp.float32(4.0) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
-    return pred.astype(jnp.float32)
+def transformer_forward(tp, lat, t_vec, ctx, pad):
+    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad)
 
-log("=== SERVER: warming executables (one throwaway gen at 256px) ===")
+def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
+    nc = transformer_forward(t_params, latents, t_vec, context, pad)
+    nu = transformer_forward(t_params, latents, t_vec, neg_context, pad)
+    nc32 = nc.astype(jnp.float32)
+    nu32 = nu.astype(jnp.float32)
+    return nu32 + jnp.float32(guidance) * (nc32 - nu32)
+
+def decode_latents(latents):
+    """Full VAE decode of a latent, matching the pipeline's latent mean/std glue."""
+    lmean = jnp.array(vae.latents_mean, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
+    lstd = jnp.array(vae.latents_std, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
+    z = latents / (1.0 / lstd) + lmean
+    graphdef, state, rest = nnx.split(vae, nnx.Param, ...)
+    merged = nnx.merge(graphdef, state, rest)
+    video = merged.decode(z, AutoencoderKLWanCache(merged), return_dict=False)[0]
+    video = jnp.clip(video / 2.0 + 0.5, 0.0, 1.0)
+    video.block_until_ready()
+    img = np.asarray(video)
+    if img.ndim == 5:
+        img = img[:, 0]
+    if img.shape[-1] not in (1, 3):
+        img = np.moveaxis(img, 1, -1)
+    return (img[0] * 255.0).round().astype(np.uint8)
+
+def save_u8(u8, path):
+    from PIL import Image
+    tmp = path + ".tmp.png"
+    Image.fromarray(u8).save(tmp)
+    os.replace(tmp, path)
+
+log("=== SERVER: warming executables at production shape (1024px) ===")
 try:
-    (wqe, wqm, wt5, wt5m), (wne, wnm, wnt5, wnt5m) = encode_texts("warmup", "warmup")
-    wctx = cond_forward(cond_params, jnp.asarray(wqe, dtype=jnp.float32), wqm, wt5, wt5m).astype(jnp.bfloat16)
-    wnctx = cond_forward(cond_params, jnp.asarray(wne, dtype=jnp.float32), wnm, wnt5, wnt5m).astype(jnp.bfloat16)
-    wctx.block_until_ready(); wnctx.block_until_ready()
+    t0 = time.perf_counter()
     _sched = FlaxFlowMatchScheduler()
     _st8 = FlowMatchSchedulerState.create()
     _sr = np.linspace(1.0, 1.0 / 4, 4).astype(np.float32)
     _st8 = _sched.set_timesteps(_st8, sigmas=jnp.asarray(_sr))
     _ts = np.asarray(_st8.timesteps); _sg = np.asarray(_st8.sigmas[:-1])
-    _lat = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16, 1, 32, 32)).astype(np.float32))
-    _pad = jnp.asarray(np.zeros((1, 1, 256, 256), dtype=np.float32))
-    for _i in range(4):
-        _pred = tf_step(t_params, _lat, jnp.asarray(np.float32(_ts[_i])), wctx, wnctx, _pad)
+    # Warm the transformer at the real 1024px latent/pad shapes so the first user
+    # generation does not pay the XLA compile.
+    _lat = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16, 1, 128, 128)).astype(np.float32))
+    _pad = jnp.zeros((1, 1, 1024, 1024), dtype=jnp.float32)
+    _ctx = jnp.zeros((1, 512, 1024), dtype=jnp.float32)
+    for _i in range(2):
+        _pred = cfg_prediction(_lat, jnp.asarray(np.float32(_ts[_i])), _ctx, _ctx, _pad, 4.0)
         _sn = _sg[_i + 1] if _i + 1 < 4 else 0.0
         _lat = _lat + jnp.asarray(np.float32(_sn - _sg[_i])) * _pred
     _lat.block_until_ready()
-    del wqe, wqm, wt5, wt5m, wne, wnm, wnt5, wnt5m, wctx, wnctx, _lat, _pad, _pred
+    del _lat, _pad, _ctx, _pred
     gc.collect()
-    log("warmup: transformer done; warming VAE decode at 1024 (one-time XLA compile) ...")
-    _w0 = time.perf_counter()
+    log(f"warmup: transformer forward compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
+    t0 = time.perf_counter()
     _wz = jnp.zeros((1, 16, 1, 128, 128), dtype=jnp.bfloat16)
-    _wlm = jnp.array(vae.latents_mean, dtype=_wz.dtype).reshape(1, 16, 1, 1, 1)
-    _wls = jnp.array(vae.latents_std, dtype=_wz.dtype).reshape(1, 16, 1, 1, 1)
-    _wzz = _wz / (1.0 / _wls) + _wlm
-    _wg, _ws, _wr = nnx.split(vae, nnx.Param, ...)
-    _wm = nnx.merge(_wg, _ws, _wr)
-    _wv = _wm.decode(_wzz, AutoencoderKLWanCache(_wm), return_dict=False)[0]
-    _wv = jnp.clip(_wv / 2.0 + 0.5, 0.0, 1.0)
-    _wv.block_until_ready()
-    log(f"vae warmup done in {time.perf_counter()-_w0:.1f}s; out {tuple(_wv.shape)} mean {float(_wv.mean()):.4f}")
-    del _wz, _wlm, _wls, _wzz, _wg, _ws, _wr, _wm, _wv
+    _wv = decode_latents(_wz)
+    log(f"warmup: VAE decode compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; out {_wv.shape}; {hbm_stats()}")
+    del _wz, _wv
     gc.collect()
-    log("warmup done; executables compiled")
+    log(f"warmup done; executables compiled; host RSS {rss_gb():.2f} GB")
 except Exception:
     log("warmup raised:\n" + traceback.format_exc())
     raise
 
 log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
-write_prog(stage="ready")
+write_prog(stage="ready", step=0, steps=0)
 
 def default_req():
     return {"prompt": "masterpiece, best quality, 1girl",
             "negative_prompt": "worst quality, low quality, blurry",
             "height": 1024, "width": 1024, "steps": 30, "guidance": 4.0,
-            "seed": 0, "out": "/content/anima_perstep.png"}
+            "seed": 0, "preview_every": 5, "out": "/content/anima_perstep.png"}
 
 if not os.path.exists(REQ_PATH):
     json.dump({**default_req(), "go": False}, open(REQ_PATH, "w"))
@@ -311,7 +383,7 @@ while True:
         PROMPT, NEG = d["prompt"], d["negative_prompt"]
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
-        PREV_EVERY = int(d.get("preview_every", 5))
+        PREV_EVERY = int(d.get("preview_every", 5) or 0)
         g0 = time.perf_counter()
         write_prog(stage="text-encoding", step=0, steps=STEPS)
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
@@ -325,55 +397,46 @@ while True:
         st = sched.set_timesteps(st, sigmas=jnp.asarray(sigmas_raw))
         timesteps = np.asarray(st.timesteps)
         sigmas = np.asarray(st.sigmas[:-1])
-        if abs(float(GUIDANCE) - 4.0) > 1e-6:
-            log(f"note: guidance {GUIDANCE} requested but tf_step bakes 4.0; using 4.0")
         rng = np.random.default_rng(SEED)
         latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
-        pad = jnp.asarray(np.zeros((1, 1, H, W), dtype=np.float32))
-        snap_every = max(1, PREV_EVERY)
+        pad = jnp.zeros((1, 1, H, W), dtype=jnp.float32)
+        d0 = time.perf_counter()
+        prev_total = 0.0
         for i in range(STEPS):
-            pred = tf_step(t_params, latents, jnp.asarray(np.float32(timesteps[i])),
-                           context, neg_context, pad)
+            pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                  context, neg_context, pad, GUIDANCE)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
             latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
+            latents.block_until_ready()
+            step_s = time.perf_counter() - d0
             if i % 2 == 0 or i == STEPS - 1:
-                latents.block_until_ready()
-                write_prog(stage="denoise", step=i + 1, steps=STEPS)
-            if (i + 1) % snap_every == 0 or i == STEPS - 1:
+                write_prog(stage="denoise", step=i + 1, steps=STEPS,
+                           ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
+                           guidance=GUIDANCE)
+            if PREV_EVERY and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
                 try:
-                    snap = np.asarray(latents, dtype=np.float32)
-                    snap = snap[0].mean(axis=0)[0]
-                    snap = snap - snap.min()
-                    snap = snap / (snap.max() + 1e-8)
-                    from PIL import Image as _PILImage
-                    _PILImage.fromarray((snap * 255.0).round().astype(np.uint8)).save(SNAP_PATH)
+                    p0 = time.perf_counter()
+                    save_u8(decode_latents(latents), SNAP_PATH)
+                    prev_total += time.perf_counter() - p0
+                    write_prog(stage="denoise", step=i + 1, steps=STEPS,
+                               preview_step=i + 1, preview_s=round(prev_total, 2),
+                               ms_per_step=round(step_s / (i + 1) * 1000.0, 1), guidance=GUIDANCE)
                 except Exception as _e:
-                    log(f"snap failed at step {i+1}: {_e}")
+                    log(f"preview decode failed at step {i+1}: {_e}")
         latents.block_until_ready()
-        write_prog(stage="decode", step=STEPS, steps=STEPS)
         denoise_s = time.perf_counter() - g0
+        write_prog(stage="decode", step=STEPS, steps=STEPS)
         v0 = time.perf_counter()
-        lmean = jnp.array(vae.latents_mean, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
-        lstd = jnp.array(vae.latents_std, dtype=latents.dtype).reshape(1, 16, 1, 1, 1)
-        z = latents / (1.0 / lstd) + lmean
-        graphdef, state, rest = nnx.split(vae, nnx.Param, ...)
-        merged = nnx.merge(graphdef, state, rest)
-        video = merged.decode(z, AutoencoderKLWanCache(merged), return_dict=False)[0]
-        video = jnp.clip(video / 2.0 + 0.5, 0.0, 1.0)
-        video.block_until_ready()
-        img = np.asarray(video)
-        if img.ndim == 5:
-            img = img[:, 0]
-        if img.shape[-1] not in (1, 3):
-            img = np.moveaxis(img, 1, -1)
-        img_u8 = (img[0] * 255.0).round().astype(np.uint8)
-        from PIL import Image
-        Image.fromarray(img_u8).save(OUT)
-        total_s = time.perf_counter() - g0
+        save_u8(decode_latents(latents), OUT)
         decode_s = time.perf_counter() - v0
-        log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s, decode {decode_s:.1f}s) = {60.0/total_s:.2f} images/min")
-        write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT, elapsed_s=round(total_s, 1))
-        json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}, open(REQ_PATH, "w"))
+        total_s = time.perf_counter() - g0
+        log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s, decode {decode_s:.1f}s, "
+            f"previews {prev_total:.1f}s) = {60.0/total_s:.2f} images/min; {hbm_stats()}; RSS {rss_gb():.2f} GB")
+        write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT,
+                   elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
+                   decode_s=round(decode_s, 1), hbm=hbm_stats())
+        json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
+                  open(REQ_PATH, "w"))
     except Exception:
         log("gen raised:\n" + traceback.format_exc())
         write_prog(stage="error")
