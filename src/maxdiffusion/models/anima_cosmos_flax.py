@@ -174,6 +174,21 @@ class _ScannedBlock(nn.Module):
     return out, out
 
 
+def _nearest_resize_mask(mask, h, w):
+  """Nearest-neighbour resize of the padding mask onto the latent grid.
+
+  Mirrors the reference pipeline, which resizes the image-resolution mask with
+  F.interpolate(mode="nearest") rather than subsampling it, so any input size is
+  valid. The previous strided-subsample approach required the image dimensions to
+  be exact multiples of the latent grid and raised AssertionError otherwise (hit
+  in practice with a 1108x956 request).
+  """
+  ph, pw = mask.shape[-2:]
+  ih = jnp.clip((jnp.arange(h) * ph / h).astype(jnp.int32), 0, ph - 1)
+  iw = jnp.clip((jnp.arange(w) * pw / w).astype(jnp.int32), 0, pw - 1)
+  return mask[:, :, ih][:, :, :, iw]
+
+
 class FlaxAnimaCosmosTransformer(nn.Module):
   in_channels: int = 16
   out_channels: int = 16
@@ -197,10 +212,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     # Reference takes the image-resolution mask and nearest-resizes it to the
     # latent grid before concatenating (transformer_cosmos.py). Accept either.
     if padding_mask.shape[-2:] != (h, w):
-      ph, pw = padding_mask.shape[-2:]
-      assert ph % h == 0 and pw % w == 0, (padding_mask.shape, (h, w))
-      sh, sw = ph // h, pw // w
-      padding_mask = padding_mask[:, :, : h * sh : sh, : w * sw : sw]
+      padding_mask = _nearest_resize_mask(padding_mask, h, w)
     padding_channel = jnp.repeat(padding_mask[:, :, None, :, :], t, axis=2)
     x = jnp.concatenate([hidden_states, padding_channel], axis=1)
     tokens = cosmos_patchify(x, self.patch_size)

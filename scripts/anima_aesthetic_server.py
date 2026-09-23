@@ -288,7 +288,12 @@ try:
     # generation does not pay the XLA compile.
     _lat = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16, 1, 128, 128)).astype(np.float32))
     _pad = jnp.zeros((1, 1, 1024, 1024), dtype=jnp.float32)
-    _ctx = jnp.zeros((1, 512, 1024), dtype=jnp.float32)
+    # These dtypes must match the real generation path exactly or XLA compiles a
+    # SECOND executable for the first real request. They did not: the real context
+    # is bf16 (cast after the conditioner) and the real latents are fp32. Warmup
+    # therefore warmed an fp32-context/fp32-latent signature the server never uses,
+    # and the first generation paid both compiles again (~124s vs 21s measured).
+    _ctx = jnp.zeros((1, 512, 1024), dtype=jnp.bfloat16)
     for _i in range(2):
         _pred = cfg_prediction(_lat, jnp.asarray(np.float32(_ts[_i])), _ctx, _ctx, _pad, 4.0)
         _sn = _sg[_i + 1] if _i + 1 < 4 else 0.0
@@ -298,7 +303,12 @@ try:
     gc.collect()
     log(f"warmup: transformer forward compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
     t0 = time.perf_counter()
-    _wz = jnp.zeros((1, 16, 1, 128, 128), dtype=jnp.bfloat16)
+    # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
+    # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
+    # the latent dtype, so a bf16 warmup compiles an executable the server never
+    # calls -- the first real preview then recompiled the VAE (~50s, matching this
+    # warmup's own compile time).
+    _wz = jnp.zeros((1, 16, 1, 128, 128), dtype=jnp.float32)
     _wv = decode_latents(_wz)
     log(f"warmup: VAE decode compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; out {_wv.shape}; {hbm_stats()}")
     del _wz, _wv
@@ -347,6 +357,15 @@ while True:
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
         PREV_EVERY = int(d.get("preview_every", 5) or 0)
+        # The VAE has stride 8, so the latent grid is H//8 x W//8. A dimension that is
+        # not a multiple of 8 silently loses the remainder pixels (1108 -> 1104) and
+        # used to crash the mask resize. Round to the nearest multiple of 8 and say so.
+        H0, W0 = int(H), int(W)
+        H = max(8, int(round(H0 / 8.0)) * 8)
+        W = max(8, int(round(W0 / 8.0)) * 8)
+        if (H, W) != (H0, W0):
+            log(f"requested {H0}x{W0} is not a multiple of 8; using {H}x{W} "
+                f"(the VAE downsamples by 8)")
         g0 = time.perf_counter()
         write_prog(stage="text-encoding", step=0, steps=STEPS)
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
@@ -387,17 +406,24 @@ while True:
                 except Exception as _e:
                     log(f"preview decode failed at step {i+1}: {_e}")
         latents.block_until_ready()
-        denoise_s = time.perf_counter() - g0
+        loop_s = time.perf_counter() - d0
+        pre_s = d0 - g0
+        # Preview decodes run inside the loop, so subtract them: otherwise "denoise"
+        # silently includes ~50s of VAE work on the first generation (it did).
+        denoise_s = loop_s - prev_total
         write_prog(stage="decode", step=STEPS, steps=STEPS)
         v0 = time.perf_counter()
         save_u8(decode_latents(latents), OUT)
         decode_s = time.perf_counter() - v0
         total_s = time.perf_counter() - g0
-        log(f"GEN DONE {OUT} in {total_s:.1f}s (denoise {denoise_s:.1f}s, decode {decode_s:.1f}s, "
-            f"previews {prev_total:.1f}s) = {60.0/total_s:.2f} images/min; {hbm_stats()}; RSS {rss_gb():.2f} GB")
+        log(f"GEN DONE {OUT} {H}x{W} in {total_s:.1f}s (text+cond {pre_s:.1f}s, "
+            f"denoise {denoise_s:.1f}s = {denoise_s / max(1, STEPS) * 1000.0:.0f} ms/step, "
+            f"previews {prev_total:.1f}s, decode {decode_s:.1f}s) "
+            f"= {60.0/total_s:.2f} images/min; {hbm_stats()}; RSS {rss_gb():.2f} GB")
         write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT,
-                   elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
-                   decode_s=round(decode_s, 1), hbm=hbm_stats())
+                   elapsed_s=round(total_s, 1), pre_s=round(pre_s, 1),
+                   denoise_s=round(denoise_s, 1), decode_s=round(decode_s, 1),
+                   height=H, width=W, hbm=hbm_stats())
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
                   open(REQ_PATH, "w"))
     except Exception:
