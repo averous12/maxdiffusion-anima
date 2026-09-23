@@ -144,7 +144,10 @@ shape_tree = jax.eval_shape(
 )
 log(f"eval_shape tree in {time.perf_counter()-t0:.1f}s")
 t0 = time.perf_counter()
-t_params = convert_anima_aesthetic_weights(CKPT, shape_tree["params"], dtype=jnp.bfloat16, num_layers=28)
+# Build the tree on the host and transfer once. With the TPU as the default device
+# every leaf in the converter becomes its own H2D transfer (measured 227.9s vs ~10s).
+with jax.default_device(jax.devices("cpu")[0]):
+    t_params = convert_anima_aesthetic_weights(CKPT, shape_tree["params"], dtype=jnp.bfloat16, num_layers=28)
 del shape_tree; gc.collect()
 log(f"transformer converted in {time.perf_counter()-t0:.1f}s")
 t_params = jax.device_put(t_params, jax.devices()[0])
