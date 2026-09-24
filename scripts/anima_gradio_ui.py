@@ -142,7 +142,10 @@ def start_gen(prompt, neg, height, width, steps, seed, guidance, preview_every):
            "steps": int(steps), "guidance": float(guidance),
            "seed": int(seed) if seed is not None else RANDOM_SEED,
            "preview_every": int(preview_every or 0),
-           "out": FINAL_PATH, "go": True}
+           "out": FINAL_PATH, "go": True,
+           # A unique id so the UI can tell its own progress records from a previous run's.
+           # The server echoes this id in every record it writes for this request.
+           "gen_id": uuid.uuid4().hex}
     _atomic_json(REQ_PATH, req)
     deadline = time.time() + 1800
     seen = None
