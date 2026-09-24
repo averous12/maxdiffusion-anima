@@ -59,6 +59,28 @@ This repository is a fork of [`google/maxdiffusion`](https://github.com/google/m
 - Cloudflared waits for origin before tunneling
 - Random seed by default with resolved seed reported and archived
 
+### Prompt weighting
+
+- `(tag:1.3)` syntax scales the attention of a prompt span
+- Groups nest and weights multiply; weights clamped to **0..3**
+- Plain parentheses (e.g. `fern (sousou no frieren)`) stay literal
+- Backslash-escaped parentheses (`\(`, `\)`) produce literal parens inside a group
+- Parsed and applied server-side where the tokenizer lives; both positive and negative prompts are processed
+
+### True batching
+
+- Request `batch` > 1 shares every denoise step across images on the TPU
+- Each image uses `seed + k` so runs are still reproducible
+- Server emits a preview grid during denoising and a final grid alongside individual PNGs
+- Grid helpers adapt to non-square batches and image sizes
+
+### Aspect-ratio sizing
+
+- UI exposes 0.5 / 1.0 / 1.5 MP targets, locked to a user-supplied W:H aspect ratio
+- Live shape preview before generation
+- "Custom size" mode lets the user type exact pixel dimensions
+- Server rounds requested H/W to multiples of 16 (VAE stride 8 × patchify stride 2)
+
 ## Measured performance (TPU v5e-1)
 
 - Boot: ~4.3 min
