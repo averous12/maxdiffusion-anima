@@ -41,6 +41,22 @@ def start(port=7860, log_path=LOG, timeout=90):
     """Start a quick tunnel to 127.0.0.1:port and return (process, public_url)."""
     binp = ensure_cloudflared()
     log = open(log_path, "w")
+
+    # Make sure the origin is actually answering before we ask cloudflared to proxy it.
+    # cloudflared itself waits, but its error message is just "502 Bad Gateway"; checking
+    # here gives a clearer log and avoids a useless tunnel process.
+    _t0 = time.time()
+    while time.time() - _t0 < timeout:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise SystemExit(f"origin http://127.0.0.1:{port}/ did not answer within {timeout}s")
+
     p = subprocess.Popen(
         [binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
         stdout=log, stderr=subprocess.STDOUT,
