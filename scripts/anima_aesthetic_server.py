@@ -270,10 +270,23 @@ def decode_latents(latents):
         img = np.moveaxis(img, 1, -1)
     return (img[0] * 255.0).round().astype(np.uint8)
 
-def save_u8(u8, path):
-    from PIL import Image
+def save_u8(u8, path, step=None, steps=None, ms_per_step=None, guidance=None):
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.fromarray(u8)
+    # Overlay progress text so the live preview is self-describing: without it the
+    # browser can look frozen when a preview is followed by a very similar preview.
+    try:
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
+        except Exception:
+            font = ImageFont.load_default()
+        text = f"step {step or '?'}/{steps or '?'}, {ms_per_step or '?'} ms/step, CFG {guidance or '?'}"
+        draw.text((10, 10), text, fill=(255, 255, 255), font=font)
+    except Exception:
+        pass
     tmp = path + ".tmp.png"
-    Image.fromarray(u8).save(tmp)
+    img.save(tmp)
     os.replace(tmp, path)
 
 log("=== SERVER: warming executables at production shape (1024px) ===")
@@ -423,7 +436,9 @@ while True:
             if PREV_EVERY and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
                 try:
                     p0 = time.perf_counter()
-                    save_u8(decode_latents(latents), SNAP_PATH)
+                    save_u8(decode_latents(latents), SNAP_PATH, step=i + 1,
+                            steps=STEPS, ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
+                            guidance=GUIDANCE)
                     prev_total += time.perf_counter() - p0
                     write_prog(stage="denoise", step=i + 1, steps=STEPS,
                                preview_step=i + 1, preview_s=round(prev_total, 2),
