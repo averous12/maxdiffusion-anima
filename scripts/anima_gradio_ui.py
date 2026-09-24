@@ -12,9 +12,17 @@ import json
 import os
 import shutil
 import time
+import uuid
 
 from PIL import Image
 
+# Handshake files, shared with the server (see anima_aesthetic_server.py).
+#
+# The request carries a `gen_id`; the server stamps that id into EVERY progress record it
+# writes for that request. The UI only accepts a `done` record whose gen_id matches the
+# request it submitted. Without that handshake the UI cannot tell its own result from the
+# previous run's: it polled the progress file, found the leftover stage="done" record, and
+# returned the previous image instantly -- the run looked like a no-op.
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
@@ -145,6 +153,12 @@ def start_gen(prompt, neg, height, width, steps, seed, guidance, preview_every):
         final = _read_img(FINAL_PATH)
         status = _status_line(prog, req["steps"])
         stage = prog.get("stage")
+        # A record from an earlier run (or from boot) must not end this generation.
+        # The image is only read once the matching `done` record is visible, and the
+        # server writes the PNG before that record, so the file is complete.
+        if prog.get("gen_id") != req["gen_id"]:
+            stage = None
+            status = "waiting for the server to pick up the request | " + status
         if stage == "done":
             # The server resolves a negative seed into a real one; archive under that
             # value so the filename identifies the run that actually happened.

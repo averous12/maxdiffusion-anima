@@ -319,7 +319,7 @@ except Exception:
     raise
 
 log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
-write_prog(stage="ready", step=0, steps=0)
+write_prog(stage="ready", step=0, steps=0, gen_id="warmup")
 
 def default_req():
     return {"prompt": "masterpiece, best quality, 1girl",
@@ -332,6 +332,7 @@ if not os.path.exists(REQ_PATH):
     json.dump({**default_req(), "go": False}, open(REQ_PATH, "w"))
 
 last_mtime = 0.0
+last_gen_id = ""          # id of the last request we actually ran
 while True:
     try:
         mt = os.path.getmtime(REQ_PATH)
@@ -350,8 +351,20 @@ while True:
     if not req.get("go"):
         continue
     d = default_req(); d.update({k: v for k, v in req.items() if k != "go"})
+    # Every progress record carries the id of the request that produced it. Without it a
+    # client cannot tell its own result from a previous run's: the UI polled the progress
+    # file, found the leftover stage="done" record, and returned the previous image
+    # instantly instead of waiting for the request it had just submitted.
+    gen_id = str(d.get("gen_id") or "")
+    if gen_id and gen_id == last_gen_id:
+        # Already ran this exact request (a duplicate write or a re-touched file).
+        log(f"ignoring request gen_id {gen_id}: already handled")
+        json.dump({**d, "go": False, "status": "duplicate"}, open(REQ_PATH, "w"))
+        last_mtime = os.path.getmtime(REQ_PATH)
+        continue
+    last_gen_id = gen_id
     json.dump({**d, "go": False, "status": "running"}, open(REQ_PATH, "w"))
-    write_prog(stage="starting", step=0, steps=d.get("steps", 30))
+    write_prog(stage="starting", step=0, steps=d.get("steps", 30), gen_id=gen_id)
     last_mtime = os.path.getmtime(REQ_PATH)
     try:
         PROMPT, NEG = d["prompt"], d["negative_prompt"]
@@ -379,9 +392,9 @@ while True:
             SEED = int(np.random.default_rng().integers(0, 2**31 - 1))
             log(f"seed {_seed_req} requested; using random seed {SEED}")
         g0 = time.perf_counter()
-        write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED))
+        write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED), gen_id=gen_id)
         (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(PROMPT, NEG)
-        write_prog(stage="conditioning", step=0, steps=STEPS, seed=int(SEED))
+        write_prog(stage="conditioning", step=0, steps=STEPS, seed=int(SEED), gen_id=gen_id)
         context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
         neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
         context.block_until_ready(); neg_context.block_until_ready()
@@ -406,7 +419,7 @@ while True:
             if i % 2 == 0 or i == STEPS - 1:
                 write_prog(stage="denoise", step=i + 1, steps=STEPS,
                            ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
-                           guidance=GUIDANCE, seed=int(SEED))
+                           guidance=GUIDANCE, seed=int(SEED), gen_id=gen_id)
             if PREV_EVERY and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
                 try:
                     p0 = time.perf_counter()
@@ -415,7 +428,7 @@ while True:
                     write_prog(stage="denoise", step=i + 1, steps=STEPS,
                                preview_step=i + 1, preview_s=round(prev_total, 2),
                                ms_per_step=round(step_s / (i + 1) * 1000.0, 1),
-                               guidance=GUIDANCE, seed=int(SEED))
+                               guidance=GUIDANCE, seed=int(SEED), gen_id=gen_id)
                 except Exception as _e:
                     log(f"preview decode failed at step {i+1}: {_e}")
         latents.block_until_ready()
@@ -424,7 +437,7 @@ while True:
         # Preview decodes run inside the loop, so subtract them: otherwise "denoise"
         # silently includes ~50s of VAE work on the first generation (it did).
         denoise_s = loop_s - prev_total
-        write_prog(stage="decode", step=STEPS, steps=STEPS)
+        write_prog(stage="decode", step=STEPS, steps=STEPS, gen_id=gen_id)
         v0 = time.perf_counter()
         save_u8(decode_latents(latents), OUT)
         decode_s = time.perf_counter() - v0
@@ -436,12 +449,12 @@ while True:
         write_prog(stage="done", step=STEPS, steps=STEPS, out=OUT, seed=int(SEED),
                    elapsed_s=round(total_s, 1), pre_s=round(pre_s, 1),
                    denoise_s=round(denoise_s, 1), decode_s=round(decode_s, 1),
-                   height=H, width=W, hbm=hbm_stats())
+                   height=H, width=W, hbm=hbm_stats(), gen_id=gen_id)
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
                   open(REQ_PATH, "w"))
     except Exception:
         log("gen raised:\n" + traceback.format_exc())
-        write_prog(stage="error")
+        write_prog(stage="error", gen_id=gen_id)
         try:
             json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
         except Exception:
