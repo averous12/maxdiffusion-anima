@@ -213,6 +213,7 @@ def build():
         btn.click(start_gen,
                   inputs=[prompt, neg, height, width, steps, seed, guidance, preview_every],
                   outputs=[final_img, snap_img, status])
+    demo.queue()  # streaming intermediate yields requires the Gradio queue
     return demo
 
 
@@ -223,6 +224,7 @@ if __name__ == "__main__":
     import time
     _port = int(os.environ.get("ANIMA_UI_PORT", "7860"))
     demo = build()
+    demo.queue()  # streaming intermediate yields requires the Gradio queue
     demo.launch(
         server_name=os.environ.get("ANIMA_UI_HOST", "0.0.0.0"),
         server_port=_port,
