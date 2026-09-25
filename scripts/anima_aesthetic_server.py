@@ -413,9 +413,35 @@ def save_u8(u8, path, step=None, steps=None, ms_per_step=None, guidance=None):
     img.save(tmp)
     os.replace(tmp, path)
 
-# (batch, H, W) shapes the transformer has compiled for, and (H, W) shapes the VAE has. A new
-# shape means a one-time XLA compile, which the UI is told about so it does not look frozen.
-_tf_compiled = set(); _vae_compiled = set()
+# (batch, H, W) shapes the transformer has compiled for, (H, W) shapes the VAE has, and the VAE
+# shapes whose PREVIEW decode failed during the CURRENT request. A new shape means a one-time XLA
+# compile, which the UI is told about so it does not look frozen. _vae_failed is reset per request
+# on purpose: it exists so the give-up path stops re-advertising a compile for a shape that just
+# failed, NOT to blacklist that shape for the server's whole life -- a later request at the same
+# shape pays the same real compile and must still say so.
+_tf_compiled = set(); _vae_compiled = set(); _vae_failed = set()
+
+# Preview bookkeeping, at module level, with _pv_state() defined here rather than inside the
+# request body. The request loop is itself module level, so EVERY progress record can carry the
+# state -- including "starting" and the transformer "compiling" record, which fire before the
+# denoise loop, and "decode"/"error", which fire after it. A closure defined inside the request
+# body would raise NameError in the request's own error handler whenever a request died before
+# that def -- exactly the case where the client most needs to know whether previews had failed.
+#
+# preview_fails counts CONSECUTIVE failures (it drives the give-up policy) and resets on success;
+# preview_fails_total is cumulative, so a recovered transient failure still shows in "done".
+prev_ok = 0
+prev_fail = 0
+prev_fails_total = 0
+prev_err = ""
+prev_giveup = False
+_pv_expected = 0
+
+
+def _pv_state():
+    return {"preview_ok": prev_ok, "preview_fails": prev_fail,
+            "preview_fails_total": prev_fails_total, "preview_total": _pv_expected,
+            "preview_gaveup": prev_giveup, "preview_error": prev_err or None}
 log("=== SERVER: warming executables at production shape (1024px) ===")
 try:
     t0 = time.perf_counter()
@@ -506,7 +532,17 @@ while True:
         continue
     last_gen_id = gen_id
     json.dump({**d, "go": False, "status": "running"}, open(REQ_PATH, "w"))
-    write_prog(stage="starting", step=0, steps=d.get("steps", 30), gen_id=gen_id)
+    # Reset before the FIRST record of this request, so a client polling "starting" can
+    # never see the previous request's preview_gaveup / preview_error.
+    prev_ok = 0
+    prev_fail = 0
+    prev_fails_total = 0
+    prev_err = ""
+    prev_giveup = False
+    _pv_expected = 0
+    _vae_failed = set()
+    write_prog(stage="starting", step=0, steps=d.get("steps", 30), gen_id=gen_id,
+               **_pv_state())
     last_mtime = os.path.getmtime(REQ_PATH)
     try:
         # One prompt, one negative, N images. Older clients sent lists: use the first entry.
@@ -520,6 +556,13 @@ while True:
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
         PREV_EVERY = int(d.get("preview_every", 5) or 0)
+        # Compute the expected preview count up front and log it, so "off" is explicit in the
+        # server log rather than a silent truthiness fall-through (preview_every=0 and a
+        # missing/None value both mean "no previews", which is invisible to the client).
+        _pv_expected = sum(1 for _i in range(int(STEPS))
+                           if PREV_EVERY and ((_i + 1) % PREV_EVERY == 0 or _i == STEPS - 1))
+        log(f"preview_every={PREV_EVERY} -> {_pv_expected} VAE previews "
+            f"{'(OFF: no live preview will be written)' if not PREV_EVERY else ''}")
         _MULT = 16
         H0, W0 = int(H), int(W)
         H = max(_MULT, int(round(H0 / _MULT)) * _MULT)
@@ -570,7 +613,8 @@ while True:
         common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id, batch_total=BATCH)
         if (BATCH, H, W) not in _tf_compiled:
             log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
-            write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}", **common)
+            write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
+                       **common, **_pv_state())
         d0 = time.perf_counter()
         prev_total = 0.0
         first_s = 0.0
@@ -587,24 +631,54 @@ while True:
             # ms/step excludes step 1 (which carries any XLA compile) and preview decodes.
             ms = round((step_s - first_s) / i * 1000.0, 1) if i > 0 else round(step_s * 1000.0, 1)
             if i % 2 == 0 or i == STEPS - 1:
-                write_prog(stage="denoise", step=i + 1, ms_per_step=ms, guidance=GUIDANCE, **common)
-            if PREV_EVERY and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
+                write_prog(stage="denoise", step=i + 1, ms_per_step=ms, guidance=GUIDANCE,
+                           **common, **_pv_state())
+            if PREV_EVERY and not prev_giveup and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
+                # A failed preview must never be silent: the old handler logged one line and
+                # carried on, so the UI showed snap=None forever behind a healthy status line
+                # and a normal "done". Every outcome is now counted and published to the
+                # progress JSON (preview_ok / preview_fails / preview_error / preview_gaveup).
+                # _pv_stage records which half failed, so a full disk or a PIL/grid error is
+                # not reported to the client as a VAE decode failure. Guessing it from the
+                # traceback text would mislabel it the moment a frame mentions "decode".
+                _pv_t0 = time.perf_counter()
+                _pv_stage = "decode"
                 try:
-                    if (H, W) not in _vae_compiled:
-                        write_prog(stage="compiling", step=i + 1, note=f"VAE decode {W}x{H}", **common)
-                    p0 = time.perf_counter()
-                    save_u8(make_grid_u8(decode_latents(latents)), SNAP_PATH, step=i + 1,
+                    if (H, W) not in _vae_compiled and (H, W) not in _vae_failed:
+                        write_prog(stage="compiling", step=i + 1, note=f"VAE decode {W}x{H}",
+                                   **common, **_pv_state())
+                    _imgs = decode_latents(latents)
+                    _pv_stage = "preview write"
+                    save_u8(make_grid_u8(_imgs), SNAP_PATH, step=i + 1,
                             steps=STEPS, ms_per_step=ms, guidance=GUIDANCE)
                     _vae_compiled.add((H, W))
-                    prev_total += time.perf_counter() - p0
+                    # ALL preview wall time, success or failure, is charged to prev_total.
+                    # Otherwise a failed attempt's ~50s XLA compile lands in denoise_s and
+                    # inflates ms_per_step, the figure the perf docs quote.
+                    prev_total += time.perf_counter() - _pv_t0
+                    prev_ok += 1
+                    prev_fail = 0
+                    prev_err = ""      # a recovered preview must not keep reporting failure
                     write_prog(stage="denoise", step=i + 1, preview_step=i + 1,
                                preview_s=round(prev_total, 2), ms_per_step=ms,
-                               guidance=GUIDANCE, **common)
+                               guidance=GUIDANCE, **common, **_pv_state())
                 except Exception as _e:
-                    log(f"preview decode failed at step {i+1}: {_e}")
+                    prev_total += time.perf_counter() - _pv_t0
+                    prev_fail += 1
+                    prev_fails_total += 1
+                    prev_err = f"{type(_e).__name__}: {str(_e)[:200]}"
+                    _vae_failed.add((H, W))
+                    log(f"preview failed at step {i+1} during {_pv_stage} "
+                        f"({type(_e).__name__}): {_e}\n" + traceback.format_exc())
+                    if prev_fail >= 2:
+                        prev_giveup = True
+                        log(f"previews disabled after {prev_fail} consecutive failures; "
+                            f"denoise continues to completion")
+                    write_prog(stage="denoise", step=i + 1, ms_per_step=ms,
+                               guidance=GUIDANCE, **common, **_pv_state())
         latents.block_until_ready()
         denoise_s = time.perf_counter() - d0 - prev_total
-        write_prog(stage="decode", step=STEPS, **common)
+        write_prog(stage="decode", step=STEPS, **common, **_pv_state())
         v0 = time.perf_counter()
         u8s = decode_latents(latents)
         _vae_compiled.add((H, W))
@@ -627,12 +701,16 @@ while True:
             f"denoise {denoise_s:.1f}s decode {decode_s:.1f}s total {total_s:.1f}s")
         write_prog(stage="done", step=STEPS, out=OUT, grid=OUT, images=images,
                    elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
-                   decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(), **common)
+                   decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(),
+                   **common, **_pv_state())
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
                   open(REQ_PATH, "w"))
     except Exception as _err:
         log("gen raised:\n" + traceback.format_exc())
-        write_prog(stage="error", gen_id=gen_id, error=f"{type(_err).__name__}: {str(_err)[:300]}")
+        # The preview state must survive into the error record too: a run that OOMs during
+        # the final decode used to lose the fact that previews had already failed.
+        write_prog(stage="error", gen_id=gen_id, error=f"{type(_err).__name__}: {str(_err)[:300]}",
+                   **_pv_state())
         try:
             json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
         except Exception:

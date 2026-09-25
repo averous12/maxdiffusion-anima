@@ -212,7 +212,34 @@ def save_outputs(prog, req):
         return f"<archive failed: {type(e).__name__}: {e}>"
 
 
-def _status_line(prog, fallback_steps):
+def _preview_fragment(prog, preview_every):
+    """The live-preview state as one status fragment, or None when there is nothing to say.
+
+    A failed preview used to be invisible to the client: the server logged a single line and
+    carried on, so the UI showed an empty preview behind a healthy status line and a normal
+    "done". The server now publishes preview_ok / preview_fails / preview_error /
+    preview_gaveup, and this is what makes them readable.
+    """
+    err = prog.get("preview_error")
+    if err and prog.get("preview_gaveup"):
+        return (f"previews disabled after failures: {err} "
+                f"(traceback in /content/anima_server.log)")
+    if err:
+        return f"previews failing: {err} (see /content/anima_server.log)"
+    if prog.get("preview_gaveup"):
+        return "previews disabled (see /content/anima_server.log)"
+    if preview_every is None:
+        return None            # the caller did not report a preview setting: say nothing
+    if not preview_every:
+        return "previews off"
+    ok = prog.get("preview_ok")
+    if ok:
+        total = prog.get("preview_total")
+        return f"previews {ok}/{total}" if total else f"previews {ok}"
+    return None
+
+
+def _status_line(prog, fallback_steps, preview_every=None):
     stage = prog.get("stage", "?")
     step = prog.get("step", 0)
     steps = prog.get("steps") or fallback_steps
@@ -242,7 +269,11 @@ def _status_line(prog, fallback_steps):
             bits.append(f"HBM peak {hbm.get('peak_gb', '?')}/{hbm.get('limit_gb', '?')} GB")
     if stage == "error":
         bits = [f"error: {prog.get('error') or 'see /content/anima_server.log'}"]
-    return " | ".join(str(b) for b in bits)
+    line = " | ".join(str(b) for b in bits)
+    # Appended after the stage overrides so the preview state survives the "done" and "error"
+    # rewrites -- that is where a silent preview failure was previously invisible.
+    frag = _preview_fragment(prog, preview_every)
+    return f"{line} | {frag}" if frag else line
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +311,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             stage = None
         else:
             stage = prog.get("stage")
-            status = _status_line(prog, req["steps"])
+            status = _status_line(prog, req["steps"], req["preview_every"])
         snap = _read_img(SNAP_PATH, newer_than=t_submit - 1) if mine else None
         if stage == "done":
             images = [im for im in (_read_img(p) for p in prog.get("images", [])) if im is not None]
@@ -301,7 +332,12 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             seen = marker
             yield None, [], snap, status
         time.sleep(0.5)
-    yield None, [], _read_img(SNAP_PATH, newer_than=t_submit - 1), f"timeout at {_read_prog()}"
+    # Render the last progress record instead of dumping a raw dict: a timeout line full of
+    # Python dict syntax was unreadable, and hid the one field that explains a stall (stage).
+    _to = _read_prog()
+    _to_status = _status_line(_to, req["steps"], req["preview_every"])
+    yield (None, [], _read_img(SNAP_PATH, newer_than=t_submit - 1),
+           f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}")
 
 
 # ---------------------------------------------------------------------------

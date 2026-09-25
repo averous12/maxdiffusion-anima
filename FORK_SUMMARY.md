@@ -67,6 +67,35 @@ This repository is a fork of [`google/maxdiffusion`](https://github.com/google/m
 - Backslash-escaped parentheses (`\(`, `\)`) produce literal parens inside a group
 - Parsed and applied server-side where the tokenizer lives; both positive and negative prompts are processed
 
+### Preview observability
+
+- A failed live preview used to be invisible: the server caught the exception, logged one
+  line, and the UI showed an empty box behind a healthy status line and a normal `done`.
+- The server now publishes preview state on **every** progress record:
+  `preview_ok`, `preview_fails` (consecutive), `preview_fails_total` (cumulative),
+  `preview_total` (expected), `preview_error`, `preview_gaveup` — so the client can tell
+  "no preview yet" from "previews keep failing".
+- After **2 consecutive failures** the server stops attempting previews for that generation
+  instead of paying a ~50 s XLA compile stall every N steps; the denoise loop still runs to
+  completion. A failed VAE shape is remembered for the request in `_vae_failed` and not
+  re-advertised as "compiling".
+- The UI status line renders it: `previews 6/6`, `previews off`,
+  `previews failing: <ErrorType>: <msg> (see /content/anima_server.log)`,
+  `previews disabled after failures: ...`. The timeout branch now renders through the same
+  status line instead of dumping the raw progress dict.
+- Previews arrive **every `preview_every` steps**, not continuously: 30 steps at 5 = 6 decodes,
+  and the final step always decodes. `preview_every=1` is available but costs a decode per step
+  (a warm decode is ~0.5 s, so ~15 s on top of a ~17 s 30-step denoise); the default of 5 is 3
+  decodes' worth of overhead.
+- The preview handler logs a full traceback, and the line names the phase that broke —
+  `preview failed at step N during decode|preview write` — so a full disk or a PIL/grid
+  error is no longer mislabelled as a VAE decode failure.
+- Both headless drivers (`anima_aesthetic_colab.ipynb` cell 6 and
+  `ops/tpu_gradio_e2e.py`) were calling an obsolete 8-argument `start_gen` and unpacking 3
+  values, so they raised `TypeError` before sending a request. They now match the current
+  12-argument signature, consume the `(grid, gallery, snap, status)` 4-tuple, save PIL
+  payloads, assert the arity, and print a `PREVIEW_VERDICT` line.
+
 ### True batching
 
 - Request `batch` > 1 shares every denoise step across images on the TPU
