@@ -66,6 +66,7 @@ from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, co
 from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
     convert_anima_aesthetic_adapter_weights)
+from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_lora
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -300,6 +301,23 @@ t_conv = time.perf_counter() - t0
 del tv
 gc.collect()
 log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
+
+# --- Optional LoRA merge (must happen on CPU before device_put) ---
+lora_path = os.environ.get("ANIMA_LORA_PATH", "").strip()
+lora_scale = float(os.environ.get("ANIMA_LORA_SCALE", "1.0"))
+if lora_path and os.path.exists(lora_path):
+    log(f"merging LoRA from {lora_path} (scale={lora_scale})")
+    t_lora0 = time.perf_counter()
+    try:
+        t_params, lora_stats = load_and_merge_anima_lora(
+            t_params, lora_path, scale=lora_scale, dtype=jnp.bfloat16)
+        log(f"LoRA merged: {lora_stats['merged']} layers, {lora_stats['skipped']} skipped in {time.perf_counter()-t_lora0:.2f}s")
+    except Exception:
+        log("LoRA merge failed:\n" + traceback.format_exc())
+        raise
+else:
+    log("no LoRA path set (ANIMA_LORA_PATH) or file not found")
+
 t0 = time.perf_counter()
 t_params = jax.device_put(t_params, jax.devices()[0])
 log(f"transformer params -> TPU in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
