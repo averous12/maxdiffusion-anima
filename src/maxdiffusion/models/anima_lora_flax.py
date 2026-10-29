@@ -26,7 +26,7 @@ Two on-disk LoRA formats are supported:
    adapter, not the diffusion transformer, and are intentionally ignored.
 
 Our linen params (scanned) live under keys:
-  ('scan', 'b', <rest>, 'kernel')  with shape (28, out, in) or (28, out, in, kH, kW)
+  ('scan', 'b', <rest>, 'kernel')  with shape (layers, out, in)
 
 Mapping table (LoRA suffix -> linen rest):
   adaln_modulation_self_attn_1     -> ('norm1', 'linear_1')
@@ -52,11 +52,24 @@ delta is transposed before being added. The transpose is mandatory: without it
 every non-square target (AdaLN modulations, cross-attn k/v, both MLP layers)
 fails its shape check and is skipped, which still leaves the square attention
 projections merged and makes the LoRA look like it "mostly worked".
+
+MEMORY / MULTI-LORA
+-------------------
+Several LoRAs can be merged in a single pass. Merging them one file at a time
+would copy every target tensor once per file; here each target tensor is copied
+exactly once and every LoRA's delta is accumulated into it.
+
+Tensors are streamed from the safetensors files on demand: the index pass reads
+only key names (plus the tiny alpha scalars), so the resident LoRA cost is one
+target's worth of deltas rather than a whole file. Params are stored back as
+plain numpy arrays and the JAX array is released as soon as the copy exists, so
+peak memory is roughly one copy of the largest single target tensor.
 """
 
+import contextlib
 import re
-import jax.numpy as jnp
 import numpy as np
+import jax.numpy as jnp
 from flax.traverse_util import flatten_dict, unflatten_dict
 from safetensors import safe_open
 
@@ -87,6 +100,9 @@ LORA_SUFFIX_TO_LINEN = {
 # Legacy constant, kept for backwards compatibility with older callers/logs.
 # Scaling now uses the per-module rank read from the tensor itself.
 EXPECTED_LORA_RANK = 32
+
+# Anima is 28 scanned layers x 16 modules.
+EXPECTED_TARGETS_ANIMA = 448
 
 # --- key patterns -----------------------------------------------------------
 # ComfyUI / AI-toolkit
@@ -124,180 +140,246 @@ def detect_lora_format(path):
     return "unknown"
 
 
-def _parse_anima_lora_file(path):
+def _new_slot(targets, layer_idx, linen_rest):
+    target_key = ("scan", "b") + linen_rest + ("kernel",)
+    targets.setdefault(target_key, {})
+    return targets[target_key].setdefault(
+        layer_idx, {"down": None, "up": None, "alpha": None})
+
+
+def _index_lora(handle):
+    """Read a LoRA's key layout WITHOUT materialising tensor data.
+
+    Returns {"targets": {target_key: {layer_idx: {"down","up","alpha"}}},
+             "format": str}
+
+    `down`/`up` are tensor key names to fetch later; `alpha` is the real value
+    (a scalar costs nothing to read).
     """
-    Parse an Anima LoRA safetensors file into a dict:
-      {layer_idx: {linen_rest_tuple: {"down": arr, "up": arr, "alpha": float|None}}}
-    Also returns the set of detected formats.
-    """
-    parsed = {}
+    targets = {}
     formats = set()
 
-    def _slot(layer_idx, linen_rest):
-        target_key = ("scan", "b") + linen_rest + ("kernel",)
-        parsed.setdefault(layer_idx, {})
-        parsed[layer_idx].setdefault(
-            target_key, {"down": None, "up": None, "alpha": None})
-        return parsed[layer_idx][target_key]
+    for key in handle.keys():
+        if key.startswith(_LLM_ADAPTER):
+            continue
 
-    with safe_open(path, framework="numpy") as s:
-        for key in s.keys():
-            if key.startswith(_LLM_ADAPTER):
+        m = _COMFY_RE.match(key)
+        if m:
+            layer_idx, suffix, kind = int(m.group(1)), m.group(2), m.group(3)
+            if suffix not in LORA_SUFFIX_TO_LINEN:
                 continue
+            formats.add("comfyui")
+            slot = _new_slot(targets, layer_idx, LORA_SUFFIX_TO_LINEN[suffix])
+            if kind == "lora_down":
+                slot["down"] = key
+            elif kind == "lora_up":
+                slot["up"] = key
+            else:
+                slot["alpha"] = float(np.asarray(handle.get_tensor(key)).reshape(-1)[0])
+            continue
 
-            m = _COMFY_RE.match(key)
-            if m:
-                layer_idx, suffix, kind = int(m.group(1)), m.group(2), m.group(3)
-                if suffix not in LORA_SUFFIX_TO_LINEN:
-                    continue
-                formats.add("comfyui")
-                slot = _slot(layer_idx, LORA_SUFFIX_TO_LINEN[suffix])
-                val = s.get_tensor(key)
-                if kind == "lora_down":
-                    slot["down"] = val.astype(np.float32)
-                elif kind == "lora_up":
-                    slot["up"] = val.astype(np.float32)
-                else:
-                    slot["alpha"] = float(np.asarray(val).reshape(-1)[0])
+        m = _DIFFUSERS_RE.match(key)
+        if m:
+            layer_idx = int(m.group(1))
+            suffix = _suffix_from_diffusers_module(m.group(2))
+            kind = m.group(3)
+            if suffix not in LORA_SUFFIX_TO_LINEN:
                 continue
+            formats.add("diffusers")
+            slot = _new_slot(targets, layer_idx, LORA_SUFFIX_TO_LINEN[suffix])
+            if kind == "lora_A":
+                slot["down"] = key
+            elif kind == "lora_B":
+                slot["up"] = key
+            else:
+                slot["alpha"] = float(np.asarray(handle.get_tensor(key)).reshape(-1)[0])
+            continue
 
-            m = _DIFFUSERS_RE.match(key)
-            if m:
-                layer_idx = int(m.group(1))
-                suffix = _suffix_from_diffusers_module(m.group(2))
-                kind = m.group(3)
-                if suffix not in LORA_SUFFIX_TO_LINEN:
-                    continue
-                formats.add("diffusers")
-                slot = _slot(layer_idx, LORA_SUFFIX_TO_LINEN[suffix])
-                val = s.get_tensor(key)
-                if kind == "lora_A":
-                    slot["down"] = val.astype(np.float32)
-                elif kind == "lora_B":
-                    slot["up"] = val.astype(np.float32)
-                else:
-                    slot["alpha"] = float(np.asarray(val).reshape(-1)[0])
-                continue
-
-    return parsed, formats
+    return {"targets": targets,
+            "format": "+".join(sorted(formats)) if formats else "unknown"}
 
 
-def merge_anima_lora_into_flat_params(flat_params, lora_path, scale=1.0, dtype=jnp.bfloat16):
+def _normalise_loras(loras):
+    """Accept a path, (path, scale), or a list of either."""
+    if loras is None:
+        return []
+    if isinstance(loras, (str, bytes)):
+        return [(loras, 1.0)]
+    if isinstance(loras, tuple) and len(loras) == 2 and isinstance(loras[0], str):
+        return [(loras[0], float(loras[1]))]
+    out = []
+    for item in loras:
+        if isinstance(item, (str, bytes)):
+            out.append((item, 1.0))
+        else:
+            path, scale = item
+            out.append((path, float(scale)))
+    return out
+
+
+def _parse_anima_lora_file(path):
+    """Compatibility helper: materialise one LoRA's deltas as arrays.
+
+    Kept for tests and callers that want everything in memory. The merge path
+    does NOT use this — it streams per target so resident memory stays flat.
     """
-    Merge LoRA weights into a flat linen parameter dict.
+    parsed = {}
+    with safe_open(path, framework="numpy") as s:
+        idx = _index_lora(s)
+        for target_key, per_layer in idx["targets"].items():
+            for layer_idx, e in per_layer.items():
+                entry = {"down": None, "up": None, "alpha": e["alpha"]}
+                if e["down"] is not None:
+                    entry["down"] = s.get_tensor(e["down"]).astype(np.float32)
+                if e["up"] is not None:
+                    entry["up"] = s.get_tensor(e["up"]).astype(np.float32)
+                parsed.setdefault(layer_idx, {})[target_key] = entry
+    return parsed, ({idx["format"]} if idx["format"] != "unknown" else set())
+
+
+def merge_anima_loras_into_flat_params(flat_params, loras, dtype=jnp.bfloat16):
+    """Merge one or more LoRAs into a flat linen parameter dict.
 
     Args:
-        flat_params: dict from flatten_dict(model_params) — will be MUTATED.
-        lora_path: path to .safetensors LoRA file.
-        scale: global LoRA scale multiplier.
-        dtype: target dtype for the merged weights (params are updated in this dtype).
+        flat_params: dict from flatten_dict(model_params). MUTATED in place;
+            touched entries are replaced with numpy arrays in `dtype`.
+        loras: [(path, scale), ...] — a bare path or (path, scale) also works.
+        dtype: dtype for the merged weights.
 
     Returns:
-        (updated_flat_params, stats_dict)
-    """
-    parsed, formats = _parse_anima_lora_file(lora_path)
-    if not parsed:
-        return flat_params, {"merged": 0, "skipped": 0, "format": "unknown",
-                             "error": "no matching keys"}
+        (flat_params, stats)
 
-    # Regroup by target param so each scanned tensor is copied exactly once.
-    # Layout: {target_key: {layer_idx: {"down","up","alpha"}}}
-    by_target = {}
-    for layer_idx, targets in parsed.items():
-        for target_key, parts in targets.items():
-            by_target.setdefault(target_key, {})[layer_idx] = parts
+    One pass over the target tensors and one copy per tensor, regardless of how
+    many LoRAs are supplied.
+    """
+    specs = _normalise_loras(loras)
+    specs = [(p, s) for p, s in specs if p]
+    if not specs:
+        return flat_params, {"merged": 0, "skipped": 0, "format": "unknown",
+                             "error": "no LoRA paths"}
 
     merged = 0
     skipped = 0
     details = []
     ranks = set()
     used = []
+    formats = set()
+    all_targets = []
 
-    for target_key, per_layer in by_target.items():
-        if target_key not in flat_params:
-            skipped += len(per_layer)
-            details.append(f"missing param: {target_key}")
-            continue
+    with contextlib.ExitStack() as stack:
+        handles = [stack.enter_context(safe_open(p, framework="numpy")) for p, _ in specs]
+        indexes = [_index_lora(h) for h in handles]
+        formats.update(idx["format"] for idx in indexes)
 
-        param = flat_params[target_key]
-        if param.ndim != 3:
-            skipped += len(per_layer)
-            details.append(f"shape mismatch {target_key}: {param.shape} (expected 3D scanned)")
-            continue
+        # union of target keys, in a stable order
+        seen = set()
+        for idx in indexes:
+            for tk in idx["targets"]:
+                if tk not in seen:
+                    seen.add(tk)
+                    all_targets.append(tk)
 
-        out = np.array(param)  # exactly one copy per scanned tensor
-        slice_shape = tuple(param.shape[1:])
-        touched = 0
-
-        for layer_idx, parts in sorted(per_layer.items()):
-            down, up, alpha = parts["down"], parts["up"], parts["alpha"]
-            if down is None or up is None:
-                skipped += 1
-                details.append(f"incomplete LoRA for {target_key}[{layer_idx}]")
+        for target_key in all_targets:
+            param = flat_params.get(target_key)
+            if param is None:
+                skipped += sum(len(idx["targets"].get(target_key, {})) for idx in indexes)
+                details.append(f"missing param: {target_key}")
                 continue
-            if layer_idx >= param.shape[0]:
+            if param.ndim != 3:
                 skipped += 1
-                details.append(f"layer {layer_idx} out of range for {target_key}")
-                continue
-
-            rank = down.shape[0]
-            ranks.add(rank)
-            # Standard LoRA scaling: alpha / rank. Missing alpha == rank -> factor 1.
-            a = alpha if alpha is not None else float(rank)
-
-            # up @ down is (out, in) — the PyTorch/diffusers convention.
-            # Our linen Dense kernel is (in, out), so the delta must be
-            # transposed. Getting this wrong silently skips every non-square
-            # target (AdaLN modulations, cross-attn k/v, both MLP layers) and
-            # leaves the square attention projections looking fine.
-            delta = up @ down
-            if delta.T.shape == slice_shape:
-                add = np.ascontiguousarray(delta.T)
-                used.append("T")
-            elif delta.shape == slice_shape:
-                # Fallback for a model that stores kernels as (out, in).
-                add = delta
-                used.append("raw")
-            else:
-                skipped += 1
-                details.append(
-                    f"delta {delta.shape} (or T {delta.T.shape}) != param slice "
-                    f"{slice_shape} for {target_key}[{layer_idx}]")
+                details.append(f"bad shape {target_key}: {param.shape} (expected 3D)")
                 continue
 
-            base = param[layer_idx].astype(np.float32)
-            out[layer_idx] = (base + add * (scale * a / rank)).astype(out.dtype)
-            merged += 1
-            touched += 1
+            # One copy, then release the JAX array: replacing the dict entry
+            # drops the last reference, so the original and the copy are never
+            # both resident beyond this point.
+            buf = np.array(param)
+            flat_params[target_key] = buf
+            del param
 
-        if touched:
-            flat_params[target_key] = jnp.asarray(out, dtype=dtype)
+            slice_shape = tuple(buf.shape[1:])
+            n_layers = buf.shape[0]
+            touched = 0
+
+            for layer_idx in range(n_layers):
+                acc = None
+                for idx, handle, (_, lora_scale) in zip(indexes, handles, specs):
+                    entry = idx["targets"].get(target_key, {}).get(layer_idx)
+                    if not entry or entry["down"] is None or entry["up"] is None:
+                        continue
+
+                    down = handle.get_tensor(entry["down"]).astype(np.float32)
+                    up = handle.get_tensor(entry["up"]).astype(np.float32)
+                    rank = down.shape[0]
+                    ranks.add(rank)
+                    # Standard LoRA scaling: alpha / rank. Missing alpha == rank.
+                    a = entry["alpha"] if entry["alpha"] is not None else float(rank)
+
+                    delta = up @ down                  # (out, in)
+                    delta *= (lora_scale * a / rank)   # in place, no extra tensor
+                    if delta.T.shape == slice_shape:
+                        add = delta.T            # (in, out): correct for linen
+                        used.append("T")
+                    elif delta.shape == slice_shape:
+                        add = delta
+                        used.append("raw")
+                    else:
+                        skipped += 1
+                        details.append(
+                            f"delta {delta.shape} (or T {delta.T.shape}) != param "
+                            f"slice {slice_shape} for {target_key}[{layer_idx}]")
+                        continue
+
+                    if acc is None:
+                        acc = buf[layer_idx].astype(np.float32)
+                    acc += add
+
+                if acc is not None:
+                    try:
+                        np.copyto(buf[layer_idx], acc, casting="unsafe")
+                    except (TypeError, ValueError):
+                        buf[layer_idx] = acc.astype(buf.dtype)
+                    merged += 1
+                    touched += 1
+
+            if not touched:
+                details.append(f"no delta applied to {target_key}")
 
     return flat_params, {
         "merged": merged,
         "skipped": skipped,
-        "layers_touched": len(parsed),
-        "targets": len(by_target),
+        "targets": len(all_targets),
+        "loras": [{"path": p, "scale": s} for p, s in specs],
         "ranks": sorted(ranks),
         "convention": sorted(set(used)),
-        "format": "+".join(sorted(formats)) if formats else "unknown",
+        "format": "+".join(sorted(formats)),
         "details": details,
     }
 
 
-def load_and_merge_anima_lora(model_params, lora_path, scale=1.0, dtype=jnp.bfloat16):
-    """
-    High-level helper: flatten, merge, unflatten.
+def merge_anima_lora_into_flat_params(flat_params, lora_path, scale=1.0, dtype=jnp.bfloat16):
+    """Single-LoRA wrapper kept for existing callers."""
+    return merge_anima_loras_into_flat_params(flat_params, [(lora_path, scale)], dtype=dtype)
+
+
+def load_and_merge_anima_loras(model_params, loras, dtype=jnp.bfloat16):
+    """Flatten, merge one or more LoRAs, unflatten.
 
     Args:
-        model_params: nested pytree (from nnx.State or linen init)
-        lora_path: path to .safetensors
-        scale: global LoRA scale
-        dtype: dtype for merged weights
+        model_params: nested pytree (from nnx.State or linen init). Must be the
+            NESTED tree — this function flattens internally, so an already-flat
+            dict would double-flatten its tuple keys.
+        loras: [(path, scale), ...] or a single path.
+        dtype: dtype for the merged weights.
 
     Returns:
-        new_model_params (nested pytree, same structure as input)
+        (new_model_params, stats)
     """
     flat = flatten_dict(model_params)
-    flat, stats = merge_anima_lora_into_flat_params(flat, lora_path, scale, dtype)
+    flat, stats = merge_anima_loras_into_flat_params(flat, loras, dtype=dtype)
     return unflatten_dict(flat), stats
+
+
+def load_and_merge_anima_lora(model_params, lora_path, scale=1.0, dtype=jnp.bfloat16):
+    """Single-LoRA wrapper kept for existing callers."""
+    return load_and_merge_anima_loras(model_params, [(lora_path, scale)], dtype=dtype)

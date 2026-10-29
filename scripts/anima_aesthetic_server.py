@@ -66,7 +66,7 @@ from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, co
 from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
     convert_anima_aesthetic_adapter_weights)
-from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_lora
+from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_loras
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -303,28 +303,54 @@ gc.collect()
 log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
 
 # --- Optional LoRA merge (must happen on CPU before device_put) ---
-lora_path = os.environ.get("ANIMA_LORA_PATH", "").strip()
-lora_scale = float(os.environ.get("ANIMA_LORA_SCALE", "1.0"))
-if lora_path and os.path.exists(lora_path):
-    log(f"merging LoRA from {lora_path} (scale={lora_scale})")
+# ANIMA_LORAS is a JSON list of {"path": ..., "scale": ...} merged in one pass.
+# ANIMA_LORA_PATH / ANIMA_LORA_SCALE remain supported for a single LoRA.
+def _lora_specs():
+    raw = os.environ.get("ANIMA_LORAS", "").strip()
+    specs = []
+    if raw:
+        try:
+            for item in json.loads(raw):
+                p = str(item.get("path", "")).strip()
+                if p:
+                    specs.append((p, float(item.get("scale", 1.0))))
+        except Exception as e:
+            log(f"ANIMA_LORAS is not valid JSON ({type(e).__name__}: {e}); ignoring it")
+    if not specs:
+        p = os.environ.get("ANIMA_LORA_PATH", "").strip()
+        if p:
+            specs.append((p, float(os.environ.get("ANIMA_LORA_SCALE", "1.0"))))
+    return specs
+
+lora_specs = [(p, s) for p, s in _lora_specs() if os.path.exists(p)]
+missing = [(p, s) for p, s in _lora_specs() if not os.path.exists(p)]
+for p, _ in missing:
+    log(f"WARNING: LoRA path not found, skipping: {p}")
+
+if lora_specs:
+    log("merging %d LoRA(s): %s" % (len(lora_specs),
+        ", ".join(f"{os.path.basename(p)}@{s}" for p, s in lora_specs)))
     t_lora0 = time.perf_counter()
     try:
-        t_params, lora_stats = load_and_merge_anima_lora(
-            t_params, lora_path, scale=lora_scale, dtype=jnp.bfloat16)
-        log(f"LoRA merged: {lora_stats['merged']} layers, {lora_stats['skipped']} skipped "
-            f"| format={lora_stats.get('format')} targets={lora_stats.get('targets')} "
+        t_params, lora_stats = load_and_merge_anima_loras(
+            t_params, lora_specs, dtype=jnp.bfloat16)
+        log(f"LoRA merged: {lora_stats['merged']} layer-targets, "
+            f"{lora_stats['skipped']} skipped | format={lora_stats.get('format')} "
+            f"targets={lora_stats.get('targets')} "
             f"convention={lora_stats.get('convention')} "
             f"in {time.perf_counter()-t_lora0:.2f}s")
-        if lora_stats.get("merged") != 448:
-            log(f"WARNING: expected 448 merged targets (28 layers x 16 modules), "
-                f"got {lora_stats.get('merged')}")
+        # A partially applied LoRA still produces a plausible image, so an
+        # unexpected skip count must be loud rather than silent.
+        if lora_stats.get("skipped"):
+            log(f"WARNING: {lora_stats['skipped']} layer-targets were skipped; "
+                f"the LoRA is only partially applied")
         for _d in lora_stats.get("details", [])[:10]:
             log(f"  lora: {_d}")
     except Exception:
         log("LoRA merge failed:\n" + traceback.format_exc())
         raise
 else:
-    log("no LoRA path set (ANIMA_LORA_PATH) or file not found")
+    log("no LoRA configured (ANIMA_LORAS / ANIMA_LORA_PATH) or file not found")
 
 t0 = time.perf_counter()
 t_params = jax.device_put(t_params, jax.devices()[0])
