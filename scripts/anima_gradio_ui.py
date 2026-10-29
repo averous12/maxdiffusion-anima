@@ -140,12 +140,16 @@ def preview_html(aspect_w, aspect_h, mp_label, width, height):
 # ---------------------------------------------------------------------------
 # Server handshake helpers
 # ---------------------------------------------------------------------------
-def _read_prog():
+def _read_json(path, default=None):
     try:
-        with open(PROG_PATH) as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
-        return {"stage": "waiting"}
+        return default
+
+
+def _read_prog():
+    return _read_json(PROG_PATH, {"stage": "waiting"})
 
 
 def _read_img(path, newer_than=None):
@@ -356,7 +360,11 @@ def poll_progress():
     steps = int(prog.get("steps") or 30)
     step = int(prog.get("step") or 0)
     busy = stage in ("starting", "text_encode", "denoise", "decode", "preview")
-    status = _status_line(prog, steps, int(prog.get("preview_every") or 0))
+    # The progress record does not carry preview_every, so read the requested
+    # value from the request file: otherwise the status line claims "previews
+    # off" on runs that are plainly producing previews.
+    requested = _read_json(REQ_PATH) or {}
+    status = _status_line(prog, steps, int(requested.get("preview_every") or 0))
     pct = 100 if stage == "done" else int(round(100.0 * step / max(1, steps)))
 
     # Only touch the image while a run is in flight: once it ends, the final
