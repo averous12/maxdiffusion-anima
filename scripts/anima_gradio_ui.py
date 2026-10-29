@@ -466,7 +466,7 @@ def build():
             btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
             stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4, visible=False)
         progress = gr.Slider(0, 100, value=0, step=1, label="Progress",
-                             interactive=False, show_reset_button=False)
+                             interactive=False)
         status = gr.Textbox(label="Status", interactive=False, show_label=False,
                             placeholder="idle")
 
