@@ -46,7 +46,12 @@ Mapping table (LoRA suffix -> linen rest):
   mlp_layer1                       -> ('ff_in',)
   mlp_layer2                       -> ('ff_out',)
 
-All target weights are 2D (Linear kernel) so LoRA delta = up @ down  (out, in)
+All target weights are 2D (Linear kernel). `up @ down` is (out, in) in the
+PyTorch/diffusers convention, while a linen `Dense` kernel is (in, out), so the
+delta is transposed before being added. The transpose is mandatory: without it
+every non-square target (AdaLN modulations, cross-attn k/v, both MLP layers)
+fails its shape check and is skipped, which still leaves the square attention
+projections merged and makes the LoRA look like it "mostly worked".
 """
 
 import re
@@ -206,6 +211,7 @@ def merge_anima_lora_into_flat_params(flat_params, lora_path, scale=1.0, dtype=j
     skipped = 0
     details = []
     ranks = set()
+    used = []
 
     for target_key, per_layer in by_target.items():
         if target_key not in flat_params:
@@ -239,16 +245,28 @@ def merge_anima_lora_into_flat_params(flat_params, lora_path, scale=1.0, dtype=j
             # Standard LoRA scaling: alpha / rank. Missing alpha == rank -> factor 1.
             a = alpha if alpha is not None else float(rank)
 
-            delta = up @ down  # (out, in)
-            if delta.shape != slice_shape:
+            # up @ down is (out, in) — the PyTorch/diffusers convention.
+            # Our linen Dense kernel is (in, out), so the delta must be
+            # transposed. Getting this wrong silently skips every non-square
+            # target (AdaLN modulations, cross-attn k/v, both MLP layers) and
+            # leaves the square attention projections looking fine.
+            delta = up @ down
+            if delta.T.shape == slice_shape:
+                add = np.ascontiguousarray(delta.T)
+                used.append("T")
+            elif delta.shape == slice_shape:
+                # Fallback for a model that stores kernels as (out, in).
+                add = delta
+                used.append("raw")
+            else:
                 skipped += 1
                 details.append(
-                    f"delta {delta.shape} != param slice {slice_shape} for "
-                    f"{target_key}[{layer_idx}]")
+                    f"delta {delta.shape} (or T {delta.T.shape}) != param slice "
+                    f"{slice_shape} for {target_key}[{layer_idx}]")
                 continue
 
             base = param[layer_idx].astype(np.float32)
-            out[layer_idx] = (base + delta * (scale * a / rank)).astype(out.dtype)
+            out[layer_idx] = (base + add * (scale * a / rank)).astype(out.dtype)
             merged += 1
             touched += 1
 
@@ -261,6 +279,7 @@ def merge_anima_lora_into_flat_params(flat_params, lora_path, scale=1.0, dtype=j
         "layers_touched": len(parsed),
         "targets": len(by_target),
         "ranks": sorted(ranks),
+        "convention": sorted(set(used)),
         "format": "+".join(sorted(formats)) if formats else "unknown",
         "details": details,
     }

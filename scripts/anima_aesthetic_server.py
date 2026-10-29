@@ -313,7 +313,11 @@ if lora_path and os.path.exists(lora_path):
             t_params, lora_path, scale=lora_scale, dtype=jnp.bfloat16)
         log(f"LoRA merged: {lora_stats['merged']} layers, {lora_stats['skipped']} skipped "
             f"| format={lora_stats.get('format')} targets={lora_stats.get('targets')} "
-            f"ranks={lora_stats.get('ranks')} in {time.perf_counter()-t_lora0:.2f}s")
+            f"convention={lora_stats.get('convention')} "
+            f"in {time.perf_counter()-t_lora0:.2f}s")
+        if lora_stats.get("merged") != 448:
+            log(f"WARNING: expected 448 merged targets (28 layers x 16 modules), "
+                f"got {lora_stats.get('merged')}")
         for _d in lora_stats.get("details", [])[:10]:
             log(f"  lora: {_d}")
     except Exception:
