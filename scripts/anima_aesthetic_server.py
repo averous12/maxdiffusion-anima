@@ -152,65 +152,17 @@ qwen3_params = jax.device_put(qwen3_params, jax.devices()[0])
 qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
 log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
 
-# --- prompt weighting begin ---
-# Syntax: (text:1.3) scales a span; groups nest and multiply; range is clamped to 0..3.
-# Only the explicit "(...:number)" form is a weight. Plain parentheses, e.g. the danbooru tag
-# "fern (sousou no frieren)", stay literal. Use \( and \) for a literal paren inside a group.
-import re as _re
-import math
-_WEIGHT_TAIL = _re.compile(r":\s*([-+]?(?:\d+\.?\d*|\.\d+))\s*$")
+# --- prompt control begin -----------------------------------------------------
+# Weighting AND scheduling come from maxdiffusion.anima_prompt_control, which
+# implements the ComfyUI core weighting syntax and the asagi4/comfyui-prompt-control
+# scheduling grammar. The old inline parser only understood "(text:weight)" and
+# could not schedule, so it is gone.
+import maxdiffusion.anima_prompt_control as prompt_control
 
-def _find_close(s, i):
-    """Index of the ')' matching the '(' at s[i], honouring backslash escapes; -1 if unbalanced."""
-    depth = 0
-    j = i
-    while j < len(s):
-        c = s[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return j
-        j += 1
-    return -1
-
-def _parse_weights(s, w=1.0):
-    out, buf, i = [], [], 0
-    while i < len(s):
-        c = s[i]
-        if c == "\\" and i + 1 < len(s) and s[i + 1] in "()\\":
-            buf.append(s[i + 1])
-            i += 2
-            continue
-        if c == "(":
-            j = _find_close(s, i)
-            if j != -1:
-                m = _WEIGHT_TAIL.search(s[i + 1:j])
-                if m:
-                    if buf:
-                        out.append(("".join(buf), w))
-                        buf = []
-                    out.extend(_parse_weights(s[i + 1:i + 1 + m.start()], w * float(m.group(1))))
-                    i = j + 1
-                    continue
-        buf.append(c)
-        i += 1
-    if buf:
-        out.append(("".join(buf), w))
-    return out
-
-def parse_prompt_weights(text):
-    """-> (clean_text, per_char_weights). clean_text has the weight syntax removed."""
-    segs = _parse_weights(text or "")
-    clean = "".join(t for t, _ in segs)
-    if not segs:
-        return clean, np.zeros(0, np.float32)
-    cw = np.concatenate([np.full(len(t), min(max(w, 0.0), 3.0), np.float32) for t, w in segs])
-    return clean, cw
+PROMPT_STYLE = (os.environ.get("ANIMA_PROMPT_STYLE", "comfy").strip().lower()
+                or "comfy")
+# T5 is our text encoder, and prompt-control documents BREAK as a no-op for T5;
+# CAT is the operator that actually splits/concatenates conditioning.
 
 def token_weights(offsets, cw, text):
     """Per-token weight = mean char weight over the token's span (leading spaces ignored)."""
@@ -223,14 +175,21 @@ def token_weights(offsets, cw, text):
         if b > a:
             tw[k] = float(cw[a:b].mean())
     return tw
-# --- prompt weighting end ---
+# --- prompt control end ---
 
-def encode_texts(prompt, neg):
-    ids = []; masks = []; wts = []; clean = []
-    for p in [prompt, neg]:
-        text, cw = parse_prompt_weights(p)
+def _encode_text_list(pairs):
+    """[(clean_text, per_char_weights)] -> (qhidden, qmask, t5ids, t5mask), batched.
+
+    The weight application is the same as before: the conditioner RMS-normalises
+    K, so plain per-token scaling would barely change attention. Instead move each
+    weighted token away from (w>1) or toward (w<1) the prompt's mean embedding:
+    (z - mu) * w + mu. Tokens with weight exactly 1.0 are untouched, so an
+    unweighted prompt is bit-identical to the unweighted path.
+    """
+    ids, masks, wts, clean = [], [], [], []
+    kw = dict(padding="max_length", max_length=512, truncation=True, return_tensors="np")
+    for text, cw in pairs:
         clean.append(text)
-        kw = dict(padding="max_length", max_length=512, truncation=True, return_tensors="np")
         tw = np.ones(512, np.float32)
         if len(cw) and (cw != 1.0).any():
             try:
@@ -242,26 +201,96 @@ def encode_texts(prompt, neg):
         else:
             ti = tok(text, **kw)
         ids.append(ti.input_ids[0]); masks.append(ti.attention_mask[0]); wts.append(tw)
+
     qids = jnp.asarray(np.stack(ids), dtype=jnp.int32)
     qmask = jnp.asarray(np.stack(masks), dtype=jnp.int32)
     qhidden = qwen3_jit(qwen3_params, qids, qmask)
     qhidden = (qhidden * qmask[..., None].astype(qhidden.dtype)).astype(jnp.float32)
     tw = np.stack(wts)
     if (tw != 1.0).any():
-        # The conditioner RMS-normalises K, so plain per-token scaling would barely change
-        # attention. Instead move each weighted token away from (w>1) or toward (w<1) the
-        # prompt's mean embedding: (z - mu) * w + mu. That changes direction as well as size.
-        # Tokens with weight exactly 1.0 are untouched, so unweighted prompts are unchanged.
         w = jnp.asarray(tw)[..., None]
         valid = qmask[..., None].astype(jnp.float32)
         mu = qhidden.sum(axis=1, keepdims=True) / jnp.maximum(valid.sum(axis=1, keepdims=True), 1.0)
         qhidden = jnp.where(w != 1.0, (qhidden - mu) * w + mu, qhidden) * valid
+
     out = []
-    for b in range(2):
+    for b in range(len(clean)):
         enc = _t5.encode(clean[b])
         out.append((np.asarray(qhidden[b:b + 1]), np.asarray(qmask[b:b + 1]),
-                    np.asarray([enc.ids], dtype=np.int32), np.asarray([enc.attention_mask], dtype=np.int32)))
+                    np.asarray([enc.ids], dtype=np.int32),
+                    np.asarray([enc.attention_mask], dtype=np.int32)))
     return out
+
+
+def encode_texts(prompt, neg, steps=30, style=None, tags=None, seed=0):
+    """Schedule-aware encoding.
+
+    Returns (positive, negative) where each is (contexts, step_state, planned):
+      contexts   : list of (1, 512, 1024) bf16 conditioning tensors, one per
+                   distinct prompt state the schedule passes through
+      step_state : index into `contexts` for each denoise step
+      planned    : the planner record, for logging
+
+    Combination semantics:
+      * AVG(w) → every term is encoded separately and the contexts are averaged
+        as w*acc + (1-w)*next, which is what ConditioningAverage does.
+      * AND / CAT / plain → prompt-control concatenates tensors, but our context
+        window is a FIXED 512 tokens shared with the T5 encoder, so instead the
+        terms are packed into that single window (term, space, term, ...). Same
+        effect for prompts of ordinary length, and it keeps the compiled shape
+        stable. Long multi-term prompts truncate at 512 like any other prompt.
+    """
+    style = (style or PROMPT_STYLE).lower()
+    if style not in prompt_control.WEIGHT_MODES:
+        log(f"unknown prompt style {style!r}, falling back to comfy")
+        style = "comfy"
+
+    def build(text):
+        planned = prompt_control.plan(text or "", steps, weight_mode=style,
+                                      tags=tags, seed=seed)
+        contexts = []
+        for result in planned["states"]:
+            pairs = [prompt_control._segments_to_text(term) for term in result["terms"]]
+            pairs = [(prompt_control.apply_escapes(t), cw) for t, cw in pairs]
+            pairs = [(t, cw) for t, cw in pairs if t]
+            if not pairs:
+                pairs = [("", np.zeros(0, np.float32))]
+            ops = result["ops"]
+
+            if len(pairs) > 1 and ops and all(o[0] == "AVG" for o in ops):
+                ctxs = []
+                for t, cw in pairs:
+                    qh, qm, ti, tm = _encode_text_list([(t, cw)])[0]
+                    c = cond_forward(cond_params, jnp.asarray(qh, dtype=jnp.float32),
+                                     qm, ti, tm).astype(jnp.bfloat16)
+                    c.block_until_ready()
+                    ctxs.append(c.astype(jnp.float32))
+                acc = ctxs[0]
+                for k, (_, w) in enumerate(ops):
+                    nxt = ctxs[k + 1]
+                    acc = acc * float(w) + nxt * (1.0 - float(w))
+                ctx = acc.astype(jnp.bfloat16)
+            else:
+                buf, wbuf = [], []
+                for t, cw in pairs:
+                    if buf:
+                        buf.append(" "); wbuf.append(1.0)
+                    buf.append(t)
+                    wbuf.extend(cw.tolist() if len(cw) == len(t) else [1.0] * len(t))
+                full = "".join(buf)
+                cw_full = np.asarray(wbuf, np.float32)
+                qh, qm, ti, tm = _encode_text_list([(full, cw_full)])[0]
+                ctx = cond_forward(cond_params, jnp.asarray(qh, dtype=jnp.float32),
+                                   qm, ti, tm).astype(jnp.bfloat16)
+                ctx.block_until_ready()
+            contexts.append(ctx)
+        return contexts, planned["step_state"], planned
+
+    pos_ctxs, pos_map, pos_plan = build(prompt)
+    neg_ctxs, neg_map, neg_plan = build(neg)
+    log(f"prompt control [{style}]: pos {prompt_control.describe(pos_plan)} | "
+        f"neg {prompt_control.describe(neg_plan)}")
+    return (pos_ctxs, pos_map, pos_plan), (neg_ctxs, neg_map, neg_plan)
 log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
 
 log("=== SERVER: conditioner ===")
@@ -634,19 +663,25 @@ while True:
             pass
         g0 = time.perf_counter()
 
-        def _encode_one(p, n):
-            (qe, qm, t5ids, t5mask), (ne, nm, nt5ids, nt5mask) = encode_texts(p, n)
-            context = cond_forward(cond_params, jnp.asarray(qe, dtype=jnp.float32), qm, t5ids, t5mask).astype(jnp.bfloat16)
-            neg_context = cond_forward(cond_params, jnp.asarray(ne, dtype=jnp.float32), nm, nt5ids, nt5mask).astype(jnp.bfloat16)
-            context.block_until_ready(); neg_context.block_until_ready()
-            return context, neg_context
-
         write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
                    gen_id=gen_id, batch_total=BATCH)
-        context, neg_context = _encode_one(_p, _n)
+        # Prompt-control scheduling: every distinct state the schedule passes through is
+        # encoded once up front, then the denoise loop indexes the right one per step.
+        # All states share the same (1,512,1024) shape, so switching costs no recompile.
+        tags = d.get("tags") or None
+        style = d.get("prompt_style") or PROMPT_STYLE
+        seed_i = int(SEED) if int(SEED) >= 0 else 0
+        (pos_ctxs, pos_map, pos_plan), (neg_ctxs, neg_map, neg_plan) = encode_texts(
+            _p, _n, steps=STEPS, style=style, tags=tags, seed=seed_i)
         if BATCH > 1:
-            context = jnp.repeat(context, BATCH, axis=0)
-            neg_context = jnp.repeat(neg_context, BATCH, axis=0)
+            pos_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in pos_ctxs]
+            neg_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in neg_ctxs]
+        write_prog(stage="text-encoded", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                   gen_id=gen_id, batch_total=BATCH,
+                   prompt_states=max(len(pos_ctxs), len(neg_ctxs)),
+                   prompt_switches=[round(b, 3) for b in
+                                    sorted(set(pos_plan["breakpoints"]) |
+                                           set(neg_plan["breakpoints"])) if 0 < b < 1])
 
         sched = FlaxFlowMatchScheduler()
         st = FlowMatchSchedulerState.create()
@@ -671,6 +706,8 @@ while True:
         prev_total = 0.0
         first_s = 0.0
         for i in range(STEPS):
+            context = pos_ctxs[pos_map[i]]
+            neg_context = neg_ctxs[neg_map[i]]
             pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                   context, neg_context, pad, GUIDANCE)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
