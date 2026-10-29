@@ -335,6 +335,42 @@ def interrupt_gen():
         return f"could not request interrupt: {type(e).__name__}: {e}"
 
 
+def poll_progress():
+    """Surface generation progress over ordinary requests instead of SSE.
+
+    The browser's Server-Sent-Events stream gets buffered by the tunnel in front
+    of us: measured from the page itself, zero events arrived during a 21.5 s
+    run and all 32 landed at once when it finished, so the live preview only
+    ever appeared at the end. Polling sidesteps that completely, because each
+    tick is a plain request/response that no proxy has a reason to hold back.
+
+    Returns: result, status, progress, generate button, interrupt button.
+    """
+    import gradio as gr
+
+    prog = _read_prog()
+    stage = prog.get("stage")
+    if not stage:
+        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+
+    steps = int(prog.get("steps") or 30)
+    step = int(prog.get("step") or 0)
+    busy = stage in ("starting", "text_encode", "denoise", "decode", "preview")
+    status = _status_line(prog, steps, int(prog.get("preview_every") or 0))
+    pct = 100 if stage == "done" else int(round(100.0 * step / max(1, steps)))
+
+    # Only touch the image while a run is in flight: once it ends, the final
+    # grid from start_gen must stay on screen rather than being replaced by the
+    # last intermediate preview.
+    snap = gr.update()
+    if busy:
+        loaded = _read_img(SNAP_PATH)
+        if loaded is not None:
+            snap = loaded
+
+    return snap, status, pct, gr.update(visible=not busy), gr.update(visible=busy)
+
+
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
               guidance, preview_every, batch_count, prompt_style="comfy", tags=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
@@ -451,26 +487,50 @@ def disable_compression_for_sse():
     return True
 
 
+RESPONSIVE_CSS = """
+/* Cap the banner image against the viewport instead of a fixed pixel height,
+   so it never pushes the prompt and button off-screen. */
+#anima-result img, #anima-result video {
+  max-height: 58vh !important;
+  object-fit: contain;
+}
+#anima-actions { flex-wrap: wrap; }
+#anima-advanced .gr-row, #anima-advanced .flex { flex-wrap: wrap !important; }
+
+@media (max-width: 760px) {
+  /* Phone / narrow window: one control per line, no side-by-side squeeze. */
+  #anima-actions { flex-direction: column !important; }
+  #anima-actions > * { width: 100% !important; }
+  #anima-result img, #anima-result video { max-height: 38vh !important; }
+  #anima-advanced .gr-row, #anima-advanced .flex { flex-direction: column !important; }
+  #anima-advanced .gr-row > *, #anima-advanced .flex > * { min-width: 100% !important; }
+  .gradio-container { padding: 8px !important; }
+  #anima-status textarea { font-size: 0.85rem; }
+}
+"""
+
+
 def build():
     import gradio as gr
 
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
-    with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
+    with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True,
+                   css=RESPONSIVE_CSS) as demo:
         # Layout is deliberately one vertical stack: result, prompt, button.
         # Everything else lives in the Advanced accordion below.
-        result = gr.Image(label="Result", height=640)
+        result = gr.Image(label="Result", height=560, elem_id="anima-result")
         prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
                             placeholder="prompt — supports (weights:1.3) and [before:after:0.5] schedules")
-        with gr.Row():
+        with gr.Row(elem_id="anima-actions"):
             btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
             stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4, visible=False)
         progress = gr.Slider(0, 100, value=0, step=1, label="Progress",
                              interactive=False)
         status = gr.Textbox(label="Status", interactive=False, show_label=False,
-                            placeholder="idle")
+                            placeholder="idle", elem_id="anima-status")
 
-        with gr.Accordion("Advanced", open=False):
+        with gr.Accordion("Advanced", open=False, elem_id="anima-advanced"):
             neg = gr.Textbox(value=FERN_NEG, lines=2,
                              label="Negative prompt (weights work here too)")
             with gr.Row():
@@ -545,6 +605,14 @@ def build():
                           seed, guidance, preview_every, batch_count, prompt_style, tags],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
+        # Progress is POLLED, not streamed. The tunnel in front of this app
+        # buffers the SSE stream, so streamed updates all arrive at once when the
+        # run is already over (measured: 0 events during a 21.5 s run, 32 at the
+        # end). A timer tick is a plain request/response, which nothing buffers.
+        timer = gr.Timer(1.0, active=True)
+        timer.tick(poll_progress, inputs=[],
+                   outputs=[result, status, progress, btn, stop],
+                   queue=False, show_progress="hidden")
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
     demo.queue()
