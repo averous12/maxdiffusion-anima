@@ -311,7 +311,11 @@ if lora_path and os.path.exists(lora_path):
     try:
         t_params, lora_stats = load_and_merge_anima_lora(
             t_params, lora_path, scale=lora_scale, dtype=jnp.bfloat16)
-        log(f"LoRA merged: {lora_stats['merged']} layers, {lora_stats['skipped']} skipped in {time.perf_counter()-t_lora0:.2f}s")
+        log(f"LoRA merged: {lora_stats['merged']} layers, {lora_stats['skipped']} skipped "
+            f"| format={lora_stats.get('format')} targets={lora_stats.get('targets')} "
+            f"ranks={lora_stats.get('ranks')} in {time.perf_counter()-t_lora0:.2f}s")
+        for _d in lora_stats.get("details", [])[:10]:
+            log(f"  lora: {_d}")
     except Exception:
         log("LoRA merge failed:\n" + traceback.format_exc())
         raise
