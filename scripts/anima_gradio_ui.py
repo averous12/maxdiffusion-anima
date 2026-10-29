@@ -239,6 +239,30 @@ def _preview_fragment(prog, preview_every):
     return None
 
 
+PROMPT_STYLES = ("comfy", "a1111", "safe")
+
+SYNTAX_HELP = """\
+**Weights** — `(tag:1.3)` strengthens, `(tag:0.7)` weakens, groups nest and multiply. \
+`(tag)` alone is `(tag:1.1)`. Range clamps to 0–3.
+
+**Schedules** — switch mid-denoise on a fraction of the steps:
+`[before:after:0.5]` · `[cat:0.5]` (empty before) · `[before:during:after:0.3,0.7]` \
+range · `[a|b:0.25]` alternating · `[SEQ:a:0.2:b:0.5:c]` chain · `[a:b:TAG]` with the \
+Tags box. All nest, e.g. `a [red:[blue::0.7]:0.5] cat`.
+
+**Combinators** — `AND` and `CAT` join prompts; `AVG(0.3)` averages them. \
+`BREAK` is a no-op here: prompt-control ignores it for T5 encoders, which is what we use.
+
+**Literals** — `#` starts a comment; escape with `\\#`, `\\:`, `\\\\`. \
+Text inside `"double quotes"` never triggers operators.
+
+**Styles** — `comfy`: bare `(x)` is emphasis (ComfyUI behaviour), so a danbooru tag \
+like `fern (sousou no frieren)` must be escaped as `\\(...\\)`. `a1111`: additionally \
+`[x]` weakens and `{x}` strengthens. `safe`: only `(x:weight)` is syntax, so plain \
+parentheses stay literal — pick this to keep old prompts byte-identical.
+"""
+
+
 def _status_line(prog, fallback_steps, preview_every=None):
     stage = prog.get("stage", "?")
     step = prog.get("step", 0)
@@ -256,6 +280,13 @@ def _status_line(prog, fallback_steps, preview_every=None):
         bits.append(f"{prog['ms_per_step']} ms/step")
     if prog.get("rss_gb"):
         bits.append(f"RSS {prog['rss_gb']} GB")
+    # Prompt scheduling: surface how many states the prompt resolves to and where it
+    # switches, so a schedule that silently never fires is visible rather than assumed.
+    states = prog.get("prompt_states")
+    if states and states > 1:
+        sw = prog.get("prompt_switches") or []
+        bits.append(f"prompt: {states} states"
+                    + (f", switches at {', '.join(str(x) for x in sw)}" if sw else ""))
     if stage == "compiling":
         bits = [f"compiling {prog.get('note', 'new shape')} (one-time per size/batch, can take 1-2 min)"]
     if stage == "done":
@@ -280,11 +311,12 @@ def _status_line(prog, fallback_steps, preview_every=None):
 # Generation
 # ---------------------------------------------------------------------------
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
-              guidance, preview_every, batch_count):
+              guidance, preview_every, batch_count, prompt_style="comfy", tags=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
-        # Weight syntax ((tag:1.3)) is sent through untouched; the server parses it.
+        # Weighting and scheduling syntax ((tag:1.3), [a:b:0.5], AND/CAT/AVG) is sent
+        # through untouched; the server parses it with the prompt-control grammar.
         "prompt": prompt,
         "negative_prompt": neg,
         "height": H, "width": W,
@@ -292,9 +324,13 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         "seed": int(seed) if seed is not None else RANDOM_SEED,
         "preview_every": int(preview_every or 0),
         "batch_count": batch,
+        "prompt_style": (prompt_style or "comfy"),
         "out": FINAL_PATH, "go": True,
         "gen_id": uuid.uuid4().hex,
     }
+    _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
+    if _tags:
+        req["tags"] = _tags
     t_submit = time.time()
     _atomic_json(REQ_PATH, req)
     # Generous: the first run at a new size/batch pays an XLA compile (1-2 min).
@@ -358,11 +394,21 @@ def build():
         with gr.Row():
             with gr.Column():
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=8, label="Prompt",
-                                    info="Weights: (tag:1.3) strengthens, (tag:0.7) weakens; 1.0 is "
-                                         "neutral, range 0-3. Groups nest. Plain parentheses such as "
-                                         "fern (sousou no frieren) are left alone; inside a weighted "
-                                         "group write \\( and \\) for literal ones.")
+                                    info="Weights and schedules both work here: (tag:1.3), "
+                                         "[before:after:0.5], [a|b:0.25], AND / CAT / AVG(). "
+                                         "In comfy style a bare (tag) means (tag:1.1) — escape "
+                                         "\\\\( \\\\) to keep a literal danbooru tag, or pick the "
+                                         "safe style.")
                 neg = gr.Textbox(value=FERN_NEG, lines=2, label="Negative prompt (weights work here too)")
+                with gr.Row():
+                    prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
+                                               label="Prompt style",
+                                               info="comfy = ComfyUI core rules. a1111 adds [x] / {x}. "
+                                                    "safe = only (x:weight), plain parens stay literal.")
+                    tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
+                                      info="Space or comma separated, e.g. SECOND_PASS")
+                with gr.Accordion("Prompt syntax reference", open=False):
+                    gr.Markdown(SYNTAX_HELP)
 
                 gr.Markdown("### Resolution")
                 with gr.Row():
@@ -427,7 +473,7 @@ def build():
 
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
-                          seed, guidance, preview_every, batch_count],
+                          seed, guidance, preview_every, batch_count, prompt_style, tags],
                   outputs=[final_img, gallery, snap_img, status],
                   concurrency_limit=1)  # one TPU: never interleave two requests
     demo.queue()
