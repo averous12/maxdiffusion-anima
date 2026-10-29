@@ -438,14 +438,16 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         if stage == "done":
             images = [im for im in (_read_img(p) for p in prog.get("images", [])) if im is not None]
             seeds = prog.get("seeds") or []
-            gallery = [(im, f"seed {seeds[k]}" if k < len(seeds) else f"image {k + 1}")
-                       for k, im in enumerate(images)]
+            gallery_items = [(im, f"seed {seeds[k]}" if k < len(seeds)
+                              else f"image {k + 1}")
+                             for k, im in enumerate(images)]
             grid = _read_img(prog.get("grid") or FINAL_PATH)
             saved = save_outputs(prog, req)
             if saved:
                 status += f" | {saved}"
             _RUN_ACTIVE["flag"] = False
-            yield grid or snap, status, progress_bar_html(100, "done"), *IDLE, gallery
+            yield (grid or snap, status, progress_bar_html(100, "done"), *IDLE,
+                   gallery_items if int(req.get("batch") or 1) > 1 else [])
             return
         if stage == "interrupted":
             _RUN_ACTIVE["flag"] = False
@@ -546,7 +548,7 @@ RESPONSIVE_CSS = """
   object-fit: contain;
 }
 #anima-actions { flex-wrap: wrap; }
-#anima-advanced .gr-row, #anima-advanced .flex { flex-wrap: wrap !important; }
+#anima-controls .gr-row, #anima-controls .flex { flex-wrap: wrap !important; }
 
 /* Narrow: collapse to a single column, preserving DOM order
    (result, then prompt, then the button). */
@@ -556,7 +558,7 @@ RESPONSIVE_CSS = """
   #anima-actions { flex-direction: column !important; }
   #anima-actions > * { width: 100% !important; }
   #anima-result img, #anima-result video { max-height: 42vh !important; }
-  #anima-advanced .gr-row, #anima-advanced .flex { flex-direction: column !important; }
+  #anima-controls .gr-row, #anima-controls .flex { flex-direction: column !important; }
   #anima-advanced .gr-row > *, #anima-advanced .flex > * { min-width: 100% !important; }
   .gradio-container { padding: 8px !important; }
   #anima-status textarea { font-size: 0.85rem; }
@@ -589,10 +591,18 @@ def build():
                 # Directly under the result: the bar describes the image above it.
                 progress = gr.HTML(progress_bar_html(0, "idle"),
                                    elem_id="anima-progress")
-            with gr.Column(scale=2):
+                # Individual images only mean something for a batch, so this stays
+                # hidden until Batch count > 1 rather than sitting empty.
+                gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
+                                     height="auto", object_fit="contain", visible=False,
+                                     elem_id="anima-gallery")
+            with gr.Column(scale=2, elem_id="anima-controls"):
+                # Prompt and negative belong together: one group, no accordion.
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
                                     placeholder="prompt — supports (weights:1.3) "
                                                 "and [before:after:0.5] schedules")
+                neg = gr.Textbox(value=FERN_NEG, lines=2,
+                                 label="Negative prompt (weights work here too)")
                 with gr.Row(elem_id="anima-actions"):
                     btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
                     stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4,
@@ -600,52 +610,49 @@ def build():
                 status = gr.Textbox(label="Status", interactive=False, show_label=False,
                                     placeholder="idle", elem_id="anima-status")
 
-                with gr.Accordion("Advanced", open=False, elem_id="anima-advanced"):
-                    neg = gr.Textbox(value=FERN_NEG, lines=2,
-                                     label="Negative prompt (weights work here too)")
-                    with gr.Row():
-                        prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
-                                                   label="Prompt style",
-                                                   info="comfy = ComfyUI core rules. "
-                                                        "a1111 adds [x] / {x}. "
-                                                        "safe = only (x:weight), plain "
-                                                        "parens stay literal.")
-                        tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
-                                          info="Space or comma separated, e.g. SECOND_PASS")
-                    gr.Markdown("### Resolution")
-                    with gr.Row():
-                        aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
-                        aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
-                        preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
-                                             info="Quick-fill the ratio")
-                        swap = gr.Button("Swap W/H", size="sm")
-                    mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
-                                         info="1 MP = 1024 x 1024 px. Custom size lets you "
-                                              "type the pixels.")
-                    with gr.Row():
-                        width = gr.Number(value=w0, label="Width (px)", precision=0,
-                                          interactive=False)
-                        height = gr.Number(value=h0, label="Height (px)", precision=0,
-                                           interactive=False)
-                    shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
-                    with gr.Row():
-                        steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
-                        guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
-                                             label="CFG guidance")
-                    with gr.Row():
-                        seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)",
-                                         precision=0)
-                        preview_every = gr.Slider(0, 10, value=5, step=1,
-                                                  label="VAE preview every N steps (0 = off)",
-                                                  info="Each preview decodes every image "
-                                                       "in the batch.")
-                    batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1, label="Batch count",
-                                            info="Images generated together, step by step. "
-                                                 "Image k uses seed + k.")
-                    gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
-                                         height="auto", object_fit="contain")
-                    with gr.Accordion("Prompt syntax reference", open=False):
-                        gr.Markdown(SYNTAX_HELP)
+                with gr.Row():
+                    steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
+                    batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
+                                            label="Batch count",
+                                            info="Images generated together, step by "
+                                                 "step. Image k uses seed + k.")
+
+                gr.Markdown("### Resolution")
+                with gr.Row():
+                    aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
+                    aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
+                    preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
+                                         info="Quick-fill the ratio")
+                    swap = gr.Button("Swap W/H", size="sm")
+                mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
+                                     info="1 MP = 1024 x 1024 px. Custom size lets you "
+                                          "type the pixels.")
+                with gr.Row():
+                    width = gr.Number(value=w0, label="Width (px)", precision=0,
+                                      interactive=False)
+                    height = gr.Number(value=h0, label="Height (px)", precision=0,
+                                       interactive=False)
+                shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
+
+                with gr.Row():
+                    guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                         label="CFG guidance")
+                    seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)",
+                                     precision=0)
+                    preview_every = gr.Slider(0, 10, value=5, step=1,
+                                              label="VAE preview every N steps (0 = off)",
+                                              info="Each preview decodes every image "
+                                                   "in the batch.")
+                with gr.Row():
+                    prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
+                                               label="Prompt style",
+                                               info="comfy = ComfyUI core rules. a1111 "
+                                                    "adds [x] / {x}. safe = only "
+                                                    "(x:weight), plain parens stay literal.")
+                    tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
+                                      info="Space or comma separated, e.g. SECOND_PASS")
+                with gr.Accordion("Prompt syntax reference", open=False):
+                    gr.Markdown(SYNTAX_HELP)
 
         gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
                     f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
@@ -703,6 +710,12 @@ def build():
               show_progress="hidden")
         demo.load(restore_settings, inputs=[settings], outputs=setting_inputs,
                   show_progress="hidden")
+
+        # Individual images are contextual: a batch of 1 is already the result,
+        # so the gallery only appears when there is genuinely more than one.
+        batch_count.change(lambda n: gr.update(visible=int(n or 1) > 1),
+                           inputs=[batch_count], outputs=[gallery],
+                           show_progress="hidden")
 
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
