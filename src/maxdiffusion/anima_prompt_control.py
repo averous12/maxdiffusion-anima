@@ -47,8 +47,8 @@ import random
 import re
 import numpy as np
 
-WEIGHT_MODES = ("comfy", "a1111")
-DEFAULT_EMPHASIS = {"comfy": 1.1, "a1111": 1.1}
+WEIGHT_MODES = ("comfy", "a1111", "safe")
+DEFAULT_EMPHASIS = {"comfy": 1.1, "a1111": 1.1, "safe": 1.1}
 BRACKET_DEEMPHASIS = 1.0 / 1.1
 BRACE_EMPHASIS = 1.05
 
@@ -214,6 +214,15 @@ def _parse_nodes(s: str, mode: str) -> list:
                 if len(parts) > 1 and _is_number(parts[-1]):
                     w = float(parts[-1].strip())
                     inner = ":".join(parts[:-1])
+                if w is None and mode == "safe":
+                    # "safe" keeps plain parentheses literal, so danbooru-style
+                    # tags like "fern (sousou no frieren)" survive untouched.
+                    # Only the explicit "(...:number)" form is a weight.
+                    flush()
+                    nodes.append(("text", "("))
+                    nodes.extend(_parse_nodes(inner, mode))
+                    nodes.append(("text", ")"))
+                    i = j + 1; continue
                 flush()
                 if w is None:
                     nodes.append(("weight", ("nodes", _parse_nodes(inner, mode)),
