@@ -515,8 +515,7 @@ def build():
 
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
-    with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True,
-                   css=RESPONSIVE_CSS) as demo:
+    with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
         # Layout is deliberately one vertical stack: result, prompt, button.
         # Everything else lives in the Advanced accordion below.
         result = gr.Image(label="Result", height=560, elem_id="anima-result")
@@ -629,6 +628,7 @@ if __name__ == "__main__":
         share=False,
         prevent_thread_lock=True,
         show_error=True,
+        css=RESPONSIVE_CSS,   # Gradio 6 moved css/head here from the Blocks ctor
     )
     print(f"ANIMA_UI_UP on port {_port}", flush=True)
     try:
