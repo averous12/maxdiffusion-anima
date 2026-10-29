@@ -101,6 +101,8 @@ CACHE_DIR = "/content/anima_cache"  # retained for the HF cache only; no param c
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
+# The client creates this file to cancel the running generation.
+INTERRUPT_PATH = "/content/anima_interrupt"
 
 def write_prog(**kw):
     try:
@@ -622,6 +624,14 @@ while True:
     prev_giveup = False
     _pv_expected = 0
     _vae_failed = set()
+    # Clean up any interrupt left over from a previous, already-aborted run so it
+    # cannot kill the next one.
+    try:
+        if os.path.exists(INTERRUPT_PATH):
+            os.remove(INTERRUPT_PATH)
+    except OSError:
+        pass
+
     write_prog(stage="starting", step=0, steps=d.get("steps", 30), gen_id=gen_id,
                **_pv_state())
     last_mtime = os.path.getmtime(REQ_PATH)
@@ -709,10 +719,29 @@ while True:
             log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
             write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
                        **common, **_pv_state())
+        # An interrupt is a file the client creates; checked every step so a stop
+        # lands within ~1 step (~0.5 s) instead of finishing the whole run.
+        try:
+            if os.path.exists(INTERRUPT_PATH):
+                os.remove(INTERRUPT_PATH)
+        except OSError:
+            pass
+
         d0 = time.perf_counter()
         prev_total = 0.0
         first_s = 0.0
+        _interrupted = False
         for i in range(STEPS):
+            if os.path.exists(INTERRUPT_PATH):
+                try:
+                    os.remove(INTERRUPT_PATH)
+                except OSError:
+                    pass
+                _interrupted = True
+                log(f"INTERRUPT at step {i}/{STEPS}; aborting before decode")
+                write_prog(stage="interrupted", step=i, steps=STEPS,
+                           **common, **_pv_state())
+                break
             context = pos_ctxs[pos_map[i]]
             neg_context = neg_ctxs[neg_map[i]]
             pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
@@ -773,6 +802,12 @@ while True:
                     write_prog(stage="denoise", step=i + 1, ms_per_step=ms,
                                guidance=GUIDANCE, **common, **_pv_state())
         latents.block_until_ready()
+        if _interrupted:
+            # Skip the VAE decode entirely: the run was cancelled, so producing
+            # (and writing) an image would be misleading.
+            json.dump({**d, "go": False, "status": "interrupted"}, open(REQ_PATH, "w"))
+            last_mtime = os.path.getmtime(REQ_PATH)
+            continue
         denoise_s = time.perf_counter() - d0 - prev_total
         write_prog(stage="decode", step=STEPS, **common, **_pv_state())
         v0 = time.perf_counter()

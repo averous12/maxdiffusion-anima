@@ -34,6 +34,7 @@ from PIL import Image
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
+INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
 FINAL_PATH = "/content/anima_perstep.png"
 
 # Where finished images are archived (Drive, usually). Empty disables archiving.
@@ -318,6 +319,22 @@ def _status_line(prog, fallback_steps, preview_every=None):
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
+def _upd(**kw):
+    """gr.update without importing gradio at module scope (keeps start_gen drivable)."""
+    import gradio as gr
+    return gr.update(**kw)
+
+
+def interrupt_gen():
+    """Ask the server to cancel the running generation."""
+    try:
+        with open(INTERRUPT_PATH, "w") as f:
+            f.write("1")
+        return "interrupt requested — stopping after the current step"
+    except Exception as e:
+        return f"could not request interrupt: {type(e).__name__}: {e}"
+
+
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
               guidance, preview_every, batch_count, prompt_style="comfy", tags=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
@@ -344,8 +361,10 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     # Generous: the first run at a new size/batch pays an XLA compile (1-2 min).
     deadline = t_submit + 900 + 1800 * batch
     seen = None
-    # outputs: final grid, gallery of individual images, live preview, status
-    yield None, [], None, "queued..."
+    # outputs: result image, status, progress bar, generate btn, interrupt btn, gallery
+    BUSY = (_upd(visible=False), _upd(visible=True))
+    IDLE = (_upd(visible=True), _upd(visible=False))
+    yield None, "queued...", 0, *BUSY, []
     while time.time() < deadline:
         prog = _read_prog()
         mine = prog.get("gen_id") == req["gen_id"]
@@ -357,6 +376,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             stage = prog.get("stage")
             status = _status_line(prog, req["steps"], req["preview_every"])
         snap = _read_img(SNAP_PATH, newer_than=t_submit - 1) if mine else None
+        done_steps = int(prog.get("step") or 0) if mine else 0
+        pct = int(round(100.0 * done_steps / max(1, int(req["steps"]))))
         if stage == "done":
             images = [im for im in (_read_img(p) for p in prog.get("images", [])) if im is not None]
             seeds = prog.get("seeds") or []
@@ -366,22 +387,25 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             saved = save_outputs(prog, req)
             if saved:
                 status += f" | {saved}"
-            yield grid, gallery, snap, status
+            yield grid or snap, status, 100, *IDLE, gallery
+            return
+        if stage == "interrupted":
+            yield snap, status, pct, *IDLE, []
             return
         if stage == "error":
-            yield None, [], snap, status
+            yield None, status, 0, *IDLE, []
             return
         marker = (prog.get("t"), prog.get("step"), stage, prog.get("preview_step"))
         if marker != seen:
             seen = marker
-            yield None, [], snap, status
+            yield snap, status, pct, *BUSY, []
         time.sleep(0.5)
     # Render the last progress record instead of dumping a raw dict: a timeout line full of
     # Python dict syntax was unreadable, and hid the one field that explains a stall (stage).
     _to = _read_prog()
     _to_status = _status_line(_to, req["steps"], req["preview_every"])
-    yield (None, [], _read_img(SNAP_PATH, newer_than=t_submit - 1),
-           f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}")
+    yield (None, f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}", 0,
+           *IDLE, [])
 
 
 # ---------------------------------------------------------------------------
@@ -432,64 +456,62 @@ def build():
 
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
-    with gr.Blocks(title="Anima Aesthetic TPU") as demo:
-        gr.Markdown("# Anima Aesthetic v1.1 (TPU v5e)\n"
-                    "Transformer + conditioner: Anima Aesthetic v1.1 | "
-                    "Qwen3 text encoder, tokenizers, VAE: Anima-Base-v1.0-Diffusers | "
-                    "BF16_BF16_F32\n\n"
-                    f"Seed `-1` picks a random seed and reports the value used. "
-                    f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
+    with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
+        # Layout is deliberately one vertical stack: result, prompt, button.
+        # Everything else lives in the Advanced accordion below.
+        result = gr.Image(label="Result", height=640, show_download_button=True,
+                          show_label=False)
+        prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
+                            placeholder="prompt — supports (weights:1.3) and [before:after:0.5] schedules")
         with gr.Row():
-            with gr.Column():
-                prompt = gr.Textbox(value=FERN_PROMPT, lines=8, label="Prompt",
-                                    info="Weights and schedules both work here: (tag:1.3), "
-                                         "[before:after:0.5], [a|b:0.25], AND / CAT / AVG(). "
-                                         "In comfy style a bare (tag) means (tag:1.1) — escape "
-                                         "\\\\( \\\\) to keep a literal danbooru tag, or pick the "
-                                         "safe style.")
-                neg = gr.Textbox(value=FERN_NEG, lines=2, label="Negative prompt (weights work here too)")
-                with gr.Row():
-                    prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
-                                               label="Prompt style",
-                                               info="comfy = ComfyUI core rules. a1111 adds [x] / {x}. "
-                                                    "safe = only (x:weight), plain parens stay literal.")
-                    tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
-                                      info="Space or comma separated, e.g. SECOND_PASS")
-                with gr.Accordion("Prompt syntax reference", open=False):
-                    gr.Markdown(SYNTAX_HELP)
+            btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
+            stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4, visible=False)
+        progress = gr.Slider(0, 100, value=0, step=1, label="Progress",
+                             interactive=False, show_reset_button=False)
+        status = gr.Textbox(label="Status", interactive=False, show_label=False,
+                            placeholder="idle")
 
-                gr.Markdown("### Resolution")
-                with gr.Row():
-                    aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
-                    aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
-                    preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
-                                         info="Quick-fill the ratio")
-                    swap = gr.Button("Swap W/H", size="sm")
-                mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
-                                     info="1 MP = 1024 x 1024 px. Custom size lets you type the pixels.")
-                with gr.Row():
-                    width = gr.Number(value=w0, label="Width (px)", precision=0, interactive=False)
-                    height = gr.Number(value=h0, label="Height (px)", precision=0, interactive=False)
-                shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
+        with gr.Accordion("Advanced", open=False):
+            neg = gr.Textbox(value=FERN_NEG, lines=2,
+                             label="Negative prompt (weights work here too)")
+            with gr.Row():
+                prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
+                                           label="Prompt style",
+                                           info="comfy = ComfyUI core rules. a1111 adds [x] / {x}. "
+                                                "safe = only (x:weight), plain parens stay literal.")
+                tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
+                                  info="Space or comma separated, e.g. SECOND_PASS")
+            gr.Markdown("### Resolution")
+            with gr.Row():
+                aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
+                aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
+                preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
+                                     info="Quick-fill the ratio")
+                swap = gr.Button("Swap W/H", size="sm")
+            mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
+                                 info="1 MP = 1024 x 1024 px. Custom size lets you type the pixels.")
+            with gr.Row():
+                width = gr.Number(value=w0, label="Width (px)", precision=0, interactive=False)
+                height = gr.Number(value=h0, label="Height (px)", precision=0, interactive=False)
+            shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
+            with gr.Row():
+                steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
+                guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5, label="CFG guidance")
+            with gr.Row():
+                seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
+                preview_every = gr.Slider(0, 10, value=5, step=1,
+                                          label="VAE preview every N steps (0 = off)",
+                                          info="Each preview decodes every image in the batch.")
+            batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1, label="Batch count",
+                                    info="Images generated together, step by step. "
+                                         "Image k uses seed + k.")
+            gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
+                                 height="auto", object_fit="contain")
+            with gr.Accordion("Prompt syntax reference", open=False):
+                gr.Markdown(SYNTAX_HELP)
 
-                with gr.Row():
-                    steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
-                    guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5, label="CFG guidance")
-                with gr.Row():
-                    seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
-                    preview_every = gr.Slider(0, 10, value=5, step=1,
-                                              label="VAE preview every N steps (0 = off)",
-                                              info="Each preview decodes every image in the batch.")
-                batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1, label="Batch count",
-                                        info="Images generated together, step by step. "
-                                             "Image k uses seed + k.")
-                btn = gr.Button("Generate", variant="primary")
-            with gr.Column():
-                status = gr.Textbox(label="Status", interactive=False)
-                final_img = gr.Image(label="Final image / grid", height=520)
-                gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
-                                     height="auto", object_fit="contain")
-                snap_img = gr.Image(label="Live preview (VAE-decoded latent)", height=520)
+        gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
+                    f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
 
         # ---- resolution wiring -------------------------------------------------------
         def apply_size(aw, ah, mp, w, h):
@@ -522,8 +544,10 @@ def build():
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
                           seed, guidance, preview_every, batch_count, prompt_style, tags],
-                  outputs=[final_img, gallery, snap_img, status],
+                  outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
+        # A plain queued call, so it can run while start_gen is still streaming.
+        stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
     demo.queue()
     return demo
 
