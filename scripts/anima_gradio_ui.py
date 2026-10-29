@@ -459,8 +459,7 @@ def build():
     with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
         # Layout is deliberately one vertical stack: result, prompt, button.
         # Everything else lives in the Advanced accordion below.
-        result = gr.Image(label="Result", height=640, show_download_button=True,
-                          show_label=False)
+        result = gr.Image(label="Result", height=640)
         prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
                             placeholder="prompt — supports (weights:1.3) and [before:after:0.5] schedules")
         with gr.Row():
