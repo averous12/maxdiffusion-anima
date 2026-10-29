@@ -421,7 +421,9 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     # outputs: result image, status, progress bar, generate btn, interrupt btn, gallery
     BUSY = (_upd(visible=False), _upd(visible=True))
     IDLE = (_upd(visible=True), _upd(visible=False))
-    yield None, "queued...", progress_bar_html(0, "queued"), *BUSY, []
+    yield (_upd(value=None, visible=True), "queued...",
+           progress_bar_html(0, "queued"), *BUSY,
+           _upd(visible=False, value=[]))
     while time.time() < deadline:
         prog = _read_prog()
         mine = prog.get("gen_id") == req["gen_id"]
@@ -446,8 +448,15 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             if saved:
                 status += f" | {saved}"
             _RUN_ACTIVE["flag"] = False
-            yield (grid or snap, status, progress_bar_html(100, "done"), *IDLE,
-                   gallery_items if int(req.get("batch") or 1) > 1 else [])
+            if int(req.get("batch") or 1) > 1:
+                # The two occupy the same panel: a batch shows the individual
+                # images with their seeds instead of the grid.
+                yield (_upd(visible=False), status,
+                       progress_bar_html(100, "done"), *IDLE,
+                       _upd(visible=True, value=gallery_items))
+            else:
+                yield (grid or snap, status, progress_bar_html(100, "done"),
+                       *IDLE, _upd(visible=False, value=[]))
             return
         if stage == "interrupted":
             _RUN_ACTIVE["flag"] = False
@@ -710,12 +719,6 @@ def build():
               show_progress="hidden")
         demo.load(restore_settings, inputs=[settings], outputs=setting_inputs,
                   show_progress="hidden")
-
-        # Individual images are contextual: a batch of 1 is already the result,
-        # so the gallery only appears when there is genuinely more than one.
-        batch_count.change(lambda n: gr.update(visible=int(n or 1) > 1),
-                           inputs=[batch_count], outputs=[gallery],
-                           show_progress="hidden")
 
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
