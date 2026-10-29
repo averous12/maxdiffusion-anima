@@ -676,12 +676,13 @@ while True:
         if BATCH > 1:
             pos_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in pos_ctxs]
             neg_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in neg_ctxs]
+        prompt_states = max(len(pos_ctxs), len(neg_ctxs))
+        prompt_switches = [round(b, 3) for b in
+                           sorted(set(pos_plan["breakpoints"]) |
+                                  set(neg_plan["breakpoints"])) if 0 < b < 1]
         write_prog(stage="text-encoded", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
                    gen_id=gen_id, batch_total=BATCH,
-                   prompt_states=max(len(pos_ctxs), len(neg_ctxs)),
-                   prompt_switches=[round(b, 3) for b in
-                                    sorted(set(pos_plan["breakpoints"]) |
-                                           set(neg_plan["breakpoints"])) if 0 < b < 1])
+                   prompt_states=prompt_states, prompt_switches=prompt_switches)
 
         sched = FlaxFlowMatchScheduler()
         st = FlowMatchSchedulerState.create()
@@ -697,7 +698,13 @@ while True:
             [np.random.default_rng(s).standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)
              for s in seeds], axis=0))
         pad = jnp.zeros((BATCH, 1, H, W), dtype=jnp.float32)
-        common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id, batch_total=BATCH)
+        # prompt_states / prompt_switches belong in `common` so every later record
+        # (denoise, done, error) carries them. Writing them only on the intermediate
+        # "text-encoded" record left the FINAL record with None, which is exactly the
+        # record the UI and the archive sidecar read.
+        common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id,
+                      batch_total=BATCH, prompt_states=prompt_states,
+                      prompt_switches=prompt_switches)
         if (BATCH, H, W) not in _tf_compiled:
             log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
             write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
