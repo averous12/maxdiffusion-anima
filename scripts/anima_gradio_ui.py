@@ -35,6 +35,13 @@ REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
 SNAP_PATH = "/content/anima_snap.png"
 INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
+
+# True while this process has a generation in flight. The 1 Hz progress poll
+# stays silent otherwise, so a freshly loaded page does not resurrect the last
+# run's progress (the server's progress file survives restarts) and an idle page
+# stops emitting an update chip every second.
+_RUN_ACTIVE = {"flag": False, "until": 0.0}
+_STALE_AFTER_S = 300.0
 FINAL_PATH = "/content/anima_perstep.png"
 
 # Where finished images are archived (Drive, usually). Empty disables archiving.
@@ -354,7 +361,11 @@ def poll_progress():
 
     prog = _read_prog()
     stage = prog.get("stage")
-    if not stage:
+    # Safety net: a client that vanished mid-run leaves the flag set, so also
+    # give up on a record the server has not touched in a long time.
+    if _RUN_ACTIVE["flag"] and time.time() - float(prog.get("t") or 0) > _STALE_AFTER_S:
+        _RUN_ACTIVE["flag"] = False
+    if not stage or not _RUN_ACTIVE["flag"]:
         return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
 
     steps = int(prog.get("steps") or 30)
@@ -402,6 +413,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     if _tags:
         req["tags"] = _tags
     t_submit = time.time()
+    _RUN_ACTIVE["flag"] = True
     _atomic_json(REQ_PATH, req)
     # Generous: the first run at a new size/batch pays an XLA compile (1-2 min).
     deadline = t_submit + 900 + 1800 * batch
@@ -432,13 +444,16 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             saved = save_outputs(prog, req)
             if saved:
                 status += f" | {saved}"
+            _RUN_ACTIVE["flag"] = False
             yield grid or snap, status, progress_bar_html(100, "done"), *IDLE, gallery
             return
         if stage == "interrupted":
+            _RUN_ACTIVE["flag"] = False
             yield snap, status, progress_bar_html(pct, f"step {done_steps}/{int(req['steps'])}"), *IDLE, []
             return
         if stage == "error":
-            yield None, status, 0, *IDLE, []
+            _RUN_ACTIVE["flag"] = False
+            yield None, status, progress_bar_html(0, "error"), *IDLE, []
             return
         marker = (prog.get("t"), prog.get("step"), stage, prog.get("preview_step"))
         if marker != seen:
@@ -449,6 +464,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     # Python dict syntax was unreadable, and hid the one field that explains a stall (stage).
     _to = _read_prog()
     _to_status = _status_line(_to, req["steps"], req["preview_every"])
+    _RUN_ACTIVE["flag"] = False
     yield (None, f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}",
            progress_bar_html(0, "timeout"), *IDLE, [])
 
@@ -570,6 +586,9 @@ def build():
         with gr.Row(elem_id="anima-main"):
             with gr.Column(scale=3):
                 result = gr.Image(label="Result", height=560, elem_id="anima-result")
+                # Directly under the result: the bar describes the image above it.
+                progress = gr.HTML(progress_bar_html(0, "idle"),
+                                   elem_id="anima-progress")
             with gr.Column(scale=2):
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
                                     placeholder="prompt — supports (weights:1.3) "
@@ -578,7 +597,6 @@ def build():
                     btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
                     stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4,
                                      visible=False)
-                progress = gr.HTML(progress_bar_html(0, "idle"), elem_id="anima-progress")
                 status = gr.Textbox(label="Status", interactive=False, show_label=False,
                                     placeholder="idle", elem_id="anima-status")
 
@@ -659,6 +677,32 @@ def build():
                       show_progress="hidden")
         swap.click(lambda a, b: (b, a), inputs=[aspect_w, aspect_h],
                    outputs=[aspect_w, aspect_h], show_progress="hidden")
+
+        # ---- persisted settings (browser localStorage) --------------------------
+        # Gr.BrowserState keeps a JSON blob in localStorage, so the prompt and the
+        # rest of the form survive a reload or a fresh browser session.
+        settings = gr.BrowserState(default_value=None, storage_key="anima_settings_v1")
+        SETTING_KEYS = ["prompt", "neg", "prompt_style", "tags", "steps", "guidance",
+                        "seed", "preview_every", "batch_count", "aspect_w", "aspect_h",
+                        "mp_target", "width", "height"]
+        setting_inputs = [prompt, neg, prompt_style, tags, steps, guidance, seed,
+                          preview_every, batch_count, aspect_w, aspect_h, mp_target,
+                          width, height]
+
+        def save_settings(*vals):
+            return {k: v for k, v in zip(SETTING_KEYS, vals)}
+
+        def restore_settings(saved):
+            if not isinstance(saved, dict):
+                return [gr.update() for _ in setting_inputs]
+            return [gr.update() if saved.get(name) is None else gr.update(value=saved[name])
+                    for name in SETTING_KEYS]
+
+        gr.on(triggers=[c.change for c in setting_inputs],
+              fn=save_settings, inputs=setting_inputs, outputs=[settings],
+              show_progress="hidden")
+        demo.load(restore_settings, inputs=[settings], outputs=setting_inputs,
+                  show_progress="hidden")
 
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
