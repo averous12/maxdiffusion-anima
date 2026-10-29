@@ -20,6 +20,14 @@ import time
 import uuid
 from collections import OrderedDict
 
+# Gradio wraps every queued call in MatplotlibBackendMananger(), which imports
+# matplotlib. Under Colab the kernel exports
+# MPLBACKEND=module://matplotlib_inline.backend_inline, which matplotlib rejects
+# with "not a valid value for backend" -- so EVERY queued call, Generate
+# included, dies with `event: error` before our code runs. Force a real backend
+# here, before anything can import matplotlib, so every launch path is safe.
+os.environ["MPLBACKEND"] = "agg"
+
 from PIL import Image
 
 # Handshake files, shared with the server (see anima_aesthetic_server.py).
