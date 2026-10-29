@@ -376,7 +376,8 @@ def poll_progress():
         if loaded is not None:
             snap = loaded
 
-    return snap, status, pct, gr.update(visible=not busy), gr.update(visible=busy)
+    return (snap, status, progress_bar_html(pct, f"step {step}/{steps}"),
+            gr.update(visible=not busy), gr.update(visible=busy))
 
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
@@ -408,7 +409,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     # outputs: result image, status, progress bar, generate btn, interrupt btn, gallery
     BUSY = (_upd(visible=False), _upd(visible=True))
     IDLE = (_upd(visible=True), _upd(visible=False))
-    yield None, "queued...", 0, *BUSY, []
+    yield None, "queued...", progress_bar_html(0, "queued"), *BUSY, []
     while time.time() < deadline:
         prog = _read_prog()
         mine = prog.get("gen_id") == req["gen_id"]
@@ -431,10 +432,10 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             saved = save_outputs(prog, req)
             if saved:
                 status += f" | {saved}"
-            yield grid or snap, status, 100, *IDLE, gallery
+            yield grid or snap, status, progress_bar_html(100, "done"), *IDLE, gallery
             return
         if stage == "interrupted":
-            yield snap, status, pct, *IDLE, []
+            yield snap, status, progress_bar_html(pct, f"step {done_steps}/{int(req['steps'])}"), *IDLE, []
             return
         if stage == "error":
             yield None, status, 0, *IDLE, []
@@ -442,14 +443,14 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         marker = (prog.get("t"), prog.get("step"), stage, prog.get("preview_step"))
         if marker != seen:
             seen = marker
-            yield snap, status, pct, *BUSY, []
+            yield snap, status, progress_bar_html(pct, f"step {done_steps}/{int(req['steps'])}"), *BUSY, []
         time.sleep(0.5)
     # Render the last progress record instead of dumping a raw dict: a timeout line full of
     # Python dict syntax was unreadable, and hid the one field that explains a stall (stage).
     _to = _read_prog()
     _to_status = _status_line(_to, req["steps"], req["preview_every"])
-    yield (None, f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}", 0,
-           *IDLE, [])
+    yield (None, f"TIMEOUT after {int(time.time() - t_submit)}s: {_to_status}",
+           progress_bar_html(0, "timeout"), *IDLE, [])
 
 
 # ---------------------------------------------------------------------------
@@ -496,20 +497,49 @@ def disable_compression_for_sse():
 
 
 RESPONSIVE_CSS = """
-/* Cap the banner image against the viewport instead of a fixed pixel height,
-   so it never pushes the prompt and button off-screen. */
+/* Custom progress bar: the Slider's reset knob and numeric range read as a
+   control the user can drag, which it is not. */
+.anima-progress {
+  position: relative;
+  width: 100%;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--border-color-primary, #3a3a3a);
+  overflow: hidden;
+}
+.anima-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--color-accent, #f97316);
+  transition: width 0.3s ease;
+}
+.anima-progress-text {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--body-text-color, #eee);
+  text-shadow: 0 0 3px rgba(0, 0, 0, 0.6);
+}
+
 #anima-result img, #anima-result video {
-  max-height: 58vh !important;
+  max-height: 72vh !important;
   object-fit: contain;
 }
 #anima-actions { flex-wrap: wrap; }
 #anima-advanced .gr-row, #anima-advanced .flex { flex-wrap: wrap !important; }
 
-@media (max-width: 760px) {
-  /* Phone / narrow window: one control per line, no side-by-side squeeze. */
+/* Narrow: collapse to a single column, preserving DOM order
+   (result, then prompt, then the button). */
+@media (max-width: 900px) {
+  #anima-main { flex-direction: column !important; }
+  #anima-main > * { min-width: 100% !important; }
   #anima-actions { flex-direction: column !important; }
   #anima-actions > * { width: 100% !important; }
-  #anima-result img, #anima-result video { max-height: 38vh !important; }
+  #anima-result img, #anima-result video { max-height: 42vh !important; }
   #anima-advanced .gr-row, #anima-advanced .flex { flex-direction: column !important; }
   #anima-advanced .gr-row > *, #anima-advanced .flex > * { min-width: 100% !important; }
   .gradio-container { padding: 8px !important; }
@@ -518,63 +548,86 @@ RESPONSIVE_CSS = """
 """
 
 
+def progress_bar_html(pct, text=""):
+    """Render the progress element. gr.HTML rather than a Slider: a slider
+    implies a draggable control and renders a reset knob we do not want."""
+    pct = max(0, min(100, int(pct)))
+    safe = (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return (f'<div class="anima-progress">'
+            f'<div class="anima-progress-fill" style="width:{pct}%"></div>'
+            f'<span class="anima-progress-text">{safe}</span></div>')
+
+
 def build():
     import gradio as gr
 
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
     with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
-        # Layout is deliberately one vertical stack: result, prompt, button.
-        # Everything else lives in the Advanced accordion below.
-        result = gr.Image(label="Result", height=560, elem_id="anima-result")
-        prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
-                            placeholder="prompt — supports (weights:1.3) and [before:after:0.5] schedules")
-        with gr.Row(elem_id="anima-actions"):
-            btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
-            stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4, visible=False)
-        progress = gr.Slider(0, 100, value=0, step=1, label="Progress",
-                             interactive=False)
-        status = gr.Textbox(label="Status", interactive=False, show_label=False,
-                            placeholder="idle", elem_id="anima-status")
+        # Wide screens get two columns (result | controls). Below 900px the CSS
+        # stacks them, and because the result comes first in the DOM that
+        # collapse reads as result -> prompt -> button on a phone.
+        with gr.Row(elem_id="anima-main"):
+            with gr.Column(scale=3):
+                result = gr.Image(label="Result", height=560, elem_id="anima-result")
+            with gr.Column(scale=2):
+                prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
+                                    placeholder="prompt — supports (weights:1.3) "
+                                                "and [before:after:0.5] schedules")
+                with gr.Row(elem_id="anima-actions"):
+                    btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
+                    stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4,
+                                     visible=False)
+                progress = gr.HTML(progress_bar_html(0, "idle"), elem_id="anima-progress")
+                status = gr.Textbox(label="Status", interactive=False, show_label=False,
+                                    placeholder="idle", elem_id="anima-status")
 
-        with gr.Accordion("Advanced", open=False, elem_id="anima-advanced"):
-            neg = gr.Textbox(value=FERN_NEG, lines=2,
-                             label="Negative prompt (weights work here too)")
-            with gr.Row():
-                prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
-                                           label="Prompt style",
-                                           info="comfy = ComfyUI core rules. a1111 adds [x] / {x}. "
-                                                "safe = only (x:weight), plain parens stay literal.")
-                tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
-                                  info="Space or comma separated, e.g. SECOND_PASS")
-            gr.Markdown("### Resolution")
-            with gr.Row():
-                aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
-                aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
-                preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
-                                     info="Quick-fill the ratio")
-                swap = gr.Button("Swap W/H", size="sm")
-            mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
-                                 info="1 MP = 1024 x 1024 px. Custom size lets you type the pixels.")
-            with gr.Row():
-                width = gr.Number(value=w0, label="Width (px)", precision=0, interactive=False)
-                height = gr.Number(value=h0, label="Height (px)", precision=0, interactive=False)
-            shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
-            with gr.Row():
-                steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
-                guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5, label="CFG guidance")
-            with gr.Row():
-                seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
-                preview_every = gr.Slider(0, 10, value=5, step=1,
-                                          label="VAE preview every N steps (0 = off)",
-                                          info="Each preview decodes every image in the batch.")
-            batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1, label="Batch count",
-                                    info="Images generated together, step by step. "
-                                         "Image k uses seed + k.")
-            gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
-                                 height="auto", object_fit="contain")
-            with gr.Accordion("Prompt syntax reference", open=False):
-                gr.Markdown(SYNTAX_HELP)
+                with gr.Accordion("Advanced", open=False, elem_id="anima-advanced"):
+                    neg = gr.Textbox(value=FERN_NEG, lines=2,
+                                     label="Negative prompt (weights work here too)")
+                    with gr.Row():
+                        prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
+                                                   label="Prompt style",
+                                                   info="comfy = ComfyUI core rules. "
+                                                        "a1111 adds [x] / {x}. "
+                                                        "safe = only (x:weight), plain "
+                                                        "parens stay literal.")
+                        tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
+                                          info="Space or comma separated, e.g. SECOND_PASS")
+                    gr.Markdown("### Resolution")
+                    with gr.Row():
+                        aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
+                        aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
+                        preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
+                                             info="Quick-fill the ratio")
+                        swap = gr.Button("Swap W/H", size="sm")
+                    mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
+                                         info="1 MP = 1024 x 1024 px. Custom size lets you "
+                                              "type the pixels.")
+                    with gr.Row():
+                        width = gr.Number(value=w0, label="Width (px)", precision=0,
+                                          interactive=False)
+                        height = gr.Number(value=h0, label="Height (px)", precision=0,
+                                           interactive=False)
+                    shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
+                    with gr.Row():
+                        steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
+                        guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                             label="CFG guidance")
+                    with gr.Row():
+                        seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)",
+                                         precision=0)
+                        preview_every = gr.Slider(0, 10, value=5, step=1,
+                                                  label="VAE preview every N steps (0 = off)",
+                                                  info="Each preview decodes every image "
+                                                       "in the batch.")
+                    batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1, label="Batch count",
+                                            info="Images generated together, step by step. "
+                                                 "Image k uses seed + k.")
+                    gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
+                                         height="auto", object_fit="contain")
+                    with gr.Accordion("Prompt syntax reference", open=False):
+                        gr.Markdown(SYNTAX_HELP)
 
         gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
                     f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
