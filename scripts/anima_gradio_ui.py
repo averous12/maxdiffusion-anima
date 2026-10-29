@@ -387,6 +387,46 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+def disable_compression_for_sse():
+    """Stop Gradio's Brotli middleware from buffering the queue event stream.
+
+    Gradio installs BrotliMiddleware, which is built on Starlette's
+    GZipResponder. Compression middleware must buffer chunks before it can
+    compress them, so the /queue/data SSE stream never flushes -- the browser
+    gets every progress event in one burst when the run ends. That is exactly
+    what makes the live preview look frozen: the transfer is fine, the events
+    are simply held back. Behind a Cloudflare tunnel it is worse, because the
+    tunnel buffers the already-buffered response again.
+
+    Fix: for the SSE path only, drop `accept-encoding` so the compressor never
+    engages. Everything else stays compressed.
+    """
+    import gradio.brotli_middleware as _bm
+    import gradio.routes as _routes
+
+    base = getattr(_bm, "BrotliMiddleware", None)
+    if base is None or getattr(base, "_sse_safe", False):
+        return False
+
+    class SSESafeBrotli(base):
+        _sse_safe = True
+
+        async def __call__(self, scope, receive, send):
+            if scope.get("type") == "http" and "/queue/data" in (scope.get("path") or ""):
+                scope = dict(scope)
+                headers = [(k, v) for (k, v) in scope.get("headers", [])
+                           if k.lower() != b"accept-encoding"]
+                headers.append((b"accept-encoding", b"identity"))
+                scope["headers"] = headers
+            await super().__call__(scope, receive, send)
+
+    _bm.BrotliMiddleware = SSESafeBrotli
+    # routes.py imported the name at import time, so patch its reference too.
+    if getattr(_routes, "BrotliMiddleware", None) is base:
+        _routes.BrotliMiddleware = SSESafeBrotli
+    return True
+
+
 def build():
     import gradio as gr
 
@@ -490,6 +530,7 @@ def build():
 
 if __name__ == "__main__":
     _port = int(os.environ.get("ANIMA_UI_PORT", "7860"))
+    print("sse-safe compression patch:", disable_compression_for_sse(), flush=True)
     demo = build()
     demo.launch(
         server_name=os.environ.get("ANIMA_UI_HOST", "0.0.0.0"),
