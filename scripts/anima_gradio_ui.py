@@ -448,7 +448,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             if saved:
                 status += f" | {saved}"
             _RUN_ACTIVE["flag"] = False
-            if int(req.get("batch") or 1) > 1:
+            if int(req.get("batch_count") or 1) > 1:
                 # The two occupy the same panel: a batch shows the individual
                 # images with their seeds instead of the grid.
                 yield (_upd(visible=False), status,
