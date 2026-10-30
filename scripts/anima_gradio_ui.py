@@ -597,14 +597,16 @@ def build():
         with gr.Row(elem_id="anima-main"):
             with gr.Column(scale=3):
                 result = gr.Image(label="Result", height=560, elem_id="anima-result")
-                # Directly under the result: the bar describes the image above it.
+                # Individual images only mean something for a batch, so this stays
+                # hidden until a batch actually produces them. It shares this column
+                # with the result, so showing one hides the other.
+                gallery = gr.Gallery(label="Individual images (with seeds)", columns=3,
+                                     height=560, object_fit="contain", visible=False,
+                                     elem_id="anima-gallery")
+                # Below BOTH panels: the bar describes whichever one is showing, and
+                # stays in place when the gallery takes the result's spot.
                 progress = gr.HTML(progress_bar_html(0, "idle"),
                                    elem_id="anima-progress")
-                # Individual images only mean something for a batch, so this stays
-                # hidden until Batch count > 1 rather than sitting empty.
-                gallery = gr.Gallery(label="Individual images (with seeds)", columns=4,
-                                     height="auto", object_fit="contain", visible=False,
-                                     elem_id="anima-gallery")
             with gr.Column(scale=2, elem_id="anima-controls"):
                 # Prompt and negative belong together: one group, no accordion.
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
