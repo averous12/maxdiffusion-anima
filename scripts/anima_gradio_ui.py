@@ -33,6 +33,12 @@ from PIL import Image
 # Handshake files, shared with the server (see anima_aesthetic_server.py).
 REQ_PATH = "/content/anima_request.json"
 PROG_PATH = "/content/anima_progress.json"
+# LoRA support reuses the CLI boot path rather than a parallel one.
+LORA_DIR = "/content/anima_lora"
+JOB_PATH = "/content/anima_job.json"
+LAUNCH_LOG = "/content/server_launch.log"
+VENV_PY = "/content/maxdiffusion/.venv/bin/python"
+BOOT_SCRIPT = "/content/anima_job.py"
 SNAP_PATH = "/content/anima_snap.png"
 INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
 
@@ -346,6 +352,156 @@ def interrupt_gen():
         return f"could not request interrupt: {type(e).__name__}: {e}"
 
 
+# ------------------------------------------------------------------------- LoRA
+# LoRAs are merged at BOOT on the CPU, before the params go to the TPU (see the
+# ANIMA_LORAS block in anima_aesthetic_server.py). There is no runtime swap, so
+# "Apply" rewrites /content/anima_job.json and re-runs anima_job.py — the exact
+# boot path the CLI uses. Cost: ~4-5 minutes during which the sampler is DOWN.
+
+_REBOOT = {"active": False, "t0": 0.0, "proc": None, "names": [], "scale": 1.0}
+REBOOT_TIMEOUT_S = 1500.0
+REBOOT_HINT = "about 4-5 minutes"
+
+
+def _installed_loras():
+    """Files available to merge. Anything else in the dropdown is rejected."""
+    try:
+        return sorted(f for f in os.listdir(LORA_DIR) if f.endswith(".safetensors"))
+    except Exception:
+        return []
+
+
+def _loaded_loras():
+    """What the RUNNING server merged, read back from its own boot log.
+
+    None  -> no boot log to judge from.
+    []    -> the server booted with no LoRA.
+    """
+    try:
+        with open(LAUNCH_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+    for line in reversed(lines):
+        if "no LoRA configured" in line:
+            return []
+        # Split on the marker, not the first ":" — every line starts with a
+        # "[HH:MM:SS]" stamp, so a naive split returns "09:02] merging ...".
+        if "merging " in line and "LoRA(s):" in line:
+            tail = line.split("LoRA(s):", 1)[1]
+            return [t.strip() for t in tail.split(",") if t.strip()]
+    return None
+
+
+def _lora_state_html(note=""):
+    import html as _html
+
+    loaded = _loaded_loras()
+    if loaded is None:
+        body = "unknown (no boot log yet)"
+    elif not loaded:
+        body = "none — base model"
+    else:
+        body = ", ".join(f"<code>{_html.escape(x)}</code>" for x in loaded)
+    out = f"<div class='lora-state'>In the running server: {body}</div>"
+    if note:
+        out += f"<div class='lora-note'>{_html.escape(note)}</div>"
+    return out
+
+
+def apply_loras(names, scale):
+    """Write the boot job and restart the sampler with the chosen LoRAs.
+
+    Detached on purpose: the boot takes minutes and the tunnel buffers long
+    streaming responses, so the button returns at once and poll_progress follows
+    the reboot. Returns (state html, generate-button update).
+    """
+    import subprocess
+
+    import gradio as gr
+
+    if _RUN_ACTIVE["flag"]:
+        return (_lora_state_html("a generation is running — interrupt it first"),
+                gr.update())
+    if _REBOOT["active"]:
+        return _lora_state_html("a reboot is already in progress"), gr.update()
+
+    allowed = set(_installed_loras())
+    chosen = [n for n in (names or []) if n in allowed]
+    rejected = [n for n in (names or []) if n not in allowed]
+    if rejected:
+        return (_lora_state_html(f"ignored unknown LoRA(s): {', '.join(rejected)}"),
+                gr.update())
+    if not chosen and names:
+        return _lora_state_html("none of those files exist in " + LORA_DIR), gr.update()
+
+    scale = float(scale if scale is not None else 1.0)
+    payload = {"step": "boot"}
+    if chosen:
+        payload["loras"] = [{"name": n, "scale": scale} for n in chosen]
+    else:
+        # No "loras" and no "name": anima_job boots the base model.
+        payload["label"] = "base"
+
+    _atomic_json(JOB_PATH, payload)
+    env = {**os.environ, "MPLBACKEND": "agg", "PYTHONUNBUFFERED": "1"}
+    try:
+        proc = subprocess.Popen(
+            [VENV_PY, "-u", BOOT_SCRIPT], cwd="/content", env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,   # outlive this click
+        )
+    except Exception as e:
+        return (_lora_state_html(f"could not start the reboot: {type(e).__name__}: {e}"),
+                gr.update())
+
+    _REBOOT.update(active=True, t0=time.time(), proc=proc,
+                   names=chosen, scale=scale)
+    label = ", ".join(f"{n}@{scale:g}" for n in chosen) if chosen else "no LoRA"
+    return (_lora_state_html(f"rebooting with {label}. The server is down for "
+                             f"{REBOOT_HINT}; leave this page open."),
+            gr.update(interactive=False))
+
+
+def _reboot_state(stage=None):
+    """Follow the detached boot. Returns (status, text)."""
+    if not _REBOOT["active"]:
+        return "idle", ""
+    elapsed = time.time() - _REBOOT["t0"]
+    proc = _REBOOT["proc"]
+    rc = proc.poll() if proc is not None else None
+
+    try:
+        mtime = os.path.getmtime(PROG_PATH)
+    except OSError:
+        mtime = 0.0
+    if stage is None:
+        stage = _read_prog().get("stage")
+
+    # do_boot() deletes the progress record before it boots, so a "ready" with a
+    # fresh mtime can only come from THIS boot.
+    if stage == "ready" and mtime >= _REBOOT["t0"] - 1:
+        _REBOOT["active"] = False
+        label = ", ".join(_REBOOT["names"]) or "no LoRA"
+        return "done", f"server ready with {label} after {elapsed:.0f}s"
+    if rc not in (None, 0):
+        _REBOOT["active"] = False
+        return "error", f"boot exited with code {rc} — see {LAUNCH_LOG}"
+    try:
+        with open(LAUNCH_LOG, encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-400:]
+    except Exception:
+        tail = []
+    if any("Traceback (most recent call last)" in l for l in tail):
+        _REBOOT["active"] = False
+        return "error", f"boot raised an exception — see {LAUNCH_LOG}"
+    if elapsed > REBOOT_TIMEOUT_S:
+        _REBOOT["active"] = False
+        return "error", f"boot timed out after {elapsed:.0f}s"
+    return "rebooting", (f"rebooting… {elapsed:.0f}s "
+                         f"(sampler at {stage or 'loading'})")
+
+
 def poll_progress():
     """Surface generation progress over ordinary requests instead of SSE.
 
@@ -355,18 +511,32 @@ def poll_progress():
     ever appeared at the end. Polling sidesteps that completely, because each
     tick is a plain request/response that no proxy has a reason to hold back.
 
-    Returns: result, status, progress, generate button, interrupt button.
+    Returns: result, status, progress, generate button, interrupt button,
+        LoRA state panel.
     """
     import gradio as gr
 
     prog = _read_prog()
     stage = prog.get("stage")
+
+    # A reboot owns the sampler: report it and hold Generate inert, so a click
+    # cannot land in the gap where nothing is reading the request file yet.
+    rb_status, rb_text = _reboot_state(stage)
+    if rb_status == "rebooting":
+        return (gr.update(), rb_text, progress_bar_html(0, "rebooting"),
+                gr.update(visible=True, interactive=False), gr.update(visible=False),
+                _lora_state_html(rb_text))
+
+    # Generate comes back only once the sampler has confirmed it is up.
+    btn_idle = gr.update(visible=True, interactive=True)
+
     # Safety net: a client that vanished mid-run leaves the flag set, so also
     # give up on a record the server has not touched in a long time.
     if _RUN_ACTIVE["flag"] and time.time() - float(prog.get("t") or 0) > _STALE_AFTER_S:
         _RUN_ACTIVE["flag"] = False
     if not stage or not _RUN_ACTIVE["flag"]:
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update()
+        return (gr.update(), gr.update(), gr.update(), btn_idle, gr.update(),
+                _lora_state_html())
 
     steps = int(prog.get("steps") or 30)
     step = int(prog.get("step") or 0)
@@ -388,7 +558,8 @@ def poll_progress():
             snap = loaded
 
     return (snap, status, progress_bar_html(pct, f"step {step}/{steps}"),
-            gr.update(visible=not busy), gr.update(visible=busy))
+            gr.update(visible=not busy, interactive=not busy), gr.update(visible=busy),
+            _lora_state_html())
 
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
@@ -662,6 +833,22 @@ def build():
                                                     "(x:weight), plain parens stay literal.")
                     tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
                                       info="Space or comma separated, e.g. SECOND_PASS")
+                with gr.Accordion("LoRA (merged at boot — Apply restarts the server)",
+                                  open=False):
+                    lora_pick = gr.Dropdown(choices=_installed_loras(), value=[],
+                                            multiselect=True, label="LoRAs to merge",
+                                            info="Everything in /content/anima_lora. "
+                                                 "All selected files merge in one pass.")
+                    with gr.Row():
+                        lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
+                                               label="Scale (applies to all selected)")
+                        lora_refresh = gr.Button("Refresh list", size="sm")
+                    lora_apply = gr.Button("Apply & restart server", variant="secondary")
+                    lora_state = gr.HTML(_lora_state_html())
+                    gr.Markdown("A restart takes ~4-5 minutes: the sampler reloads the "
+                                "base model and merges the LoRAs on the CPU before it "
+                                "can generate again. Generate stays disabled until it "
+                                "reports ready.")
                 with gr.Accordion("Prompt syntax reference", open=False):
                     gr.Markdown(SYNTAX_HELP)
 
@@ -733,10 +920,19 @@ def build():
         # end). A timer tick is a plain request/response, which nothing buffers.
         timer = gr.Timer(1.0, active=True)
         timer.tick(poll_progress, inputs=[],
-                   outputs=[result, status, progress, btn, stop],
+                   outputs=[result, status, progress, btn, stop, lora_state],
                    queue=False, show_progress="hidden")
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
+
+        # ---- LoRA wiring ------------------------------------------------------
+        lora_refresh.click(lambda: gr.update(choices=_installed_loras()),
+                           inputs=[], outputs=[lora_pick], show_progress="hidden")
+        # concurrency_limit=1 keeps a double click from launching two boots.
+        lora_apply.click(apply_loras, inputs=[lora_pick, lora_scale],
+                         outputs=[lora_state, btn], concurrency_limit=1)
+        demo.load(lambda: gr.update(choices=_installed_loras()), inputs=[],
+                  outputs=[lora_pick], show_progress="hidden")
     demo.queue()
     return demo
 
