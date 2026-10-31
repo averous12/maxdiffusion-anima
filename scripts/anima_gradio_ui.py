@@ -39,6 +39,9 @@ JOB_PATH = "/content/anima_job.json"
 LAUNCH_LOG = "/content/server_launch.log"
 VENV_PY = "/content/maxdiffusion/.venv/bin/python"
 BOOT_SCRIPT = "/content/anima_job.py"
+# Where a running boot announces itself, so a UI restart (watchdog) does not
+# forget that the sampler is mid-reboot.
+REBOOT_PATH = "/content/anima_reboot.json"
 SNAP_PATH = "/content/anima_snap.png"
 INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
 
@@ -342,6 +345,11 @@ def _upd(**kw):
     return gr.update(**kw)
 
 
+def btn_reset():
+    """Generate's fully-enabled resting state, for after a reboot completes."""
+    return _upd(visible=True, interactive=True)
+
+
 def interrupt_gen():
     """Ask the server to cancel the running generation."""
     try:
@@ -393,7 +401,13 @@ def _loaded_loras():
     return None
 
 
-def _lora_state_html(note=""):
+def _lora_state_html(note="", pct=None):
+    """State panel for the LoRA accordion.
+
+    pct is the LIVE BOOT progress (0-100) and only exists while a reboot is
+    running: once the boot finishes, the panel drops back to the plain
+    "In the running server: ..." line and the bar disappears.
+    """
     import html as _html
 
     loaded = _loaded_loras()
@@ -404,9 +418,80 @@ def _lora_state_html(note=""):
     else:
         body = ", ".join(f"<code>{_html.escape(x)}</code>" for x in loaded)
     out = f"<div class='lora-state'>In the running server: {body}</div>"
+    if pct is not None:
+        pct = max(0, min(100, int(pct)))
+        out += (f"<div class='lora-bar'>"
+                f"<div class='lora-bar-fill' style='width:{pct}%'></div></div>")
     if note:
         out += f"<div class='lora-note'>{_html.escape(note)}</div>"
     return out
+
+
+def _boot_progress():
+    """Turn the sampler's boot log into (pct, label, last line).
+
+    do_boot() truncates the log before every boot, so the file holds exactly
+    one boot's worth of lines. A missing/empty file just means the boot has
+    not stamped anything yet — not an error.
+    """
+    try:
+        with open(LAUNCH_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception:
+        return 0, "starting…", ""
+    import re as _re
+
+    pct, label, detail = 0, "starting…", ""
+    for line in lines:
+        l = line.strip()
+        if not l:
+            continue
+        detail = l[:140]
+        if "Qwen3 TPU model ready" in l:
+            pct, label = 8, "text encoder ready"
+        elif "adapter block" in l and "/6" in l:
+            m = _re.search(r"block (\d+)/6", l)
+            if m:
+                cur = int(m.group(1))
+                pct, label = 10 + int(14 * cur / 6), f"conditioner {cur}/6"
+        elif "transformer block" in l and "/28" in l:
+            m = _re.search(r"block (\d+)/28", l)
+            if m:
+                cur = int(m.group(1))
+                pct, label = 24 + int(36 * cur / 28), f"transformer {cur}/28"
+        elif "merging " in l and "LoRA(s):" in l:
+            pct, label = 60, "merging LoRA(s)…"
+        elif "LoRA merged:" in l:
+            m = _re.search(r"in ([\d.]+)s", l)
+            pct, label = 75, (f"LoRA merged in {m.group(1)}s" if m
+                              else "LoRA merged")
+        elif "vae converted+merged" in l:
+            pct, label = 80, "VAE ready"
+        elif "warmup: transformer forward" in l:
+            pct, label = 86, "compiling transformer exec (1024px)"
+        elif "warmup: VAE decode" in l:
+            pct, label = 92, "compiling VAE decode"
+        elif "SERVER READY" in l:
+            pct, label = 100, "ready"
+    return pct, label, detail
+
+
+def _resume_reboot():
+    """Adopt a boot that outlived the UI process.
+
+    The watchdog restarts the UI when the tunnel dies, and that wipes the
+    in-memory reboot state. If a reboot was mid-flight, pick it back up from
+    the intent file so the tracker (and the Generate lock) come back.
+    """
+    try:
+        d = json.load(open(REBOOT_PATH))
+        age = time.time() - float(d["t0"])
+        if 0 < age < REBOOT_TIMEOUT_S:
+            _REBOOT.update(active=True, t0=float(d["t0"]), proc=None,
+                           names=list(d.get("names") or []),
+                           scale=float(d.get("scale", 1.0)))
+    except Exception:
+        pass
 
 
 def apply_loras(names, scale):
@@ -457,6 +542,8 @@ def apply_loras(names, scale):
 
     _REBOOT.update(active=True, t0=time.time(), proc=proc,
                    names=chosen, scale=scale)
+    _atomic_json(REBOOT_PATH, {"t0": _REBOOT["t0"], "names": chosen,
+                               "scale": scale})
     label = ", ".join(f"{n}@{scale:g}" for n in chosen) if chosen else "no LoRA"
     return (_lora_state_html(f"rebooting with {label}. The server is down for "
                              f"{REBOOT_HINT}; leave this page open."),
@@ -482,10 +569,12 @@ def _reboot_state(stage=None):
     # fresh mtime can only come from THIS boot.
     if stage == "ready" and mtime >= _REBOOT["t0"] - 1:
         _REBOOT["active"] = False
+        _clear_reboot_intent()
         label = ", ".join(_REBOOT["names"]) or "no LoRA"
         return "done", f"server ready with {label} after {elapsed:.0f}s"
     if rc not in (None, 0):
         _REBOOT["active"] = False
+        _clear_reboot_intent()
         return "error", f"boot exited with code {rc} — see {LAUNCH_LOG}"
     try:
         with open(LAUNCH_LOG, encoding="utf-8", errors="replace") as f:
@@ -494,12 +583,21 @@ def _reboot_state(stage=None):
         tail = []
     if any("Traceback (most recent call last)" in l for l in tail):
         _REBOOT["active"] = False
+        _clear_reboot_intent()
         return "error", f"boot raised an exception — see {LAUNCH_LOG}"
     if elapsed > REBOOT_TIMEOUT_S:
         _REBOOT["active"] = False
+        _clear_reboot_intent()
         return "error", f"boot timed out after {elapsed:.0f}s"
     return "rebooting", (f"rebooting… {elapsed:.0f}s "
                          f"(sampler at {stage or 'loading'})")
+
+
+def _clear_reboot_intent():
+    try:
+        os.remove(REBOOT_PATH)
+    except OSError:
+        pass
 
 
 def poll_progress():
@@ -523,9 +621,18 @@ def poll_progress():
     # cannot land in the gap where nothing is reading the request file yet.
     rb_status, rb_text = _reboot_state(stage)
     if rb_status == "rebooting":
-        return (gr.update(), rb_text, progress_bar_html(0, "rebooting"),
+        pct, label, _detail = _boot_progress()
+        note = f"{pct}% — {label}"
+        return (gr.update(), f"{rb_text} | {note}",
+                progress_bar_html(pct, f"rebooting {pct}%"),
                 gr.update(visible=True, interactive=False), gr.update(visible=False),
-                _lora_state_html(rb_text))
+                _lora_state_html(f"{label}  ({pct}%)", pct=pct))
+    if rb_status == "done":
+        # 100% reached: the tracker and its bar clear themselves, leaving only
+        # the plain "In the running server: ..." line.
+        return (gr.update(), "reboot complete — server ready",
+                progress_bar_html(100, "ready"), btn_reset(),
+                gr.update(visible=False), _lora_state_html())
 
     # Generate comes back only once the sampler has confirmed it is up.
     btn_idle = gr.update(visible=True, interactive=True)
@@ -723,6 +830,30 @@ RESPONSIVE_CSS = """
   text-shadow: 0 0 3px rgba(0, 0, 0, 0.6);
 }
 
+/* Boot tracker: shown only while a LoRA reboot is running, then it clears. */
+.lora-state { font-size: 12px; margin-bottom: 4px; }
+.lora-bar {
+  position: relative;
+  width: 100%;
+  height: 10px;
+  border-radius: 5px;
+  background: var(--border-color-primary, #3a3a3a);
+  overflow: hidden;
+  margin: 4px 0 2px 0;
+}
+.lora-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--color-accent, #f97316);
+  transition: width 0.4s ease;
+}
+.lora-note {
+  font-size: 12px;
+  color: var(--body-text-color-subdued, #bbb);
+  margin-top: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
 #anima-result img, #anima-result video {
   max-height: 72vh !important;
   object-fit: contain;
@@ -758,6 +889,10 @@ def progress_bar_html(pct, text=""):
 
 def build():
     import gradio as gr
+
+    # A boot may have outlived a UI restart (watchdog): adopt it so the tracker
+    # and the Generate lock survive the process swap.
+    _resume_reboot()
 
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
