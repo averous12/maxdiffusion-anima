@@ -42,6 +42,11 @@ BOOT_SCRIPT = "/content/anima_job.py"
 # Where a running boot announces itself, so a UI restart (watchdog) does not
 # forget that the sampler is mid-reboot.
 REBOOT_PATH = "/content/anima_reboot.json"
+# Live state of a link-triggered LoRA download (written by scripts/add_lora.py).
+DL_STATE_PATH = "/content/anima_download.json"
+# Repo root, so the detached downloader runs from the pulled checkout.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ADD_LORA_SCRIPT = os.path.join(REPO_ROOT, "scripts", "add_lora.py")
 SNAP_PATH = "/content/anima_snap.png"
 INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
 
@@ -367,6 +372,9 @@ def interrupt_gen():
 # boot path the CLI uses. Cost: ~4-5 minutes during which the sampler is DOWN.
 
 _REBOOT = {"active": False, "t0": 0.0, "proc": None, "names": [], "scale": 1.0}
+# Last finished download already advertised in the dropdown, so the choices are
+# not rewritten on every timer tick.
+_DL_HANDLED = {"key": None}
 REBOOT_TIMEOUT_S = 1500.0
 REBOOT_HINT = "about 4-5 minutes"
 
@@ -418,6 +426,39 @@ def _lora_state_html(note="", pct=None):
     else:
         body = ", ".join(f"<code>{_html.escape(x)}</code>" for x in loaded)
     out = f"<div class='lora-state'>In the running server: {body}</div>"
+
+    # A link download in flight (or just finished) belongs in this panel: it is
+    # the thing the user is waiting on, and it needs no server restart.
+    dl = _read_json(DL_STATE_PATH) or {}
+    dst = dl.get("status")
+    if dst in ("resolving", "downloading", "validating"):
+        name = _html.escape(str(dl.get("name") or "…"))
+        if dst == "downloading":
+            pct_dl = int(dl.get("pct") or 0)
+            mb = (dl.get("done") or 0) / 1e6
+            tot = (dl.get("total") or 0) / 1e6
+            label = (f"downloading {name} — {pct_dl}% "
+                     f"({mb:.0f}/{tot:.0f} MB)" if tot
+                     else f"downloading {name} — {mb:.0f} MB")
+        elif dst == "validating":
+            label = f"validating {name}…"
+        else:
+            label = f"resolving {name}…"
+        out += (f"<div class='lora-dl'>↓ {label}</div>"
+                f"<div class='lora-bar'><div class='lora-bar-fill' "
+                f"style='width:{int(dl.get('pct') or 0)}%'></div></div>")
+    elif dst == "error":
+        out += (f"<div class='lora-dl lora-err'>✗ "
+                f"{_html.escape(str(dl.get('message') or 'download failed'))}</div>")
+    elif dst == "ok":
+        # A short confirmation, not a permanent one: the file is in the list now.
+        if time.time() - float(dl.get("t") or 0) < 120:
+            n = dl.get("tensors")
+            extra = f" ({n} tensors)" if n else ""
+            out += (f"<div class='lora-dl'>✓ "
+                    f"{_html.escape(str(dl.get('name') or 'file'))}{extra} ready — "
+                    f"select it above, then Apply</div>")
+
     if pct is not None:
         pct = max(0, min(100, int(pct)))
         out += (f"<div class='lora-bar'>"
@@ -600,6 +641,53 @@ def _clear_reboot_intent():
         pass
 
 
+def add_lora_from_link(url):
+    """Download + validate a LoRA from a HuggingFace/CivitAI link.
+
+    Deliberately does NOT touch the sampler: fetching a file is safe while the
+    TPU is busy generating, and merging it is a separate, explicit Apply.
+    The downloader is a detached process because a 600 MB fetch through the
+    tunnel would look dead as a blocking click; poll_progress follows
+    /content/anima_download.json instead.
+    """
+    import subprocess
+
+    import gradio as gr
+
+    u = (url or "").strip()
+    if not u:
+        return _lora_state_html("paste a HuggingFace or CivitAI link first")
+
+    cur = _read_json(DL_STATE_PATH) or {}
+    if cur.get("status") in ("resolving", "downloading", "validating"):
+        return _lora_state_html(f"already fetching {cur.get('name') or 'a file'} "
+                                f"— let it finish")
+    if not os.path.exists(ADD_LORA_SCRIPT):
+        return _lora_state_html(f"downloader missing on this checkout: {ADD_LORA_SCRIPT}")
+    if not os.path.exists(VENV_PY):
+        return _lora_state_html(f"venv python missing: {VENV_PY}")
+
+    # Drop the previous result first, so a stale "ok" can never be read as the
+    # outcome of this attempt.
+    try:
+        os.remove(DL_STATE_PATH)
+    except OSError:
+        pass
+    _atomic_json(DL_STATE_PATH, {"status": "resolving", "url": u, "t": time.time()})
+
+    try:
+        subprocess.Popen([VENV_PY, "-u", ADD_LORA_SCRIPT, u], cwd=REPO_ROOT,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except Exception as e:
+        _atomic_json(DL_STATE_PATH, {"status": "error", "url": u,
+                                     "message": f"{type(e).__name__}: {e}",
+                                     "t": time.time()})
+        return _lora_state_html(f"could not start the download: "
+                                f"{type(e).__name__}: {e}")
+    return _lora_state_html("fetching — progress appears here")
+
+
 def poll_progress():
     """Surface generation progress over ordinary requests instead of SSE.
 
@@ -617,6 +705,17 @@ def poll_progress():
     prog = _read_prog()
     stage = prog.get("stage")
 
+    # A finished link download should appear in the picker without the user
+    # having to press Refresh. Track what we already advertised so the choices
+    # are not rewritten on every tick.
+    dl = _read_json(DL_STATE_PATH) or {}
+    dl_key = (dl.get("name"), dl.get("t")) if dl.get("status") == "ok" else None
+    if dl_key and dl_key != _DL_HANDLED["key"]:
+        _DL_HANDLED["key"] = dl_key
+        dl_update = gr.update(choices=_installed_loras())
+    else:
+        dl_update = gr.update()
+
     # A reboot owns the sampler: report it and hold Generate inert, so a click
     # cannot land in the gap where nothing is reading the request file yet.
     rb_status, rb_text = _reboot_state(stage)
@@ -626,13 +725,13 @@ def poll_progress():
         return (gr.update(), f"{rb_text} | {note}",
                 progress_bar_html(pct, f"rebooting {pct}%"),
                 gr.update(visible=True, interactive=False), gr.update(visible=False),
-                _lora_state_html(f"{label}  ({pct}%)", pct=pct))
+                _lora_state_html(f"{label}  ({pct}%)", pct=pct), dl_update)
     if rb_status == "done":
         # 100% reached: the tracker and its bar clear themselves, leaving only
         # the plain "In the running server: ..." line.
         return (gr.update(), "reboot complete — server ready",
                 progress_bar_html(100, "ready"), btn_reset(),
-                gr.update(visible=False), _lora_state_html())
+                gr.update(visible=False), _lora_state_html(), dl_update)
 
     # Generate comes back only once the sampler has confirmed it is up.
     btn_idle = gr.update(visible=True, interactive=True)
@@ -643,7 +742,7 @@ def poll_progress():
         _RUN_ACTIVE["flag"] = False
     if not stage or not _RUN_ACTIVE["flag"]:
         return (gr.update(), gr.update(), gr.update(), btn_idle, gr.update(),
-                _lora_state_html())
+                _lora_state_html(), dl_update)
 
     steps = int(prog.get("steps") or 30)
     step = int(prog.get("step") or 0)
@@ -666,7 +765,7 @@ def poll_progress():
 
     return (snap, status, progress_bar_html(pct, f"step {step}/{steps}"),
             gr.update(visible=not busy, interactive=not busy), gr.update(visible=busy),
-            _lora_state_html())
+            _lora_state_html(), dl_update)
 
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
@@ -853,6 +952,13 @@ RESPONSIVE_CSS = """
   margin-top: 2px;
   font-variant-numeric: tabular-nums;
 }
+.lora-dl {
+  font-size: 12px;
+  margin-top: 4px;
+  color: var(--body-text-color-subdued, #bbb);
+  font-variant-numeric: tabular-nums;
+}
+.lora-dl.lora-err { color: var(--error-text-color, #f87171); }
 
 #anima-result img, #anima-result video {
   max-height: 72vh !important;
@@ -978,7 +1084,17 @@ def build():
                         lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
                                                label="Scale (applies to all selected)")
                         lora_refresh = gr.Button("Refresh list", size="sm")
-                    lora_apply = gr.Button("Apply & restart server", variant="secondary")
+                    # Fetching a file is safe while the TPU generates: only the
+                    # merge needs a restart, so this is a separate button.
+                    lora_url = gr.Textbox(
+                        label="Add from link (HuggingFace or CivitAI)",
+                        placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors "
+                                    "or https://civitai.com/models/12345",
+                        info="Downloads and validates into /content/anima_lora. "
+                             "A CivitAI model page becomes its API download route; "
+                             "a bare HuggingFace repo picks a .safetensors file.")
+                    lora_add = gr.Button("Download & validate", variant="secondary")
+                    lora_apply = gr.Button("Apply & restart server", variant="primary")
                     lora_state = gr.HTML(_lora_state_html())
                     gr.Markdown("A restart takes ~4-5 minutes: the sampler reloads the "
                                 "base model and merges the LoRAs on the CPU before it "
@@ -1055,7 +1171,7 @@ def build():
         # end). A timer tick is a plain request/response, which nothing buffers.
         timer = gr.Timer(1.0, active=True)
         timer.tick(poll_progress, inputs=[],
-                   outputs=[result, status, progress, btn, stop, lora_state],
+                   outputs=[result, status, progress, btn, stop, lora_state, lora_pick],
                    queue=False, show_progress="hidden")
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
@@ -1063,6 +1179,10 @@ def build():
         # ---- LoRA wiring ------------------------------------------------------
         lora_refresh.click(lambda: gr.update(choices=_installed_loras()),
                            inputs=[], outputs=[lora_pick], show_progress="hidden")
+        # Fetching is independent of the sampler, so it is not gated on a run;
+        # the handler refuses only if another download is already in flight.
+        lora_add.click(add_lora_from_link, inputs=[lora_url], outputs=[lora_state],
+                       concurrency_limit=1)
         # concurrency_limit=1 keeps a double click from launching two boots.
         lora_apply.click(apply_loras, inputs=[lora_pick, lora_scale],
                          outputs=[lora_state, btn], concurrency_limit=1)
