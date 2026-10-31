@@ -478,21 +478,16 @@ def make_grid_u8(imgs):
         canvas[r * h:(r + 1) * h, c * w:(c + 1) * w] = im
     return canvas
 
-def save_u8(u8, path, step=None, steps=None, ms_per_step=None, guidance=None):
-    from PIL import Image, ImageDraw, ImageFont
+def save_u8(u8, path):
+    """Save a numpy RGB (H, W, 3) array as a lossless PNG.
+
+    No overlay: images used to carry a burned-in "step X/Y, N ms/step, CFG Z"
+    progress stamp so consecutive previews did not look frozen. The UI now has
+    a real progress bar and status line, and the stamp ended up permanently in
+    archived/final images, so it was removed — output pixels == input pixels.
+    """
+    from PIL import Image
     img = Image.fromarray(u8)
-    # Overlay progress text so the live preview is self-describing: without it the
-    # browser can look frozen when a preview is followed by a very similar preview.
-    try:
-        draw = ImageDraw.Draw(img)
-        try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
-        except Exception:
-            font = ImageFont.load_default()
-        text = f"step {step or '?'}/{steps or '?'}, {ms_per_step or '?'} ms/step, CFG {guidance or '?'}"
-        draw.text((10, 10), text, fill=(255, 255, 255), font=font)
-    except Exception:
-        pass
     tmp = path + ".tmp.png"
     img.save(tmp)
     os.replace(tmp, path)
@@ -775,8 +770,7 @@ while True:
                                    **common, **_pv_state())
                     _imgs = decode_latents(latents)
                     _pv_stage = "preview write"
-                    save_u8(make_grid_u8(_imgs), SNAP_PATH, step=i + 1,
-                            steps=STEPS, ms_per_step=ms, guidance=GUIDANCE)
+                    save_u8(make_grid_u8(_imgs), SNAP_PATH)
                     _vae_compiled.add((H, W))
                     # ALL preview wall time, success or failure, is charged to prev_total.
                     # Otherwise a failed attempt's ~50s XLA compile lands in denoise_s and
