@@ -18,6 +18,7 @@ import os
 import shutil
 import time
 import uuid
+import warnings
 from collections import OrderedDict
 
 # Gradio wraps every queued call in MatplotlibBackendMananger(), which imports
@@ -27,6 +28,17 @@ from collections import OrderedDict
 # included, dies with `event: error` before our code runs. Force a real backend
 # here, before anything can import matplotlib, so every launch path is safe.
 os.environ["MPLBACKEND"] = "agg"
+
+# gradio's routes.py still references starlette's deprecated
+# HTTP_422_UNPROCESSABLE_ENTITY status constant, so every queue_join (every
+# poll tick AND every API call) prints a StarletteDeprecationWarning to stderr.
+# It is gradio's bug, not ours — silence exactly that message, nothing else.
+# No category filter on purpose: starlette changed the base of
+# StarletteDeprecationWarning from DeprecationWarning (older) to FutureWarning
+# (newer), so a category-restricted filter silently stops matching after a
+# starlette upgrade. The message alone is unambiguous.
+warnings.filterwarnings("ignore",
+                        message=r"'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated.*")
 
 from PIL import Image
 
