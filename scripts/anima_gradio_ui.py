@@ -358,8 +358,15 @@ def _status_line(prog, fallback_steps, preview_every=None):
 # ---------------------------------------------------------------------------
 def _upd(**kw):
     """gr.update without importing gradio at module scope (keeps start_gen drivable)."""
-    import gradio as gr
-    return gr.update(**kw)
+    try:
+        import gradio as gr
+        return gr.update(**kw)
+    except ModuleNotFoundError:
+        # Headless drive: the notebook kernel has no gradio (it lives only in the
+        # server/UI venv). start_gen's consumers read updates as plain dicts
+        # (e.g. isinstance(gal_upd, dict) and gal_upd.get("value")), so a kwargs
+        # dict is equivalent. The real browser UI always hits the gr.update path.
+        return dict(kw)
 
 
 def btn_reset():
