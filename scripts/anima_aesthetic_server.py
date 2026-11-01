@@ -60,6 +60,29 @@ import faulthandler
 faulthandler.dump_traceback_later(1800, exit=False)
 import jax
 jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
+
+# Persistent XLA executable cache: the 52s VAE + 16s transformer warmup
+# compiles are pure compile cost, keyed on SHAPES not weight values, so a
+# server reboot (LoRA Apply, watchdog restart) can load them instead of
+# recompiling. The cache key includes JAX/libtpu versions + topology, so a
+# fresh VM allocation recompiles once — that is expected and cheap-ish.
+# Drive is used ONLY when actually mounted (cold_start / anima_job do not
+# mount it, and an unmounted makedirs would silently create a dead local
+# directory under /content); otherwise fall back to the VM-local path, which
+# still spans server reboots within this VM's life.
+XLA_CACHE = os.environ.get("ANIMA_XLA_CACHE", "")
+if not XLA_CACHE:
+    XLA_CACHE = "/content/drive/MyDrive/anima_xla_cache" if os.path.isdir(
+        "/content/drive/MyDrive") else "/content/anima_xla_cache"
+try:
+    os.makedirs(XLA_CACHE, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", XLA_CACHE)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+    log(f"XLA cache: {XLA_CACHE} (drive={XLA_CACHE.startswith('/content/drive')})")
+except Exception as e:
+    log(f"XLA cache disabled ({type(e).__name__}: {e}); compiling every boot")
+    XLA_CACHE = ""
 import jax.numpy as jnp
 log("matmul precision: BF16_BF16_F32 (bf16 operands, fp32 accumulate; activations stay fp32)")
 
@@ -566,6 +589,12 @@ except Exception:
     raise
 
 log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
+if XLA_CACHE:
+    try:
+        _n = len(os.listdir(XLA_CACHE))
+    except Exception:
+        _n = -1
+    log(f"xla cache: {_n} entries at {XLA_CACHE}")
 write_prog(stage="ready", step=0, steps=0, gen_id="warmup")
 
 def default_req():
