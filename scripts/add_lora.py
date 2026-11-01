@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-LORA_DIR = "/content/anima_lora"
+LORA_DIR = os.environ.get("ANIMA_LORA_DIR", "/content/anima_lora")
 STATE_PATH = "/content/anima_download.json"
 UA = "Mozilla/5.0 (X11; Linux x86_64) anima-lora-fetch/1.0"
 CHUNK = 1 << 16
