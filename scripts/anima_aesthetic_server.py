@@ -71,15 +71,33 @@ jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 # directory under /content); otherwise fall back to the VM-local path, which
 # still spans server reboots within this VM's life.
 XLA_CACHE = os.environ.get("ANIMA_XLA_CACHE", "")
+# One Drive tree for both caches: /content/drive/MyDrive/anima_cache/{hf,xla}.
+# This default only exists so a forgotten env var cannot silently lose the
+# cache; the agenda sets ANIMA_XLA_CACHE explicitly. The pre-unification
+# /content/drive/MyDrive/anima_xla_cache stays readable as a fallback so
+# entries written before the tree was unified are not thrown away.
+DRIVE_XLA = "/content/drive/MyDrive/anima_cache/xla"
+LEGACY_DRIVE_XLA = "/content/drive/MyDrive/anima_xla_cache"
 if not XLA_CACHE:
-    XLA_CACHE = "/content/drive/MyDrive/anima_xla_cache" if os.path.isdir(
-        "/content/drive/MyDrive") else "/content/anima_xla_cache"
+    if os.path.isdir("/content/drive/MyDrive"):
+        XLA_CACHE = DRIVE_XLA
+    elif os.path.isdir(LEGACY_DRIVE_XLA):
+        XLA_CACHE = LEGACY_DRIVE_XLA
+    else:
+        XLA_CACHE = "/content/anima_xla_cache"
 try:
     os.makedirs(XLA_CACHE, exist_ok=True)
     jax.config.update("jax_compilation_cache_dir", XLA_CACHE)
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
-    log(f"XLA cache: {XLA_CACHE} (drive={XLA_CACHE.startswith('/content/drive')})")
+    _persistent = XLA_CACHE.startswith("/content/drive/")
+    log(f"XLA cache: {XLA_CACHE} (drive={_persistent} persistent={_persistent})")
+    if not _persistent:
+        # Loud on purpose: a silent fallback here means the ~68 s of warmup
+        # compiles is paid every single session and nobody notices.
+        log("XLA cache WARNING: NOT persistent -- this directory lives on the VM "
+            "and is lost at the next allocation; set ANIMA_XLA_CACHE="
+            + DRIVE_XLA + " to keep it")
 except Exception as e:
     log(f"XLA cache disabled ({type(e).__name__}: {e}); compiling every boot")
     XLA_CACHE = ""
@@ -138,8 +156,16 @@ def write_prog(**kw):
         pass
 
 t_all = time.perf_counter()
-snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers", cache_dir="/content/hf_cache")
-aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", cache_dir="/content/hf_cache",
+# Weight cache: the two snapshot_download calls below used to hardcode
+# /content/hf_cache, which ignored HF_HOME entirely -- so weights pre-fetched
+# into Drive were never used and every session paid the ~5.6 GB download again.
+# ANIMA_HF_CACHE wins, then HF_HOME, then the old VM-local path.
+HF_CACHE = (os.environ.get("ANIMA_HF_CACHE") or os.environ.get("HF_HOME")
+            or "/content/hf_cache")
+os.makedirs(HF_CACHE, exist_ok=True)
+log(f"weight cache (HF): {HF_CACHE} (persistent={HF_CACHE.startswith('/content/drive/')})")
+snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers", cache_dir=HF_CACHE)
+aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", cache_dir=HF_CACHE,
                                        allow_patterns=["split_files/diffusion_models/anima-aesthetic-v1.1.safetensors"])
 import shutil
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
