@@ -164,12 +164,21 @@ HF_CACHE = (os.environ.get("ANIMA_HF_CACHE") or os.environ.get("HF_HOME")
             or "/content/hf_cache")
 os.makedirs(HF_CACHE, exist_ok=True)
 log(f"weight cache (HF): {HF_CACHE} (persistent={HF_CACHE.startswith('/content/drive/')})")
-snapshot_dir = snapshot_download("circlestone-labs/Anima-Base-v1.0-Diffusers", cache_dir=HF_CACHE)
-aesthetic_snapshot = snapshot_download("circlestone-labs/Anima", cache_dir=HF_CACHE,
-                                       allow_patterns=["split_files/diffusion_models/anima-aesthetic-v1.1.safetensors"])
+# Weight sources are overridable from the notebook's "links" cell via env; empty
+# = the standard Anima aesthetic family. Each is an HF repo id that
+# snapshot_download / from_pretrained can resolve (the base repo must carry the
+# tokenizer / text_encoder / t5_tokenizer subfolders the loader reads).
+BASE_REPO = os.environ.get("ANIMA_BASE_REPO", "circlestone-labs/Anima-Base-v1.0-Diffusers").strip()
+AESTHETIC_REPO = os.environ.get("ANIMA_AESTHETIC_REPO", "circlestone-labs/Anima").strip()
+AESTHETIC_FILE = os.environ.get("ANIMA_AESTHETIC_FILE",
+                                "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors").strip()
+log(f"weight sources: base={BASE_REPO} | aesthetic={AESTHETIC_REPO}/{AESTHETIC_FILE}")
+snapshot_dir = snapshot_download(BASE_REPO, cache_dir=HF_CACHE)
+aesthetic_snapshot = snapshot_download(AESTHETIC_REPO, cache_dir=HF_CACHE,
+                                       allow_patterns=[AESTHETIC_FILE])
 import shutil
 aesthetic_path = "/content/aesthetic_v1.1.safetensors"
-_src = os.path.join(aesthetic_snapshot, "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors")
+_src = os.path.join(aesthetic_snapshot, AESTHETIC_FILE)
 if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
     shutil.copyfile(_src, aesthetic_path)
 log(f"base weights at {snapshot_dir}")
@@ -179,11 +188,11 @@ log("=== SERVER: torch tokenizer + TPU Qwen3 load (once) ===")
 t0 = time.perf_counter()
 from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
 from tokenizers import Tokenizer as _RawTokenizer
-tok = AutoTokenizer.from_pretrained("circlestone-labs/Anima-Base-v1.0-Diffusers", subfolder="tokenizer")
+tok = AutoTokenizer.from_pretrained(BASE_REPO, subfolder="tokenizer")
 _t5 = _RawTokenizer.from_file(os.path.join(snapshot_dir, "t5_tokenizer", "tokenizer.json"))
 _t5.enable_padding(pad_id=0, pad_token="<pad>", length=512)
 _t5.enable_truncation(max_length=512)
-pc = HFAutoConfig.from_pretrained("circlestone-labs/Anima-Base-v1.0-Diffusers", subfolder="text_encoder")
+pc = HFAutoConfig.from_pretrained(BASE_REPO, subfolder="text_encoder")
 rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
 qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
     intermediate_size=pc.intermediate_size, num_hidden_layers=pc.num_hidden_layers,
