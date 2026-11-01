@@ -32,6 +32,13 @@ STATE_PATH = "/content/anima_download.json"
 UA = "Mozilla/5.0 (X11; Linux x86_64) anima-lora-fetch/1.0"
 CHUNK = 1 << 16
 
+# Auth tokens come from the environment; the notebook's config form sets them and
+# the UI's launcher inherits them, so the user never edits code. Empty = public
+# files only. HF accepts a Bearer header; CivitAI wants the token in the query
+# string on its download route.
+HF_TOKEN = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+CIVITAI_TOKEN = (os.environ.get("ANIMA_CIVITAI_TOKEN") or "").strip()
+
 
 def write_state(**kw):
     kw.setdefault("t", time.time())
@@ -100,8 +107,16 @@ def resolve_url(url, name_hint=""):
                 params[k] = v
         version = params.get("modelVersionId") or params.get("version") or ""
         dl = f"https://civitai.com/api/download/models/{model_id}"
+        query = []
         if version:
-            dl += f"?version={version}"
+            query.append(f"version={version}")
+        user_token = params.get("token", "")
+        if user_token:
+            query.append(f"token={user_token}")   # keep a token the user put in the link
+        elif CIVITAI_TOKEN:
+            query.append(f"token={CIVITAI_TOKEN}")  # otherwise use the session token
+        if query:
+            dl += "?" + "&".join(query)
         return dl, sanitize_name(name_hint or f"civitai_{model_id}")
 
     # ---- anything else that is a direct file -------------------------------
@@ -123,7 +138,10 @@ def hf_pick_file(repo_url):
         raise ValueError("not a HuggingFace repo link")
     owner, repo = m.group(1), m.group(2)
     api = f"https://huggingface.co/api/models/{owner}/{repo}"
-    req = urllib.request.Request(api, headers={"User-Agent": UA})
+    hdrs = {"User-Agent": UA}
+    if HF_TOKEN:
+        hdrs["Authorization"] = f"Bearer {HF_TOKEN}"
+    req = urllib.request.Request(api, headers=hdrs)
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8"))
     files = [s.get("rfilename", "") for s in data.get("siblings", [])]
@@ -165,7 +183,12 @@ def validate_safetensors(path):
 
 def download(dl_url, target):
     """Stream to target, publishing progress. Removes a partial file on failure."""
-    req = urllib.request.Request(dl_url, headers={"User-Agent": UA})
+    hdrs = {"User-Agent": UA}
+    # Gated HuggingFace repos need the Bearer token; the CivitAI token was
+    # already folded into dl_url's query string by resolve_url.
+    if "huggingface.co" in dl_url and HF_TOKEN:
+        hdrs["Authorization"] = f"Bearer {HF_TOKEN}"
+    req = urllib.request.Request(dl_url, headers=hdrs)
     tmp = target + ".part"
     with urllib.request.urlopen(req, timeout=60) as r:
         total = int(r.headers.get("Content-Length") or 0)
