@@ -35,14 +35,20 @@ Combinators (processed after schedule expansion):
 Also handled: `#` comments to end of line, `STYLE(mode)` weight-mode override,
 `NOSTRIP()` (accepted, whitespace already preserved here).
 
-Deliberately out of scope: LoRA scheduling (our LoRA is merged at boot before
-the sampler exists), regional prompting / MASK / COUPLE / CUT, TE() per-encoder
-prompts, SDXL(), NOISE(), macros and Jinja templating.
+Deliberately out of scope: regional prompting / MASK / COUPLE / CUT, TE()
+per-encoder prompts, SDXL(), NOISE(), macros and Jinja templating.
+
+LoRA tags (`<lora:name:0.8>`) ARE parsed here, but with one honest difference
+from A1111: Anima merges LoRA deltas into the weights before the sampler
+exists, so a strength holds for the whole generation and changing it costs a
+re-merge. Per-step LoRA scheduling is therefore impossible, and the second
+number in `<lora:name:0.8:0.6>` (CLIP strength) has nothing to act on.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import random
 import re
 import numpy as np
@@ -506,6 +512,140 @@ def preprocess(text, weight_mode="comfy"):
         text = _STYLE_RE.sub("", text)
     text = _NOSTRIP_RE.sub("", text)
     return text, mode
+
+
+# --------------------------------------------------------------------------- #
+# LoRA tags: <lora:name:0.8>  (A1111-compatible selection syntax)
+# --------------------------------------------------------------------------- #
+# This only *selects* LoRAs and their strengths -- it does not apply them. The
+# caller diffs `specs` against what is currently merged and re-merges if they
+# differ, because the delta lives in the weights rather than in the forward pass.
+#
+# Decisions, each of which could reasonably go the other way:
+#   * the tag is stripped from the text before parsing, so it never reaches the
+#     text encoder as literal tokens;
+#   * `<lora:name:0.8:0.6>` is accepted but the second number (CLIP strength) is
+#     counted in `ignored_clip` and dropped -- there is no text-encoder merge;
+#   * a tag naming the same file twice keeps the LAST strength, like a dict of
+#     overrides;
+#   * an unresolvable name is REPORTED, never silently dropped. A quiet failure
+#     here would render at base strength and look like success.
+_LORA_TAG_RE = re.compile(r"<\s*lora\s*:\s*([^<>]+?)\s*>", re.IGNORECASE)
+_LORA_SCALE_CLAMP = 4.0
+
+
+def _to_float(s):
+    try:
+        return float(s), True
+    except (TypeError, ValueError):
+        return None, False
+
+
+def strip_lora_tags(text):
+    """Return (text_without_tags, [(name, scale, clip_scale_or_None), ...])."""
+    found = []
+
+    def _sub(m):
+        parts = [p.strip() for p in (m.group(1) or "").split(":")]
+        name = parts[0] if parts else ""
+        if not name:
+            return " "
+        scale, ok = _to_float(parts[1]) if len(parts) > 1 and parts[1] else (1.0, True)
+        if not ok:
+            scale = 1.0
+        clip = None
+        if len(parts) > 2 and parts[2]:
+            clip, _ = _to_float(parts[2])
+        found.append((name, scale, clip))
+        return " "
+
+    clean = _LORA_TAG_RE.sub(_sub, text or "")
+    # Tidy the hole the tag left behind without touching intentional grouping.
+    # A tag between two commas ("a, <lora:x>, b") leaves "a,, b", so collapse
+    # repeated separators as well as the whitespace around the gap.
+    clean = re.sub(r"[ \t]{2,}", " ", clean)
+    clean = re.sub(r"\s+([,)\]])", r"\1", clean)
+    clean = re.sub(r"([(\[])\s+", r"\1", clean)
+    clean = re.sub(r",(\s*,)+", ",", clean)
+    # A tag at the very end ("blurry, <lora:x>") leaves a dangling separator.
+    clean = re.sub(r"^[,;\s]+|[,;\s]+$", "", clean)
+    return clean.strip(), found
+
+
+def lora_index(installed):
+    """Map lowercased filename-without-extension -> full path."""
+    idx = {}
+    for p in installed or []:
+        p = str(p)
+        base = os.path.basename(p)
+        stem = base[:-len(".safetensors")] if base.lower().endswith(".safetensors") \
+            else os.path.splitext(base)[0]
+        idx.setdefault(stem.lower(), p)
+    return idx
+
+
+def resolve_lora_name(name, idx):
+    """Find an installed file for a tag's name. Extension and case are optional."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    if os.path.isabs(name) and os.path.isfile(name):
+        return name
+    stem = os.path.basename(name)
+    if stem.lower().endswith(".safetensors"):
+        stem = stem[:-len(".safetensors")]
+    hit = idx.get(stem.lower())
+    if hit:
+        return hit
+    return idx.get(name.lower())
+
+
+def parse_lora_tags(text, installed=None, clamp=_LORA_SCALE_CLAMP):
+    """Extract LoRA selections from `text`.
+
+    Returns a dict::
+
+        clean        prompt with every <lora:...> tag removed
+        specs        [(path, scale), ...] in first-seen order, deduplicated
+        unresolved   names that matched no installed file
+        ignored_clip how many tags carried a second (CLIP) number
+        clamped      how many strengths were pulled into [-clamp, +clamp]
+
+    `specs` is deliberately in a stable shape so a caller can compare two of
+    them cheaply with `lora_specs_key`.
+    """
+    clean, found = strip_lora_tags(text)
+    idx = lora_index(installed)
+    seen, unresolved = {}, []
+    ignored_clip = clamped = 0
+    # `<lora:none>` is the explicit way back to the bare base. Without it there
+    # is no prompt-level way to clear a stack, because "no tags" deliberately
+    # means "leave the weights as they are".
+    clear = any(name.strip().lower() == "none" for name, _s, _c in found)
+    for name, scale, clip in found:
+        if name.strip().lower() == "none":
+            continue
+        if clip is not None:
+            ignored_clip += 1
+        s = max(-clamp, min(clamp, float(scale)))
+        if s != float(scale):
+            clamped += 1
+        path = resolve_lora_name(name, idx)
+        if not path:
+            if name.lower() not in [u.lower() for u in unresolved]:
+                unresolved.append(name)
+            continue
+        seen[path] = s          # last occurrence wins
+    specs = [] if clear else [(p, s) for p, s in seen.items()]
+    return {"clean": clean, "specs": specs,
+            "unresolved": unresolved, "ignored_clip": ignored_clip,
+            "clamped": clamped, "found": len(found), "clear": clear}
+
+
+def lora_specs_key(specs):
+    """Order-independent identity of a merge spec, for change detection."""
+    return tuple(sorted((os.path.basename(str(p)), round(float(s), 4))
+                        for p, s in (specs or [])))
 
 
 def parse(text, weight_mode="comfy"):
