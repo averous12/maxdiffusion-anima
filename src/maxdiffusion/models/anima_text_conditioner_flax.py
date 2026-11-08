@@ -76,6 +76,9 @@ def convert_anima_aesthetic_adapter_weights(path, params, dtype=jnp.bfloat16):
   prefix = "model.diffusion_model.llm_adapter."
   with safe_open(path, framework="pt", device="cpu") as f:
     keys = set(f.keys())
+    # Single-file ComfyUI checkpoints name the same tensors `net.llm_adapter.*`.
+    if f"{prefix}embed.weight" not in keys and "net.llm_adapter.embed.weight" in keys:
+      prefix = "net.llm_adapter."
     def put(dst, src, tr=False):
       key = prefix + src
       if key not in keys: raise KeyError(f"Missing aesthetic adapter key: {key}")

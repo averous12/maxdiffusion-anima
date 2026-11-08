@@ -115,13 +115,21 @@ class _Attention(nn.Module):
   context_dim: Optional[int] = None
   cross: bool = False
   @nn.compact
-  def __call__(self, x, context=None, cos=None, sin=None, mask=None):
+  def __call__(self, x, context=None, cos=None, sin=None, mask=None, lora=None,
+               ref_kv=None, ref_bias=None, record=False):
+    """Self/cross attention. `lora`, `ref_kv`, `ref_bias`, `record` are SnapRef-only and
+    default to the plain path, which stays bit-identical (no extra op is emitted).
+
+    ref_kv: (k, v) [1, S_ref, heads, head_dim] cached reference keys/values, already RoPE'd;
+    they are prepended to this call's own keys. ref_bias: [S_ref + S] additive log-scale bias
+    on the attention scores, the SnapRef `strength` / per-reference weights.
+    """
     ctx = x if context is None else context
     d = self.hidden // self.heads
     qd = self.hidden // self.heads
-    q = nn.Dense(self.hidden, use_bias=False, name="to_q")(x).reshape(x.shape[0], x.shape[1], self.heads, qd)
-    k = nn.Dense(self.hidden, use_bias=False, name="to_k")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
-    v = nn.Dense(self.hidden, use_bias=False, name="to_v")(ctx).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    q = self._proj(x, "to_q", lora, self.hidden).reshape(x.shape[0], x.shape[1], self.heads, qd)
+    k = self._proj(ctx, "to_k", lora, self.hidden).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    v = self._proj(ctx, "to_v", lora, self.hidden).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
     q = _rms(q, self.param("norm_q", nn.initializers.ones, (qd,)))
     k = _rms(k, self.param("norm_k", nn.initializers.ones, (qd,)))
     if not self.cross and cos is not None:
@@ -129,13 +137,37 @@ class _Attention(nn.Module):
       q = q.astype(jnp.float32); k = k.astype(jnp.float32)
       q = q * cos[None, :, None, :] + _rotate_pairs(q) * sin[None, :, None, :]
       k = k * cos[None, :, None, :] + _rotate_pairs(k) * sin[None, :, None, :]
+    if ref_kv is not None:
+      k_r, v_r = ref_kv
+      k_r = jnp.broadcast_to(k_r, (k.shape[0],) + k_r.shape[1:]).astype(k.dtype)
+      v_r = jnp.broadcast_to(v_r, (v.shape[0],) + v_r.shape[1:]).astype(v.dtype)
+      k = jnp.concatenate([k_r, k], axis=1)
+      v = jnp.concatenate([v_r, v], axis=1)
     scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) / math.sqrt(d)
+    if ref_bias is not None:
+      scores = scores + ref_bias.astype(jnp.float32)[None, None, None, :]
     if mask is not None:
       scores = jnp.where(mask[:, None, None, :].astype(bool), scores, -1e4)
     y = jnp.einsum("bhqk,bkhd->bqhd", nn.softmax(scores, axis=-1).astype(jnp.float32), v.astype(jnp.float32))
     b, q_len, h, d = y.shape
     y = y.reshape(b, q_len, h * d)
-    return nn.Dense(self.hidden, use_bias=False, name="to_out")(y)
+    out = self._proj(y, "to_out", lora, self.hidden)
+    return (out, (k, v)) if record else out
+
+  def _proj(self, x, name, lora, out_features):
+    """Dense projection plus an optional SnapRef LoRA delta: delta = (x @ A) @ B.
+
+    A is (in_features, rank), B is (rank, out_features) — the adapter file stores torch's
+    (rank, in) / (out, rank), transposed once at load time. `out_features` is explicit because
+    cross-attention projects the context (context_dim) up to `hidden`.
+    """
+    y = nn.Dense(out_features, use_bias=False, name=name)(x)
+    pair = None if lora is None else lora.get(name)
+    if pair is not None:
+      A, B = pair
+      xf = x.astype(jnp.float32)
+      y = y + (xf @ A.astype(jnp.float32)) @ B.astype(jnp.float32)
+    return y
 
 
 class _Block(nn.Module):
@@ -144,34 +176,108 @@ class _Block(nn.Module):
   context_dim: int
   adaln_dim: int
   @nn.compact
-  def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask=None):
+  def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask=None,
+               lora=None, ref_kv=None, ref_bias=None, record=False):
     h, gate1 = _AdaLN(self.hidden, self.adaln_dim, name="norm1")(x.astype(jnp.float32), embedded_timestep, temb)
     # fp32 residual accumulation: bf16 activations in, fp32 adds out.
-    x = x.astype(jnp.float32) + gate1 * _Attention(self.hidden, self.heads, name="attn1")(h, cos=cos, sin=sin).astype(jnp.float32)
+    attn1 = _Attention(self.hidden, self.heads, name="attn1")
+    if record:
+      y, kv = attn1(h, cos=cos, sin=sin, lora=_sub(lora, "attn1"), ref_kv=ref_kv,
+                    ref_bias=ref_bias, record=True)
+    else:
+      y = attn1(h, cos=cos, sin=sin, lora=_sub(lora, "attn1"), ref_kv=ref_kv, ref_bias=ref_bias)
+    x = x.astype(jnp.float32) + gate1 * y.astype(jnp.float32)
     h, gate2 = _AdaLN(self.hidden, self.adaln_dim, name="norm2")(x, embedded_timestep, temb)
-    x = x + gate2 * _Attention(self.hidden, self.heads, self.context_dim, cross=True, name="attn2")(h, context=context, mask=mask).astype(jnp.float32)
+    x = x + gate2 * _Attention(self.hidden, self.heads, self.context_dim, cross=True, name="attn2")(
+        h, context=context, mask=mask, lora=_sub(lora, "attn2")).astype(jnp.float32)
     h, gate3 = _AdaLN(self.hidden, self.adaln_dim, name="norm3")(x, embedded_timestep, temb)
-    h = nn.Dense(self.hidden * 4, use_bias=False, name="ff_in")(h)
+    h = _lora_dense(nn.Dense(self.hidden * 4, use_bias=False, name="ff_in"), h, _sub(lora, "ff_in"))
     h = nn.gelu(h, approximate=False)
-    x = x.astype(jnp.float32) + gate3.astype(jnp.float32) * nn.Dense(self.hidden, use_bias=False, name="ff_out")(h).astype(jnp.float32)
-    return x
+    ff = _lora_dense(nn.Dense(self.hidden, use_bias=False, name="ff_out"), h, _sub(lora, "ff_out"))
+    x = x.astype(jnp.float32) + gate3.astype(jnp.float32) * ff.astype(jnp.float32)
+    return (x, kv) if record else x
+
+
+def _sub(lora, key):
+  """The LoRA sub-dict for one sublayer, or None."""
+  return None if lora is None else lora.get(key)
+
+
+def _lora_dense(dense, x, lora):
+  """Dense(ff_in/ff_out) plus a SnapRef LoRA delta: y = Dense(x) + (x @ A) @ B."""
+  y = dense(x)
+  if lora is not None:
+    A, B = lora["self"]
+    xf = x.astype(jnp.float32)
+    y = y + (xf @ A.astype(jnp.float32)) @ B.astype(jnp.float32)
+  return y
 
 
 class _ScannedBlock(nn.Module):
   """One transformer block, in the shape nn.scan needs.
 
-  Returns (carry, output) — identical here — so the residual stream threads
-  through the scan. Params get a leading axis of length `layers`.
+  Returns (carry, output) — identical here except when `record` is set, where the output is
+  the self-attention (k, v) of this layer, so the scan stacks them per layer (SnapRef's
+  reference pass). Params get a leading axis of length `layers`; `lora`, `ref_kv` come in as
+  scan *inputs* with the same leading axis, so no second copy of the weights is needed.
   """
   hidden: int
   heads: int
   context_dim: int
   adaln_dim: int
+  record: bool = False
   @nn.compact
-  def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask):
+  def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask, lora=None,
+               ref_kv=None, ref_bias=None):
     out = _Block(self.hidden, self.heads, self.context_dim, self.adaln_dim, name="b")(
-        x, embedded_timestep, temb, context, cos, sin, mask)
+        x, embedded_timestep, temb, context, cos, sin, mask,
+        lora=lora, ref_kv=ref_kv, ref_bias=ref_bias, record=self.record)
+    if self.record:
+      out, kv = out
+      return out, kv
     return out, out
+
+
+def snapref_in_axes(tree):
+  """nn.scan in_axes for a SnapRef extra argument: per-layer (axis 0) leaves, None if absent.
+
+  The Anima blocks are scanned, so a per-layer LoRA / reference K/V can only ride through
+  the loop as a scan *input* — this is what keeps the transformer weights to a single copy
+  (no merged duplicate of the 4 GB param tree per stream).
+  """
+  if tree is None:
+    return None
+  return jax.tree_util.tree_map(lambda _x: 0, tree)
+
+
+def layer_slice(tree, i):
+  """One layer's entry of a stacked SnapRef extra argument (unrolled block path)."""
+  if tree is None:
+    return None
+  return jax.tree_util.tree_map(lambda x: x[i], tree)
+
+
+def cosmos_rope_from_positions(t_pos, h_pos, w_pos, head_dim, rope_scale=(1.0, 4.0, 4.0), dtype=jnp.float32):
+  """cosmos_rope for explicit per-token positions instead of an arange grid.
+
+  The SnapRef reference stream sits at its own temporal position (ref_t) and is centred on
+  the target's token grid, which the `grid=` form of cosmos_rope cannot express.
+  """
+  dh = head_dim // 6 * 2
+  dw = dh
+  dt = head_dim - dh - dw
+
+  def axis(positions, d, scale):
+    theta = 10000.0 * scale ** (d / (d - 2))
+    inv = 1.0 / (theta ** (jnp.arange(0, d, 2, dtype=jnp.float32) / d))
+    return positions.astype(jnp.float32)[:, None] * inv[None, :]
+
+  ft = axis(t_pos, dt, rope_scale[0])
+  fh = axis(h_pos, dh, rope_scale[1])
+  fw = axis(w_pos, dw, rope_scale[2])
+  f = jnp.concatenate([ft, fh, fw], axis=-1)
+  e = jnp.concatenate([f, f], axis=-1)
+  return jnp.cos(e).astype(dtype), jnp.sin(e).astype(dtype)
 
 
 def _nearest_resize_mask(mask, h, w):
@@ -202,8 +308,11 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   active_layers: Optional[int] = None
   scan_blocks: bool = True  # lax.scan over blocks: one compiled body, not 28
   diag_sync: bool = False  # diagnostic only: block_until_ready per stage (destroys perf)
+  record_kv: bool = False  # SnapRef reference pass: return every layer's self-attention (k, v)
   @nn.compact
-  def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None, padding_mask=None):
+  def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None,
+               padding_mask=None, rope_override=None, t_embed_add=None, lora=None,
+               ref_kv=None, ref_bias=None):
     b, c, t, h, w = hidden_states.shape
     if padding_mask is None:
       padding_mask = jnp.zeros((b, 1, h, w), dtype=hidden_states.dtype)
@@ -230,8 +339,17 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     temb = nn.Dense(3 * hidden, use_bias=False, name="time_embed_linear_2", dtype=jnp.float32, param_dtype=jnp.float32)(temb)
     # Stream 2: embedded_timestep = RMS(tproj); flows through each AdaLN's own MLP
     embedded_timestep = _rms(tproj, self.param("time_embed_norm", nn.initializers.ones, (hidden,)))
+    if t_embed_add is not None:
+      # SnapRef `mode` (cs / char): a learned offset on the thin timestep stream, added where
+      # the ComfyUI node adds adapter.mode_embed to t_emb after t_embedding_norm. This port
+      # has no temporal axis in tproj (shape (b, hidden)), so the offset is 1-D per batch.
+      embedded_timestep = embedded_timestep + t_embed_add.astype(jnp.float32)[None, :]
     grid = (t // self.patch_size[0], h // self.patch_size[1], w // self.patch_size[2])
     cos, sin = cosmos_rope(x.shape[1], self.head_dim, jnp.float32, self.rope_scale, grid)
+    if rope_override is not None:
+      # SnapRef reference pass: the reference sits at its own temporal position (ref_t) and
+      # centred in the target's token grid, so cos/sin cannot come from the default grid.
+      cos, sin = rope_override
     if self.scan_blocks:
       # One block body compiled once and looped, instead of 28 unrolled
       # subgraphs. This is what keeps host compile memory bounded.
@@ -241,16 +359,25 @@ class FlaxAnimaCosmosTransformer(nn.Module):
           variable_axes={"params": 0},
           split_rngs={"params": False},
           length=n,
-          in_axes=(_scan_broadcast,) * 6,
+          in_axes=(_scan_broadcast,) * 6 + (snapref_in_axes(lora), snapref_in_axes(ref_kv),
+                                            _scan_broadcast),
       )
-      x, _ = ScanBlock(hidden, self.heads, self.context_dim, self.adaln_dim, name="scan")(
-          x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+      x, kv = ScanBlock(hidden, self.heads, self.context_dim, self.adaln_dim,
+                        record=self.record_kv, name="scan")(
+          x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask,
+          lora, ref_kv, ref_bias)
       x = x.astype(jnp.float32)
     else:
+      kv = None
       for i in range(self.layers):
         if self.active_layers is not None and i >= self.active_layers:
           break
-        x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask)
+        x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(
+            x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask,
+            lora=layer_slice(lora, i), ref_kv=layer_slice(ref_kv, i), ref_bias=ref_bias,
+            record=self.record_kv)
+        if self.record_kv:
+          x, kv = x
         x = x.astype(jnp.float32)
         if self.diag_sync:
           try:
@@ -266,7 +393,8 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x.astype(jnp.float32))
     y = y * (1 + scale[:, None, :]) + shift[:, None, :]
     y = nn.Dense(self.out_channels * self.patch_size[0] * self.patch_size[1] * self.patch_size[2], use_bias=False, name="proj_out", dtype=jnp.float32, param_dtype=jnp.float32)(y)
-    return cosmos_unpatchify(y, self.out_channels, (t, h, w), self.patch_size)
+    out = cosmos_unpatchify(y, self.out_channels, (t, h, w), self.patch_size)
+    return (out, kv) if self.record_kv else out
 
 
 def _transpose_weight(value):
@@ -308,9 +436,15 @@ def stack_block_params(converted, num_layers):
 
 def _aesthetic_get(available, name):
   key = f"model.diffusion_model.{name}"
-  if key not in available:
-    raise KeyError(f"Missing Anima aesthetic key: {key}")
-  return key
+  if key in available:
+    return key
+  # Single-file ComfyUI checkpoints (circlestone-labs/Anima split_files/diffusion_models/
+  # *.safetensors) use the `net.` prefix for the same tensors. Accept both so either source
+  # works; the aesthetic-named diffusers layout is still tried first.
+  alt = f"net.{name}"
+  if alt in available:
+    return alt
+  raise KeyError(f"Missing Anima aesthetic key: {key}")
 
 
 def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfloat16, num_layers=28, stacked=True):
@@ -382,7 +516,8 @@ def convert_anima_aesthetic_weights(safetensors_path, flax_params, dtype=jnp.bfl
     extras = set(tensors.keys()) - consumed
     if extras:
       # The LLM adapter is validated by its separate converter.
-      all_extras = {x for x in extras if x != "__metadata__" and not x.startswith("model.diffusion_model.llm_adapter.")}
+      all_extras = {x for x in extras if x != "__metadata__"
+                    and not x.startswith(("model.diffusion_model.llm_adapter.", "net.llm_adapter."))}
       if all_extras:
         raise ValueError(f"Unconsumed aesthetic transformer keys: {sorted(all_extras)[:10]}")
   return unflatten_dict(converted)

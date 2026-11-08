@@ -70,9 +70,15 @@ except ImportError:
   machinelearning_run = None
   xprof = None
 
-from tensorboardX import writer
+try:
+  from tensorboardX import writer
+except ImportError:  # optional dependency (used only for TensorBoard summaries)
+  writer = None
 
-from google.cloud import storage
+try:
+  from google.cloud import storage
+except ImportError:  # optional: only GCS checkpoint helpers use it
+  storage = None
 
 FrozenDict = core.frozen_dict.FrozenDict
 _ml_run = None

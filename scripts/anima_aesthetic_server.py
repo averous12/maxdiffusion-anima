@@ -2,7 +2,7 @@ import os
 import subprocess
 import sys
 
-repo = "/content/maxdiffusion"
+repo = os.environ.get("ANIMA_REPO", "/content/maxdiffusion")
 venv = repo + "/.venv"
 # Prefer the repo venv when it exists; otherwise fall back to the running
 # interpreter so the server also works in sessions that pip-installed into the
@@ -14,15 +14,19 @@ else:
     py = sys.executable
     _path_prefix = ""
 env = {**os.environ, "PATH": _path_prefix + "/usr/local/bin:" + os.environ["PATH"],
-       "PYTHONPATH": repo + "/src", "HF_HOME": "/content/hf_cache",
+       "PYTHONPATH": repo + "/src", "HF_HOME": os.environ.get("HF_HOME", "/content/hf_cache"),
        "PYTHONUNBUFFERED": "1", "MPLBACKEND": "agg"}
 env.pop("UV_SYSTEM_PYTHON", None)
 print("server interpreter:", py, flush=True)
 
 code = r'''
+import os
 import time
 
-LOG = open("/content/anima_server.log", "a", buffering=1)
+# Content root. Colab keeps the historical /content; ANIMA_CONTENT_ROOT lets the same
+# script run (and be tested) on a normal machine without touching any other default.
+CROOT = os.environ.get("ANIMA_CONTENT_ROOT", "/content")
+LOG = open(os.path.join(CROOT, "anima_server.log"), "a", buffering=1)
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
@@ -36,7 +40,12 @@ def rss_gb():
                     return int(line.split()[1]) / 1e6
     except Exception:
         pass
-    return 0.0
+    # Non-Linux fallback (local CPU runs of this same script): keep the field meaningful.
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:
+        return 0.0
 
 def hbm_stats():
     try:
@@ -57,7 +66,7 @@ import traceback
 import faulthandler
 # Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
 # It dumps the live stack of every thread once, which is what localizes a stall.
-faulthandler.dump_traceback_later(1800, exit=False)
+faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
 import jax
 jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 
@@ -109,6 +118,7 @@ from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
     convert_anima_aesthetic_adapter_weights)
 from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_loras
+from maxdiffusion.models import anima_snapref_flax as anima_snapref
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -137,14 +147,21 @@ log(f"HBM at boot: {hbm_stats()}")
 # ("TypeError: can not serialize 'State' object") that killed the server outright
 # whenever the cache was invalid.
 # ---------------------------------------------------------------------------
-_CPU = jax.devices("cpu")[0]
+# The project's Colab venv installs a TPU-only jax build, where jax.devices("cpu")
+# raises "Unknown backend cpu". Fall back to the default device so the host-side
+# weight conversion still runs (it just happens on the TPU device instead).
+try:
+    _CPU = jax.devices("cpu")[0]
+except (RuntimeError, ValueError):
+    _CPU = jax.devices()[0]
+    log(f"no CPU backend in this jax build; host conversion uses {_CPU.device_kind}")
 
-CACHE_DIR = "/content/anima_cache"  # retained for the HF cache only; no param cache
-REQ_PATH = "/content/anima_request.json"
-PROG_PATH = "/content/anima_progress.json"
-SNAP_PATH = "/content/anima_snap.png"
+CACHE_DIR = os.path.join(CROOT, "anima_cache")  # retained for the HF cache only; no param cache
+REQ_PATH = os.path.join(CROOT, "anima_request.json")
+PROG_PATH = os.path.join(CROOT, "anima_progress.json")
+SNAP_PATH = os.path.join(CROOT, "anima_snap.png")
 # The client creates this file to cancel the running generation.
-INTERRUPT_PATH = "/content/anima_interrupt"
+INTERRUPT_PATH = os.path.join(CROOT, "anima_interrupt")
 
 def write_prog(**kw):
     try:
@@ -177,7 +194,7 @@ snapshot_dir = snapshot_download(BASE_REPO, cache_dir=HF_CACHE)
 aesthetic_snapshot = snapshot_download(AESTHETIC_REPO, cache_dir=HF_CACHE,
                                        allow_patterns=[AESTHETIC_FILE])
 import shutil
-aesthetic_path = "/content/aesthetic_v1.1.safetensors"
+aesthetic_path = os.path.join(CROOT, os.path.basename(AESTHETIC_FILE))
 _src = os.path.join(aesthetic_snapshot, AESTHETIC_FILE)
 if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
     shutil.copyfile(_src, aesthetic_path)
@@ -395,6 +412,48 @@ log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
 # --- Optional LoRA merge (must happen on CPU before device_put) ---
 # ANIMA_LORAS is a JSON list of {"path": ..., "scale": ...} merged in one pass.
 # ANIMA_LORA_PATH / ANIMA_LORA_SCALE remain supported for a single LoRA.
+def swap_loras(specs):
+    """Rebuild t_params from the pristine as-booted weights with `specs` merged.
+
+    No restart, no torch->jax re-conversion, no VAE reload, no warmup, no XLA
+    compile: the transformer's executable is keyed on shapes, not values, so the
+    new weight arrays reuse it. Measured ~1.1 s for a real 665 MB CivitAI LoRA
+    against 366 s for a reboot.
+
+    `specs` is [] to go back to the bare base model.
+    """
+    global t_params, _LORA_SPECS
+    t0 = time.perf_counter()
+    work = dict(_T_PARAMS_PRISTINE)
+    stats = {"merged": 0, "skipped": 0, "details": []}
+    t_merge = 0.0
+    if specs:
+        # The merger mutates the dict it is handed, so it gets a shallow copy of
+        # the pristine tree and never the tree itself -- otherwise repeated
+        # swaps would stack deltas and drift.
+        os.environ["ANIMA_MERGE_DEVICE"] = "device"
+        tm = time.perf_counter()
+        work, stats = load_and_merge_anima_loras(work, specs, dtype=jnp.bfloat16)
+        t_merge = time.perf_counter() - tm
+    # Split the two costs: the merge is compute (one-time kernel compiles on the
+    # first call), the device_put is 3.9 GB of host->accelerator traffic and is
+    # paid on every single swap, LoRA or not.
+    tp = time.perf_counter()
+    t_params = jax.device_put(work, jax.devices()[0])
+    jax.tree_util.tree_map(lambda x: x.block_until_ready(), t_params)
+    t_put = time.perf_counter() - tp
+    del work
+    secs = time.perf_counter() - t0
+    _LORA_SPECS = list(specs)
+    log(f"LoRA swap: merged={stats['merged']} skipped={stats['skipped']} "
+        f"in {secs:.2f}s (merge {t_merge:.2f}s + device_put {t_put:.2f}s) "
+        f"| {[os.path.basename(p) + '@' + str(s) for p, s in specs] or 'base'}"
+        f" | {hbm_stats()}")
+    for d in (stats.get("details") or [])[:5]:
+        log(f"  swap: {d}")
+    return stats, secs, t_merge, t_put
+
+
 def _lora_specs():
     raw = os.environ.get("ANIMA_LORAS", "").strip()
     specs = []
@@ -442,7 +501,36 @@ if lora_specs:
 else:
     log("no LoRA configured (ANIMA_LORAS / ANIMA_LORA_PATH) or file not found")
 
+# What is merged into the weights right now. swap_loras maintains this; seeding
+# it from the boot spec matters because the diff below compares against it -- an
+# empty seed would make the first prompt re-merge a LoRA that is already loaded,
+# and would make a tag-free prompt look like it needed nothing when the boot
+# LoRA was still resident.
+_LORA_SPECS = list(lora_specs)
+
+# Directories scanned for <lora:name:scale> resolution. Both are accepted: the
+# UI's own folder and the one the benchmark tooling downloads into.
+LORA_DIRS = [d for d in (os.environ.get("ANIMA_LORA_DIR", "").strip(),
+                         os.path.join(CROOT, "anima_lora"), os.path.join(CROOT, "loras")) if d]
+
+
+def installed_lora_files():
+    """Every .safetensors under LORA_DIRS, cheapest-first ordered."""
+    out = []
+    for d in LORA_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(".safetensors"):
+                    out.append(os.path.join(root, f))
+    return sorted(set(out))
+
 t0 = time.perf_counter()
+# Keep the as-booted tree alive on the host: it is what every later hot-swap
+# rebuilds from. jax.device_put does not consume the host arrays, so this holds
+# a reference rather than making a copy, and HBM is unchanged.
+_T_PARAMS_PRISTINE = t_params
 t_params = jax.device_put(t_params, jax.devices()[0])
 log(f"transformer params -> TPU in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
 
@@ -482,6 +570,40 @@ def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
 def transformer_forward(tp, lat, t_vec, ctx, pad):
     return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad)
 
+# --- SnapRef (reference adapter) -------------------------------------------------------
+# Every callable below is a *separate* jit with a different signature, so the plain path
+# above keeps its existing executable and behaviour exactly as before. Nothing here runs
+# unless a request carries "snapref".
+# A second module instance whose scan emits every layer's self-attention (k, v): the
+# reference pass needs those, the target pass does not, so they cannot share one instance.
+_SNAPREF_RECORDER = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, record_kv=True)
+
+@jax.jit
+def snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
+    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
+                             lora=lora, ref_kv=refkv, ref_bias=refbias)
+
+@jax.jit
+def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
+    # record_kv is a Module field, not a call argument: a separate instance is what makes the
+    # scan emit every layer's self-attention (k, v) instead of the residual stream alone.
+    return _SNAPREF_RECORDER.apply({"params": tp}, lat,
+                                   jnp.zeros((lat.shape[0],), jnp.float32), ctx, None, pad,
+                                   rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
+
+def snapref_encode_latent(z):
+    """Reference pixels (1,3,1,H,W) in [-1,1] -> sampler-space latent, jitted on (H, W)."""
+    key = (int(z.shape[-2]), int(z.shape[-1]))
+    if key not in _SNAPREF_ENC:
+        _, merged = anima_snapref.encode_reference_latent(vae, z, vae.latents_mean, vae.latents_std)
+        _SNAPREF_ENC_CACHE[key] = (merged,)
+        _SNAPREF_ENC[key] = jax.jit(lambda q, _m=merged: anima_snapref.encode_reference_latent(
+            _m, q, vae.latents_mean, vae.latents_std)[0])
+    return _SNAPREF_ENC[key](z)
+
+_SNAPREF_ENC = {}
+_SNAPREF_ENC_CACHE = {}
+
 def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
     t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
     nc = transformer_forward(t_params, latents, t_vec, context, pad)
@@ -490,9 +612,184 @@ def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
     nu32 = nu.astype(jnp.float32)
     return nu32 + jnp.float32(guidance) * (nc32 - nu32)
 
+# --- SnapRef session: reference prep + reference-aware CFG -------------------------------
+SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
+                            os.path.join(CROOT, "anima_snapref"),
+                            os.path.join(os.path.dirname(LORA_DIRS[0]), "snapref"))
+                if d]
+_SNAPREF_ADAPTERS = {}          # path -> SnapRefAdapter (lazy, one per file)
+_SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
+
+def installed_snapref_files():
+    out = []
+    for d in SNAPREF_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(".safetensors") and ("snapref" in f.lower() or "anima_ref_kv" in f.lower()):
+                    out.append(os.path.join(root, f))
+    return sorted(set(out))
+
+def resolve_snapref_adapter(name):
+    """Accept an absolute path, a bare file name, or '' (the only installed file)."""
+    files = installed_snapref_files()
+    name = (name or "").strip()
+    if not name:
+        if not files:
+            raise anima_snapref.SnapRefError("no SnapRef adapter installed; upload one to "
+                                             + ", ".join(SNAPREF_DIRS))
+        return files[0]
+    if os.path.exists(name):
+        return name
+    for f in files:
+        if os.path.basename(f) == name or os.path.basename(f).rsplit(".", 1)[0] == name:
+            return f
+    raise anima_snapref.SnapRefError(f"SnapRef adapter not found: {name} (have {[os.path.basename(f) for f in files]})")
+
+def get_snapref_adapter(name):
+    path = resolve_snapref_adapter(name)
+    if path not in _SNAPREF_ADAPTERS:
+        t0 = time.perf_counter()
+        _SNAPREF_ADAPTERS[path] = anima_snapref.load_snapref(path, num_layers=28, dtype=jnp.float32)
+        ad = _SNAPREF_ADAPTERS[path]
+        log(f"SnapRef adapter loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)} "
+            f"(streams {list(ad.stream_names())}, ref_t {ad.ref_t}, modes {list(ad.modes)}, "
+            f"mode_embed {None if ad.mode_embed is None else ad.mode_embed.shape})")
+    return _SNAPREF_ADAPTERS[path]
+
+def _load_reference_pixels(path, megapixels):
+    """Reference image file -> (1,3,1,h,w) pixels in [-1,1] at the adapter's reference size."""
+    from PIL import Image, ImageOps
+    img = ImageOps.exif_transpose(Image.open(path))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img, mask=img.split()[3])
+        img = bg
+    img = img.convert("RGB")
+    w, h = anima_snapref.reference_latent_size(img.width, img.height, megapixels)
+    img = img.resize((w, h), Image.LANCZOS)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))[None, :, None]          # (1,3,1,h,w)
+    return jnp.asarray(arr * 2.0 - 1.0), (w, h)
+
+def _snapref_cond_tensor(text):
+    """Encode the optional appearance caption the same way the positive prompt is encoded."""
+    pairs = [(text or "", np.ones(max(1, len(text or "")), np.float32))]
+    qh, qmask, t5ids, t5mask = _encode_text_list(pairs)[0]
+    return cond_forward(cond_params, jnp.asarray(qh, dtype=jnp.float32), jnp.asarray(qmask),
+                        jnp.asarray(t5ids), jnp.asarray(t5mask))
+
+def prepare_snapref(cfg, target_hw):
+    """Encode the reference(s) once per run: one reference pass, cached per-block K/V."""
+    t0 = time.perf_counter()
+    ad = get_snapref_adapter(cfg.get("adapter"))
+    refs = cfg.get("images") or []
+    if not refs:
+        raise anima_snapref.SnapRefError("snapref.images is empty")
+    weights = [float(w) for w in (cfg.get("weights") or [1.0] * len(refs))]
+    if len(weights) != len(refs):
+        raise anima_snapref.SnapRefError("snapref.weights must match snapref.images")
+    if sum(1 for w in weights if w > 0) == 0:
+        raise anima_snapref.SnapRefError("every reference has weight 0")
+    mode = str(cfg.get("mode") or "cs")
+    megapixels = float(cfg.get("ref_megapixels") or 1.0)
+    caption = str(cfg.get("ref_caption") or "")
+    ref_ctx = _snapref_cond_tensor(caption)
+    mode_vec = ad.mode_vector(mode)
+    records, sizes = [], []
+    for path, w in zip(refs, weights):
+        if w <= 0:
+            continue
+        px, (pw, ph) = _load_reference_pixels(path, megapixels)
+        lat = snapref_encode_latent(px)
+        rh, rw = max(1, ph // 16), max(1, pw // 16)      # VAE stride 8, patch 2
+        th, tw = max(1, target_hw[0] // 16), max(1, target_hw[1] // 16)
+        cos, sin = anima_snapref.reference_rope((th, tw), (rh, rw), ad.ref_t)
+        _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
+            (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
+            ad.lora_tree("ref"))
+        kv[0][0].block_until_ready()
+        records.append(kv)
+        sizes.append(int(kv[0][0].shape[1]))
+        log(f"SnapRef reference {os.path.basename(path)} -> {pw}x{ph}px, {sizes[-1]} tokens, weight {w}")
+    cache = anima_snapref.concat_reference_kv(records)
+    size_list = [s for s, w in zip(sizes, [w for w in weights if w > 0])]
+    bias = anima_snapref.key_biases(size_list,
+                                    anima_snapref.reference_biases(cfg.get("strength", 0.0),
+                                                                   [w for w in weights if w > 0]),
+                                    (target_hw[0] // 16) * (target_hw[1] // 16))
+    _SNAPREF_STATE["kv"] = cache
+    secs = time.perf_counter() - t0
+    log(f"SnapRef reference cached: {len(records)} image(s), {sum(size_list)} tokens, "
+        f"{secs:.2f}s, mode {mode}, strength {cfg.get('strength', 0.0)}")
+    return {"adapter": os.path.basename(ad.path), "mode": mode, "sizes": size_list,
+            "weights": [w for w in weights if w > 0], "biases": list(bias.shape),
+            "ref_seconds": round(secs, 3), "tokens": int(sum(size_list)),
+            "ref_pixels": [_load_reference_pixels(p, megapixels)[1] for p in refs if True][:len(records)]}
+
+def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidance, cfg):
+    """CFG along the SnapRef branches, then the documented post-CFG steps.
+
+    Off (the trained default): only the positive branch reads the reference, so cfg pushes
+    toward it — exactly the initial CFG per-step sample.
+    ref_in_uncond: both branches read it.
+    fidelity < 1: every row reads it, the negative rows with an extra log(1-f) key bias.
+    ref_guidance_on: both read it, plus one reference-free negative call per step, and
+      guided = base + rg*(uncond_ref - base) + cfg*(cond_ref - uncond_ref), then APG.
+    """
+    cache = _SNAPREF_STATE["kv"]
+    ad = get_snapref_adapter(cfg.get("adapter"))
+    lora = ad.lora_tree("tgt")
+    sizes = list(cfg["_sizes"])
+    biases = [anima_snapref.reference_biases(cfg.get("strength", 0.0), cfg["_weights"])[i]
+              for i in range(len(cfg["_weights"]))]
+    # The transformer patchifies the latent 2x2, so the token count is the latent grid
+    # divided by the patch area -- not the latent pixel count. Using the raw grid made the
+    # reference bias 4x too long and the attention add failed to broadcast.
+    _pa = 2
+    tgt_tokens = (latents.shape[-2] // _pa) * (latents.shape[-1] // _pa)
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
+
+    rg_on = bool(cfg.get("ref_guidance_on"))
+    in_uncond = bool(cfg.get("ref_in_uncond")) or rg_on
+    fid = cfg.get("fidelity", 1.0)
+    ubias = anima_snapref.uncond_bias_for_fidelity(fid, in_uncond, rg_on)
+
+    def run(ctx, extra_bias=0.0, with_ref=True):
+        if not with_ref:
+            return snapref_target_forward(t_params, latents, t_vec, ctx, pad, lora, None, None)
+        b = jnp.asarray(anima_snapref.key_biases(sizes, biases, tgt_tokens, extra_bias))
+        return snapref_target_forward(t_params, latents, t_vec, ctx, pad, lora, cache, b)
+
+    cond_ref = run(context)
+    if not in_uncond and ubias is None:
+        uncond_ref = run(neg_context, with_ref=False)     # trained default
+        base = uncond_ref
+    elif ubias is None:
+        uncond_ref = run(neg_context)
+        base = uncond_ref
+    else:
+        uncond_ref = run(neg_context, extra_bias=ubias)
+        base = None
+
+    cond_ref = cond_ref.astype(jnp.float32)
+    uncond_ref = uncond_ref.astype(jnp.float32)
+    if not rg_on:
+        out = uncond_ref + jnp.float32(guidance) * (cond_ref - uncond_ref)
+    else:
+        if not anima_snapref.guidance_active(float(np.asarray(timestep)), float(cfg.get("ref_end", 1.0))):
+            out = uncond_ref + jnp.float32(guidance) * (cond_ref - uncond_ref)
+        else:
+            base = run(neg_context, with_ref=False).astype(jnp.float32)
+            out = anima_snapref.ref_guidance_combine(cond_ref, uncond_ref, base,
+                                                     guidance, cfg.get("ref_guidance", 4.5))
+        out = anima_snapref.snapref_correct(out, cond_ref, cfg.get("correction") or "apg")
+    return out
+
 def decode_latents(latents):
     """Decode a (B,16,1,h,w) latent batch -> list of B uint8 HxWx3 arrays.
-
     Each sample is decoded on its own, so the (1,...)-shaped VAE executable that warmup
     compiled is reused for every batch size: no per-B recompile, and decode memory stays flat.
     """
@@ -582,6 +879,10 @@ def _pv_state():
 log("=== SERVER: warming executables at production shape (1024px) ===")
 try:
     t0 = time.perf_counter()
+    # Warmup shape. Colab/TPU keeps 1024; ANIMA_WARMUP_PX lets the same script be exercised
+    # at a smaller production shape (a CPU box cannot compile 1024px in reasonable time).
+    # A request at a different size simply pays its own compile, exactly as before.
+    _WPX = int(os.environ.get("ANIMA_WARMUP_PX", "1024"))
     _sched = FlaxFlowMatchScheduler()
     _st8 = FlowMatchSchedulerState.create()
     _sr = np.linspace(1.0, 1.0 / 4, 4).astype(np.float32)
@@ -589,8 +890,9 @@ try:
     _ts = np.asarray(_st8.timesteps); _sg = np.asarray(_st8.sigmas[:-1])
     # Warm the transformer at the real 1024px latent/pad shapes so the first user
     # generation does not pay the XLA compile.
-    _lat = jnp.asarray(np.random.default_rng(0).standard_normal((1, 16, 1, 128, 128)).astype(np.float32))
-    _pad = jnp.zeros((1, 1, 1024, 1024), dtype=jnp.float32)
+    _lat = jnp.asarray(np.random.default_rng(0).standard_normal(
+        (1, 16, 1, _WPX // 8, _WPX // 8)).astype(np.float32))
+    _pad = jnp.zeros((1, 1, _WPX, _WPX), dtype=jnp.float32)
     # These dtypes must match the real generation path exactly or XLA compiles a
     # SECOND executable for the first real request. They did not: the real context
     # is bf16 (cast after the conditioner) and the real latents are fp32. Warmup
@@ -602,20 +904,20 @@ try:
         _sn = _sg[_i + 1] if _i + 1 < 4 else 0.0
         _lat = _lat + jnp.asarray(np.float32(_sn - _sg[_i])) * _pred
     _lat.block_until_ready()
-    _tf_compiled.add((1, 1024, 1024))
+    _tf_compiled.add((1, _WPX, _WPX))
     del _lat, _pad, _ctx, _pred
     gc.collect()
-    log(f"warmup: transformer forward compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
+    log(f"warmup: transformer forward compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
     t0 = time.perf_counter()
     # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
     # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
     # the latent dtype, so a bf16 warmup compiles an executable the server never
     # calls -- the first real preview then recompiled the VAE (~50s, matching this
     # warmup's own compile time).
-    _wz = jnp.zeros((1, 16, 1, 128, 128), dtype=jnp.float32)
+    _wz = jnp.zeros((1, 16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)
     _wv = decode_latents(_wz)
-    log(f"warmup: VAE decode compiled+ran at 1024px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
-    _vae_compiled.add((1024, 1024))
+    log(f"warmup: VAE decode compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
+    _vae_compiled.add((_WPX, _WPX))
     del _wz, _wv
     gc.collect()
     log(f"warmup done; executables compiled; host RSS {rss_gb():.2f} GB")
@@ -675,6 +977,32 @@ while True:
         continue
     last_gen_id = gen_id
     json.dump({**d, "go": False, "status": "running"}, open(REQ_PATH, "w"))
+
+    # --- hot LoRA swap: same process, no restart, no recompile -----------------
+    # transformer_forward takes the params as a jitted argument, so replacing the
+    # weight arrays reuses the compiled executable (asserted in
+    # anima_tpu_project/ops/xla_cache_bench.py, weight_swap -> reused_executable).
+    if d.get("lora_swap") is not None:
+        specs = [(str(it.get("path", "")), float(it.get("scale", 1.0)))
+                 for it in (d.get("lora_swap") or [])
+                 if str(it.get("path", "")).strip()]
+        try:
+            stats, secs, t_merge, t_put = swap_loras(specs)
+            write_prog(stage="lora-swapped", step=0, gen_id=gen_id,
+                       swap_seconds=round(secs, 3),
+                       merge_seconds=round(t_merge, 3),
+                       put_seconds=round(t_put, 3),
+                       merged=stats.get("merged"), skipped=stats.get("skipped"),
+                       loras=[{"path": p, "scale": s} for p, s in specs])
+            json.dump({**d, "go": False, "status": "swapped",
+                       "swap_seconds": round(secs, 3)}, open(REQ_PATH, "w"))
+        except Exception:
+            log("LoRA swap failed:\n" + traceback.format_exc())
+            write_prog(stage="error", step=0, gen_id=gen_id,
+                       error="lora swap failed")
+            json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
+        last_mtime = os.path.getmtime(REQ_PATH)
+        continue
     # Reset before the FIRST record of this request, so a client polling "starting" can
     # never see the previous request's preview_gaveup / preview_error.
     prev_ok = 0
@@ -703,6 +1031,63 @@ while True:
         _n = d.get("negative_prompt", "")
         if isinstance(_n, (list, tuple)):
             _n = _n[0] if _n else ""
+
+        # --- in-prompt LoRA control: <lora:name:0.8> -------------------------
+        # Semantics:
+        #   * only the POSITIVE prompt is authoritative for which LoRAs are
+        #     merged; a tag in the negative prompt is stripped and otherwise
+        #     ignored, so it can never wipe the stack by accident;
+        #   * a positive prompt with no tags leaves the weights alone, so the
+        #     Gradio panel's applied LoRAs survive an ordinary prompt;
+        #   * `<lora:none>` is the explicit way back to the bare base;
+        #   * if tags resolve to nothing at all (every name is a typo), the
+        #     current merge is KEPT and the names are reported -- clearing the
+        #     stack because of a typo would be destructive and silent.
+        # Tags are always stripped from both prompts: leaving them in would
+        # feed the encoder literal "<lora:...>" tokens.
+        _lora_note = {}
+        _tags_pos = "<lora:" in (_p or "").lower()
+        _tags_neg = "<lora:" in (_n or "").lower()
+        if _tags_neg:
+            _n = prompt_control.strip_lora_tags(_n)[0]
+        if _tags_pos:
+            _parsed = prompt_control.parse_lora_tags(_p, installed_lora_files())
+            _p = _parsed["clean"]
+            _want = _parsed["specs"]
+            _have = [(str(a), float(b)) for a, b in (globals().get("_LORA_SPECS") or [])]
+            _lora_note = {"lora_requested": [{"path": a, "scale": b} for a, b in _want],
+                          "lora_unresolved": _parsed["unresolved"],
+                          "lora_ignored_clip": _parsed["ignored_clip"],
+                          "lora_clamped": _parsed["clamped"],
+                          "lora_cleared": bool(_parsed.get("clear")),
+                          "lora_swapped": False}
+            if _parsed["unresolved"]:
+                log("WARNING: prompt names LoRA(s) that are not installed: "
+                    + ", ".join(_parsed["unresolved"])
+                    + f" (searched {', '.join(LORA_DIRS)})")
+            _skip = (not _want and not _parsed.get("clear") and _parsed["unresolved"])
+            if _skip:
+                log("prompt named only unknown LoRAs -> keeping the current merge")
+                _lora_note["lora_skipped_reason"] = "no named LoRA is installed"
+            elif prompt_control.lora_specs_key(_want) != prompt_control.lora_specs_key(_have):
+                log(f"prompt requests {len(_want)} LoRA(s), merged set differs -> hot swap")
+                try:
+                    _sw_stats, _sw_secs, _sw_merge, _sw_put = swap_loras(_want)
+                    _lora_note.update(lora_swapped=True,
+                                      auto_swap_seconds=round(_sw_secs, 3),
+                                      auto_swap_merged=_sw_stats.get("merged"),
+                                      auto_swap_skipped=_sw_stats.get("skipped"))
+                    log(f"in-prompt LoRA swap: {_sw_secs:.2f}s "
+                        f"(merge {_sw_merge:.2f}s + put {_sw_put:.2f}s) "
+                        f"merged={_sw_stats.get('merged')}")
+                    if not _sw_stats.get("merged") and _want:
+                        log("WARNING: swap reported 0 merged targets; the prompt's "
+                            "LoRAs had no effect")
+                except Exception:
+                    log("in-prompt LoRA swap failed:\n" + traceback.format_exc())
+                    _lora_note["auto_swap_error"] = "swap failed; using previous weights"
+            else:
+                log(f"prompt requests {len(_want)} LoRA(s), already merged -> no swap")
         BATCH = max(1, min(8, int(d.get("batch_count", 1) or 1)))
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
@@ -761,6 +1146,24 @@ while True:
         timesteps = np.asarray(st.timesteps)
         sigmas = np.asarray(st.sigmas[:-1])
 
+        # SnapRef: opt-in reference adapter. Absent/off keeps the plain path untouched.
+        _snap = d.get("snapref") or {}
+        snap_info = {}
+        if _snap and _snap.get("enabled", True) and (_snap.get("images") or []):
+            write_prog(stage="snapref", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding reference")
+            snap_info = prepare_snapref(_snap, (H, W))
+            _snap["_sizes"] = snap_info["sizes"]
+            _snap["_weights"] = snap_info["weights"]
+            snap_info.update(adapter=snap_info.get("adapter"), mode=snap_info.get("mode"),
+                             strength=float(_snap.get("strength", 0.0)),
+                             fidelity=float(_snap.get("fidelity", 1.0)),
+                             ref_in_uncond=bool(_snap.get("ref_in_uncond", False)),
+                             ref_guidance_on=bool(_snap.get("ref_guidance_on", False)),
+                             ref_guidance=float(_snap.get("ref_guidance", 4.5)))
+        else:
+            _SNAPREF_STATE["kv"] = None
+
         # All BATCH images share every transformer call: latents (B,16,1,h,w), context
         # (B,512,1024), pad (B,1,H,W). The padding mask is concatenated channel-wise inside the
         # transformer, so its batch dim must equal the latents' batch dim.
@@ -774,7 +1177,9 @@ while True:
         # record the UI and the archive sidecar read.
         common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id,
                       batch_total=BATCH, prompt_states=prompt_states,
-                      prompt_switches=prompt_switches)
+                      prompt_switches=prompt_switches, **_lora_note)
+        if snap_info:
+            common["snapref"] = snap_info
         if (BATCH, H, W) not in _tf_compiled:
             log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
             write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
@@ -804,8 +1209,12 @@ while True:
                 break
             context = pos_ctxs[pos_map[i]]
             neg_context = neg_ctxs[neg_map[i]]
-            pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
-                                  context, neg_context, pad, GUIDANCE)
+            if snap_info:
+                pred = snapref_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                              context, neg_context, pad, GUIDANCE, _snap)
+            else:
+                pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                      context, neg_context, pad, GUIDANCE)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
             latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
             latents.block_until_ready()
@@ -907,5 +1316,13 @@ while True:
             pass
     last_mtime = os.path.getmtime(REQ_PATH)
 '''
-r = subprocess.Popen([py, "-u", "-c", code], cwd=repo, env=env)
+if os.name == "nt" and len(code) > 24000:
+    # Windows caps a command line at 32767 characters, and this program is larger than that.
+    # Write it to a file and run the file: Colab (POSIX) keeps the proven -c path.
+    _main = os.path.join(os.environ.get("ANIMA_CONTENT_ROOT", "/content"), "anima_server_main.py")
+    with open(_main, "w", encoding="utf-8") as _fh:
+        _fh.write(code)
+    r = subprocess.Popen([py, "-u", _main], cwd=repo, env=env)
+else:
+    r = subprocess.Popen([py, "-u", "-c", code], cwd=repo, env=env)
 print("server pid", r.pid, flush=True)

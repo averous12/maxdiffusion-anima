@@ -15,6 +15,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import time
 import uuid
@@ -43,24 +44,96 @@ warnings.filterwarnings("ignore",
 from PIL import Image
 
 # Handshake files, shared with the server (see anima_aesthetic_server.py).
-REQ_PATH = "/content/anima_request.json"
-PROG_PATH = "/content/anima_progress.json"
+# Colab keeps /content; ANIMA_CONTENT_ROOT lets the same UI run against a local server.
+CONTENT = os.environ.get("ANIMA_CONTENT_ROOT", "/content")
+REQ_PATH = os.path.join(CONTENT, "anima_request.json")
+PROG_PATH = os.path.join(CONTENT, "anima_progress.json")
 # LoRA support reuses the CLI boot path rather than a parallel one.
-LORA_DIR = "/content/anima_lora"
-JOB_PATH = "/content/anima_job.json"
-LAUNCH_LOG = "/content/server_launch.log"
-VENV_PY = "/content/maxdiffusion/.venv/bin/python"
-BOOT_SCRIPT = "/content/anima_job.py"
+LORA_DIR = os.path.join(CONTENT, "anima_lora")
+JOB_PATH = os.path.join(CONTENT, "anima_job.json")
+LAUNCH_LOG = os.path.join(CONTENT, "server_launch.log")
+VENV_PY = os.path.join(CONTENT, "maxdiffusion", ".venv", "bin", "python")
+BOOT_SCRIPT = os.path.join(CONTENT, "anima_job.py")
 # Where a running boot announces itself, so a UI restart (watchdog) does not
 # forget that the sampler is mid-reboot.
-REBOOT_PATH = "/content/anima_reboot.json"
+REBOOT_PATH = os.path.join(CONTENT, "anima_reboot.json")
 # Live state of a link-triggered LoRA download (written by scripts/add_lora.py).
-DL_STATE_PATH = "/content/anima_download.json"
+DL_STATE_PATH = os.path.join(CONTENT, "anima_download.json")
 # Repo root, so the detached downloader runs from the pulled checkout.
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADD_LORA_SCRIPT = os.path.join(REPO_ROOT, "scripts", "add_lora.py")
-SNAP_PATH = "/content/anima_snap.png"
-INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running generation
+SNAP_PATH = os.path.join(CONTENT, "anima_snap.png")
+INTERRUPT_PATH = os.path.join(CONTENT, "anima_interrupt")   # create to cancel the running generation
+# SnapRef reference images live on the VM and are handed to the server by path.
+SNAPREF_DIR = os.environ.get("ANIMA_SNAPREF_DIR", os.path.join(CONTENT, "anima_snapref"))
+SNAPREF_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _snapref_files():
+    """Reference images available to the server (uploaded / saved on the VM)."""
+    try:
+        os.makedirs(SNAPREF_DIR, exist_ok=True)
+        out = [os.path.join(SNAPREF_DIR, f) for f in sorted(os.listdir(SNAPREF_DIR))
+               if f.lower().endswith(SNAPREF_EXTS)]
+        return out
+    except OSError:
+        return []
+
+
+def _snapref_adapters():
+    """SnapRef adapter files the server can load."""
+    dirs = [SNAPREF_DIR, LORA_DIR]
+    out = []
+    for d in dirs:
+        try:
+            for f in sorted(os.listdir(d)):
+                if f.lower().endswith(".safetensors") and ("snapref" in f.lower() or "anima_ref_kv" in f.lower()):
+                    out.append(os.path.join(d, f))
+        except OSError:
+            pass
+    return out
+
+
+def save_snapref_reference(files):
+    """Copy uploaded reference picture(s) into SNAPREF_DIR, return (names, state html)."""
+    if not files:
+        return _upd(), _snapref_state_html("no file picked")
+    from PIL import Image, ImageOps
+
+    imported, bad = [], []
+    for f in (files if isinstance(files, (list, tuple)) else [files]):
+        path = getattr(f, "name", f)
+        try:
+            img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+            stem = os.path.splitext(os.path.basename(path))[0][:60] or "reference"
+            dst = os.path.join(SNAPREF_DIR, stem + ".png")
+            n = 1
+            while os.path.exists(dst):
+                dst = os.path.join(SNAPREF_DIR, f"{stem}_{n}.png")
+                n += 1
+            os.makedirs(SNAPREF_DIR, exist_ok=True)
+            img.save(dst, "PNG")
+            imported.append(os.path.basename(dst))
+        except Exception as e:
+            bad.append(f"{os.path.basename(str(path))}: {type(e).__name__}")
+    names = [os.path.basename(p) for p in _snapref_files()]
+    note = f"saved {', '.join(imported)}" if imported else "nothing saved"
+    if bad:
+        note += f" — failed: {', '.join(bad)}"
+    return _upd(choices=names), _snapref_state_html(note)
+
+
+def _snapref_state_html(note=""):
+    import html as _html
+
+    refs = [os.path.basename(p) for p in _snapref_files()]
+    ads = [os.path.basename(p) for p in _snapref_adapters()]
+    body = (f"{len(refs)} reference image(s)" if refs else "no reference image")
+    body += f" · adapter: {', '.join(ads) if ads else 'none found'}"
+    out = f"<div class='lora-state'>SnapRef: {body}</div>"
+    if note:
+        out += f"<div class='lora-note'>{_html.escape(note)}</div>"
+    return out
 
 # True while this process has a generation in flight. The 1 Hz progress poll
 # stays silent otherwise, so a freshly loaded page does not resurrect the last
@@ -68,7 +141,7 @@ INTERRUPT_PATH = "/content/anima_interrupt"   # create to cancel the running gen
 # stops emitting an update chip every second.
 _RUN_ACTIVE = {"flag": False, "until": 0.0}
 _STALE_AFTER_S = 300.0
-FINAL_PATH = "/content/anima_perstep.png"
+FINAL_PATH = os.path.join(CONTENT, "anima_perstep.png")
 
 # Where finished images are archived (Drive, usually). Empty disables archiving.
 SAVE_ENV = "ANIMA_SAVE_DIR"
@@ -333,6 +406,8 @@ def _status_line(prog, fallback_steps, preview_every=None):
         sw = prog.get("prompt_switches") or []
         bits.append(f"prompt: {states} states"
                     + (f", switches at {', '.join(str(x) for x in sw)}" if sw else ""))
+    if stage == "snapref":
+        bits = [f"SnapRef: {prog.get('note') or 'encoding reference'}"]
     if stage == "compiling":
         bits = [f"compiling {prog.get('note', 'new shape')} (one-time per size/batch, can take 1-2 min)"]
     if stage == "done":
@@ -554,16 +629,119 @@ def _resume_reboot():
         pass
 
 
-def apply_loras(names, scale):
-    """Write the boot job and restart the sampler with the chosen LoRAs.
+# ---- LoRA picker: click a name, get <lora:name:scale> in the prompt ----------
+# The grammar lives on the server (maxdiffusion.anima_prompt_control), but this
+# UI runs on the CPU host outside the TPU venv, where importing maxdiffusion
+# would drag in its package __init__. So the tag handling is duplicated here as
+# a small regex. It has to stay in step with the server's parser: same tag
+# shape, same "extension and case are optional" resolution, last-tag-wins.
+_LORA_TAG_RE = re.compile(r"<\s*lora\s*:\s*([^<>]+?)\s*>", re.IGNORECASE)
 
-    Detached on purpose: the boot takes minutes and the tunnel buffers long
-    streaming responses, so the button returns at once and poll_progress follows
-    the reboot. Returns (state html, generate-button update).
+
+def _lora_stem(name):
+    """'animA.safetensors' -> 'anima', for case/extension-insensitive matching."""
+    base = os.path.basename(str(name or "").strip())
+    if base.lower().endswith(".safetensors"):
+        base = base[:-len(".safetensors")]
+    return base
+
+
+def _fmt_scale(v):
+    """1.0 -> '1', 0.75 -> '0.75' -- keep the tag tidy."""
+    try:
+        s = f"{float(v):.2f}".rstrip("0").rstrip(".")
+        return s if s not in ("", "-") else "0"
+    except (TypeError, ValueError):
+        return "1"
+
+
+def _lora_tags_in(text):
+    """[(stem, scale_str, raw_tag), ...] for every tag in the prompt."""
+    out = []
+    for m in _LORA_TAG_RE.finditer(text or ""):
+        parts = [p.strip() for p in (m.group(1) or "").split(":")]
+        if not parts or not parts[0]:
+            continue
+        scale = parts[1] if len(parts) > 1 and parts[1] else "1"
+        out.append((_lora_stem(parts[0]), scale, m.group(0)))
+    return out
+
+
+def _strip_lora_tags(text):
+    clean = _LORA_TAG_RE.sub(" ", text or "")
+    clean = re.sub(r"[ \t]{2,}", " ", clean)
+    clean = re.sub(r",(\s*,)+", ",", clean)
+    clean = re.sub(r"^[,;\s]+|[,;\s]+$", "", clean)
+    return clean.strip()
+
+
+def _upsert_lora_tag(text, name, scale):
+    """Add the tag, or rewrite the strength if that LoRA is already selected.
+
+    Appending a second tag for the same file would be ignored by the server
+    (last-one-wins), so replacing in place keeps the prompt honest about the
+    strength that will actually be used.
     """
-    import subprocess
+    text = text or ""
+    tag = f"<lora:{name}:{_fmt_scale(scale)}>"
+    stem = _lora_stem(name).lower()
+    for m in _LORA_TAG_RE.finditer(text):
+        parts = [p.strip() for p in (m.group(1) or "").split(":")]
+        if parts and _lora_stem(parts[0]).lower() == stem:
+            return text[:m.start()] + tag + text[m.end():]
+    body = text.rstrip()
+    if not body:
+        return tag
+    sep = " " if body.endswith((",", ".")) else ", "
+    return f"{body}{sep}{tag}"
 
+
+def _lora_menu_html(prompt_text):
+    """Small readout of which LoRAs the prompt currently selects."""
+    tags = _lora_tags_in(prompt_text)
+    if not tags:
+        return ('<div class="anima-lora-menu">no LoRA in prompt '
+                '&mdash; base model</div>')
+    chips = " ".join(f"<code>{n}@{s}</code>" for n, s, _ in tags)
+    return (f'<div class="anima-lora-menu">{len(tags)} in prompt: {chips}</div>')
+
+
+def insert_lora(prompt_text, name, scale):
+    """Picker callback: put the tag in the prompt and reset the dropdown.
+
+    Resetting to None matters: Gradio only fires .change when the value
+    actually changes, so without this a second click on the same name would do
+    nothing.
+    """
     import gradio as gr
+
+    if not name:
+        return (gr.update(), _lora_menu_html(prompt_text),
+                gr.update(), _lora_state_html("pick a LoRA first"))
+    new_text = _upsert_lora_tag(prompt_text, _lora_stem(name), scale)
+    return (new_text, _lora_menu_html(new_text), gr.update(value=None),
+            _lora_state_html(f"prompt now uses <lora:{_lora_stem(name)}:"
+                             f"{_fmt_scale(scale)}>"))
+
+
+def remove_loras(prompt_text):
+    """Strip every LoRA tag from the prompt."""
+    import gradio as gr
+
+    new_text = _strip_lora_tags(prompt_text)
+    return (new_text, _lora_menu_html(new_text),
+            _lora_state_html("removed every LoRA tag from the prompt"))
+
+
+def apply_loras(names, scale):
+    """Send LoRA config to the /lora_swap endpoint instead of restarting the server.
+
+    Uses HTTP POST to http://localhost:8000/lora_swap with the payload:
+      {"prompt": "...", "loras": [{"name": "foo.safetensors", "scale": 1.0}], "negative_prompt": "..."}
+    Returns (state html, generate-button update).
+    """
+    import gradio as gr
+    import requests
 
     if _RUN_ACTIVE["flag"]:
         return (_lora_state_html("a generation is running — interrupt it first"),
@@ -581,33 +759,53 @@ def apply_loras(names, scale):
         return _lora_state_html("none of those files exist in " + LORA_DIR), gr.update()
 
     scale = float(scale if scale is not None else 1.0)
-    payload = {"step": "boot"}
+    # Read current prompt from the request file to preserve user edits
+    try:
+        req = _read_json(REQ_PATH, {})
+        prompt = req.get("prompt", "")
+        neg_prompt = req.get("negative_prompt", "")
+    except Exception:
+        prompt = ""
+        neg_prompt = ""
+
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": neg_prompt
+    }
     if chosen:
         payload["loras"] = [{"name": n, "scale": scale} for n in chosen]
     else:
-        # No "loras" and no "name": anima_job boots the base model.
-        payload["label"] = "base"
+        payload["loras"] = []
 
-    _atomic_json(JOB_PATH, payload)
-    env = {**os.environ, "MPLBACKEND": "agg", "PYTHONUNBUFFERED": "1"}
     try:
-        proc = subprocess.Popen(
-            [VENV_PY, "-u", BOOT_SCRIPT], cwd="/content", env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,   # outlive this click
-        )
-    except Exception as e:
-        return (_lora_state_html(f"could not start the reboot: {type(e).__name__}: {e}"),
+        resp = requests.post("http://localhost:8000/lora_swap", json=payload, timeout=60)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("swapped"):
+            names_list = [n for n in chosen]
+            label = ", ".join(f"{n}@{scale:g}" for n in names_list) if names_list else "no LoRA"
+            return (_lora_state_html(f"✅ Hot-swapped: {label} in {result.get('merge_time', '?')}s"),
+                    gr.update())
+        else:
+            unresolved = result.get("unresolved", [])
+            if unresolved:
+                return (_lora_state_html(f"⚠️ Safe fallback: {', '.join(unresolved)} not found"),
+                        gr.update())
+            else:
+                return (_lora_state_html("ℹ️ No change needed — same LoRA set already active"),
+                        gr.update())
+    except requests.exceptions.Timeout:
+        return (_lora_state_html("❌ Request timed out — check if the server is running"),
                 gr.update())
-
-    _REBOOT.update(active=True, t0=time.time(), proc=proc,
-                   names=chosen, scale=scale)
-    _atomic_json(REBOOT_PATH, {"t0": _REBOOT["t0"], "names": chosen,
-                               "scale": scale})
-    label = ", ".join(f"{n}@{scale:g}" for n in chosen) if chosen else "no LoRA"
-    return (_lora_state_html(f"rebooting with {label}. The server is down for "
-                             f"{REBOOT_HINT}; leave this page open."),
-            gr.update(interactive=False))
+    except requests.exceptions.ConnectionError:
+        return (_lora_state_html("❌ Cannot connect to server — is it running?"),
+                gr.update())
+    except requests.exceptions.HTTPError as e:
+        return (_lora_state_html(f"❌ Server error: {e}"),
+                gr.update())
+    except Exception as e:
+        return (_lora_state_html(f"❌ Unexpected error: {type(e).__name__}: {e}"),
+                gr.update())
 
 
 def _reboot_state(stage=None):
@@ -788,7 +986,11 @@ def poll_progress():
 
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
-              guidance, preview_every, batch_count, prompt_style="comfy", tags=""):
+              guidance, preview_every, batch_count, prompt_style="comfy", tags="",
+              snapref_on=False, snapref_mode="cs", snapref_adapter="", snapref_refs=None,
+              snapref_strength=0.0, snapref_fidelity=1.0, snapref_megapixels=1.0,
+              snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
+              snapref_correction="apg", snapref_caption=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -808,6 +1010,37 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
     if _tags:
         req["tags"] = _tags
+    # SnapRef is strictly additive: without the checkbox the request is byte-for-byte the
+    # same shape as before (no "snapref" key), so the server's plain path is untouched.
+    if snapref_on:
+        _refs = [r for r in (snapref_refs or []) if r]
+        if not _refs:
+            return ("pick at least one reference picture, or untick 'Use SnapRef'",
+                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+        _paths = []
+        for r in _refs:
+            p = r if os.path.isabs(r) else os.path.join(SNAPREF_DIR, r)
+            if not os.path.exists(p):
+                return (f"reference picture not found: {p}",
+                        _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+            _paths.append(p)
+        req["snapref"] = {
+            "enabled": True,
+            "adapter": snapref_adapter or "",
+            "images": _paths,
+            "weights": [1.0] * len(_paths),
+            "mode": snapref_mode or "cs",
+            "strength": float(snapref_strength or 0.0),
+            "fidelity": float(snapref_fidelity if snapref_fidelity is not None else 1.0),
+            "ref_megapixels": float(snapref_megapixels or 1.0),
+            "ref_in_uncond": bool(snapref_in_uncond),
+            "ref_guidance_on": bool(snapref_rg_on),
+            "ref_guidance": float(snapref_rg or 4.5),
+            "correction": snapref_correction or "apg",
+            "ref_caption": snapref_caption or "",
+        }
+    else:
+        req.pop("snapref", None)
     t_submit = time.time()
     _RUN_ACTIVE["flag"] = True
     _atomic_json(REQ_PATH, req)
@@ -1093,18 +1326,20 @@ def build():
                                                     "(x:weight), plain parens stay literal.")
                     tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
                                       info="Space or comma separated, e.g. SECOND_PASS")
-                with gr.Accordion("LoRA (merged at boot — Apply restarts the server)",
+                with gr.Accordion("LoRA picker — click a name to add it to the prompt",
                                   open=False):
-                    lora_pick = gr.Dropdown(choices=_installed_loras(), value=[],
-                                            multiselect=True, label="LoRAs to merge",
-                                            info="Everything in /content/anima_lora. "
-                                                 "All selected files merge in one pass.")
+                    lora_menu = gr.HTML(_lora_menu_html(""))
+                    lora_pick = gr.Dropdown(choices=_installed_loras(), value=None,
+                                            multiselect=False, label="Add a LoRA",
+                                            info="Pick one and its <lora:name:scale> "
+                                                 "tag is appended to the prompt.")
                     with gr.Row():
                         lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
-                                               label="Scale (applies to all selected)")
+                                               label="Strength for the picked LoRA")
                         lora_refresh = gr.Button("Refresh list", size="sm")
-                    # Fetching a file is safe while the TPU generates: only the
-                    # merge needs a restart, so this is a separate button.
+                        lora_remove = gr.Button("Remove tags from prompt", size="sm")
+                    # Fetching a file is safe while the TPU generates: only a
+                    # merge touches the weights, and that now happens on request.
                     lora_url = gr.Textbox(
                         label="Add from link (HuggingFace or CivitAI)",
                         placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors "
@@ -1113,12 +1348,69 @@ def build():
                              "A CivitAI model page becomes its API download route; "
                              "a bare HuggingFace repo picks a .safetensors file.")
                     lora_add = gr.Button("Download & validate", variant="secondary")
-                    lora_apply = gr.Button("Apply & restart server", variant="primary")
                     lora_state = gr.HTML(_lora_state_html())
-                    gr.Markdown("A restart takes ~4-5 minutes: the sampler reloads the "
-                                "base model and merges the LoRAs on the CPU before it "
-                                "can generate again. Generate stays disabled until it "
-                                "reports ready.")
+                with gr.Accordion("SnapRef — character reference (reference adapter)", open=False):
+                    with gr.Row():
+                        snapref_on = gr.Checkbox(value=False, label="Use SnapRef",
+                                                 info="Off keeps the plain pipeline. On: the "
+                                                      "reference picture supplies the character "
+                                                      "(and, in 'cs' mode, the style).")
+                        snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Mode",
+                                                   info="cs = character + style from the picture; "
+                                                        "char = character only, style from your prompt")
+                        snapref_adapter = gr.Dropdown(
+                            choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
+                            value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
+                            label="Adapter", info="snapref_v1a.safetensors (bf16 or fp8)")
+                    with gr.Row():
+                        snapref_upload = gr.File(label="Add reference picture(s)", file_count="multiple",
+                                                 file_types=["image"], type="filepath")
+                        snapref_save = gr.Button("Save to the VM", size="sm")
+                    with gr.Row():
+                        snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
+                                                  multiselect=True, label="Reference(s)",
+                                                  info="One character. Several pictures of the SAME "
+                                                       "character (e.g. upper body + full body).")
+                        snapref_refresh = gr.Button("Refresh", size="sm")
+                    with gr.Row():
+                        snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1, label="Strength",
+                                                     info="0 = as trained; +1 ≈ 2.7x more reference "
+                                                          "attention, -1 ≈ 2.7x less")
+                        snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="Fidelity",
+                                                     info="1 = keep every detail; lower follows the "
+                                                          "prompt more freely")
+                        snapref_megapixels = gr.Slider(0.25, 2.0,
+                                                       value=float(os.environ.get("ANIMA_SNAPREF_MP", "1.0")),
+                                                       step=0.05, label="Reference size (MP)")
+                    with gr.Row():
+                        snapref_in_uncond = gr.Checkbox(value=False, label="Reference in negative too",
+                                                        info="Off (trained): only the positive branch "
+                                                             "reads it, so CFG pushes toward it")
+                        snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
+                                                    info="Extra model call per step; ignores "
+                                                         "'negative too' and fidelity")
+                        snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
+                                               info="Above CFG = closer to the reference, below = "
+                                                    "closer to the prompt")
+                        snapref_correction = gr.Dropdown(["apg", "rescale", "none"], value="apg",
+                                                         label="Correction")
+                    snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
+                                                 placeholder="1girl, solo, brown hair, red jacket",
+                                                 info="Appearance tags of the reference; helps with "
+                                                      "accessories. No name, no artist.")
+                    snapref_state = gr.HTML(_snapref_state_html())
+                    gr.Markdown(
+                        "Strength lives in the prompt, A1111 style: "
+                        "`<lora:name:0.8>`. The server merges only when the set "
+                        "or a strength actually changes (~4 s warm), so editing "
+                        "words between generations costs nothing. `<lora:none>` "
+                        "goes back to the bare base. The first generation after "
+                        "a change pays the merge; the next ones do not.\n\n"
+                        "*Fallback:* if a hot swap ever leaves the server in a "
+                        "bad state, restart it with nothing merged —")
+                    with gr.Row():
+                        lora_restart = gr.Button("Restart server with base weights",
+                                                 size="sm", variant="stop")
                 with gr.Accordion("Prompt syntax reference", open=False):
                     gr.Markdown(SYNTAX_HELP)
 
@@ -1181,7 +1473,11 @@ def build():
 
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
-                          seed, guidance, preview_every, batch_count, prompt_style, tags],
+                          seed, guidance, preview_every, batch_count, prompt_style, tags,
+                          snapref_on, snapref_mode, snapref_adapter, snapref_ref,
+                          snapref_strength, snapref_fidelity, snapref_megapixels,
+                          snapref_in_uncond, snapref_rg_on, snapref_rg, snapref_correction,
+                          snapref_caption],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app
@@ -1195,16 +1491,46 @@ def build():
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
 
-        # ---- LoRA wiring ------------------------------------------------------
+        # ---- SnapRef wiring ----------------------------------------------------
+        snapref_save.click(save_snapref_reference, inputs=[snapref_upload],
+                           outputs=[snapref_ref, snapref_state])
+        snapref_refresh.click(lambda: (gr.update(choices=[os.path.basename(p) for p in _snapref_files()]),
+                                       gr.update(choices=[os.path.basename(p) for p in _snapref_adapters()]
+                                                 or ["(none found)"])),
+                              inputs=[], outputs=[snapref_ref, snapref_adapter],
+                              show_progress="hidden")
+        # Guidance ignores 'reference in negative' and 'fidelity' (documented upstream), so
+        # the controls say so instead of silently doing nothing.
+        snapref_rg_on.change(
+            lambda on: (gr.update(interactive=not on), gr.update(interactive=not on),
+                        gr.update(interactive=bool(on)), gr.update(interactive=bool(on))),
+            inputs=[snapref_rg_on],
+            outputs=[snapref_in_uncond, snapref_fidelity, snapref_rg, snapref_correction],
+            show_progress="hidden")
+
+        # ---- LoRA picker wiring ------------------------------------------------
         lora_refresh.click(lambda: gr.update(choices=_installed_loras()),
                            inputs=[], outputs=[lora_pick], show_progress="hidden")
         # Fetching is independent of the sampler, so it is not gated on a run;
         # the handler refuses only if another download is already in flight.
         lora_add.click(add_lora_from_link, inputs=[lora_url], outputs=[lora_state],
                        concurrency_limit=1)
-        # concurrency_limit=1 keeps a double click from launching two boots.
-        lora_apply.click(apply_loras, inputs=[lora_pick, lora_scale],
-                         outputs=[lora_state, btn], concurrency_limit=1)
+        # Picking a name appends <lora:name:scale> to the prompt. The handler
+        # resets the dropdown so the SAME name can be picked again after a
+        # strength change (Gradio only fires .change on an actual value change).
+        lora_pick.change(insert_lora, inputs=[prompt, lora_pick, lora_scale],
+                         outputs=[prompt, lora_menu, lora_pick, lora_state],
+                         show_progress="hidden")
+        lora_remove.click(remove_loras, inputs=[prompt],
+                          outputs=[prompt, lora_menu, lora_state],
+                          show_progress="hidden")
+        # Keep the readout honest when the prompt is edited by hand.
+        prompt.change(_lora_menu_html, inputs=[prompt], outputs=[lora_menu],
+                      show_progress="hidden")
+        # Escape hatch only: a full restart with nothing merged. The normal path
+        # is the in-prompt tag, which never stops the server.
+        lora_restart.click(lambda: apply_loras([], 1.0), inputs=[],
+                           outputs=[lora_state, btn], concurrency_limit=1)
         demo.load(lambda: gr.update(choices=_installed_loras()), inputs=[],
                   outputs=[lora_pick], show_progress="hidden")
     demo.queue()
