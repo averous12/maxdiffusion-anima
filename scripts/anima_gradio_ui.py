@@ -94,10 +94,15 @@ def _snapref_adapters():
     return out
 
 
+def _snapref_gallery_items():
+    """Gallery cards for saved references; captions keep filenames visible."""
+    return [(path, f"Reference · {os.path.basename(path)}") for path in _snapref_files()]
+
+
 def save_snapref_reference(files):
-    """Copy uploaded reference picture(s) into SNAPREF_DIR, return (names, state html)."""
+    """Copy uploaded reference pictures and refresh both visual and precise pickers."""
     if not files:
-        return _upd(), _snapref_state_html("no file picked")
+        return _upd(), _upd(), _snapref_state_html("no file picked")
     from PIL import Image, ImageOps
 
     imported, bad = [], []
@@ -120,7 +125,7 @@ def save_snapref_reference(files):
     note = f"saved {', '.join(imported)}" if imported else "nothing saved"
     if bad:
         note += f" — failed: {', '.join(bad)}"
-    return _upd(choices=names), _snapref_state_html(note)
+    return _upd(choices=names), _upd(value=_snapref_gallery_items()), _snapref_state_html(note)
 
 
 def _snapref_state_html(note=""):
@@ -1212,10 +1217,25 @@ RESPONSIVE_CSS = """
 }
 .lora-dl.lora-err { color: var(--error-text-color, #f87171); }
 
+# SnapRef reference board
+# The gallery is intentionally image-first: filenames and precise multi-select remain available,
+# but users can understand their references at a glance.
+.snapref-board { border: 1px solid var(--border-color-primary, #3a3a3a); border-radius: 14px; padding: 14px; }
+.snapref-board h3 { margin: 0 0 4px 0; font-size: 16px; }
+.snapref-board .snapref-hint { color: var(--body-text-color-subdued, #aaa); font-size: 12px; margin-bottom: 12px; }
+.snapref-gallery { min-height: 150px; }
+.snapref-gallery .grid-wrap { gap: 10px !important; }
+.snapref-gallery .thumbnail-item { border-radius: 12px !important; overflow: hidden; }
+.snapref-gallery img { object-fit: cover !important; }
+.snapref-empty { min-height: 120px; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--border-color-primary, #555); border-radius: 12px;
+  color: var(--body-text-color-subdued, #aaa); font-size: 13px; }
+
 #anima-result img, #anima-result video {
   max-height: 72vh !important;
   object-fit: contain;
 }
+
 #anima-actions { flex-wrap: wrap; }
 #anima-controls .gr-row, #anima-controls .flex { flex-wrap: wrap !important; }
 
@@ -1350,55 +1370,59 @@ def build():
                     lora_add = gr.Button("Download & validate", variant="secondary")
                     lora_state = gr.HTML(_lora_state_html())
                 with gr.Accordion("SnapRef — character reference (reference adapter)", open=False):
+                    gr.HTML(
+                        "<div class='snapref-board'><h3>Build your character board</h3>"
+                        "<div class='snapref-hint'>Add one or more pictures of the same character. "
+                        "The selected cards become the visual identity for your generation.</div></div>"
+                    )
+                    with gr.Row(elem_classes="snapref-board"):
+                        with gr.Column(scale=1, min_width=250):
+                            snapref_on = gr.Checkbox(value=False, label="Use these references",
+                                                     info="Off keeps the plain pipeline. On uses the selected cards.")
+                            snapref_upload = gr.File(label="Drop reference images here",
+                                                     file_count="multiple", file_types=["image"],
+                                                     type="filepath", height=145)
+                            snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
+                        with gr.Column(scale=2, min_width=360):
+                            snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
+                                                         label="Saved references",
+                                                         columns=3, rows=1, height=220,
+                                                         object_fit="cover", allow_preview=True,
+                                                         show_label=True, elem_classes="snapref-gallery",
+                                                         type="filepath")
+                            snapref_state = gr.HTML(_snapref_state_html())
                     with gr.Row():
-                        snapref_on = gr.Checkbox(value=False, label="Use SnapRef",
-                                                 info="Off keeps the plain pipeline. On: the "
-                                                      "reference picture supplies the character "
-                                                      "(and, in 'cs' mode, the style).")
-                        snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Mode",
-                                                   info="cs = character + style from the picture; "
-                                                        "char = character only, style from your prompt")
+                        snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
+                                                  multiselect=True, label="Use these cards",
+                                                  info="Select one or several cards. They must show the SAME character.")
+                        snapref_refresh = gr.Button("↻ Refresh board", size="sm")
+                    with gr.Row():
+                        snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Reference mode",
+                                                   info="cs = character + style; char = character only")
                         snapref_adapter = gr.Dropdown(
                             choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
                             value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
                             label="Adapter", info="snapref_v1a.safetensors (bf16 or fp8)")
                     with gr.Row():
-                        snapref_upload = gr.File(label="Add reference picture(s)", file_count="multiple",
-                                                 file_types=["image"], type="filepath")
-                        snapref_save = gr.Button("Save to the VM", size="sm")
-                    with gr.Row():
-                        snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
-                                                  multiselect=True, label="Reference(s)",
-                                                  info="One character. Several pictures of the SAME "
-                                                       "character (e.g. upper body + full body).")
-                        snapref_refresh = gr.Button("Refresh", size="sm")
-                    with gr.Row():
                         snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1, label="Strength",
-                                                     info="0 = as trained; +1 ≈ 2.7x more reference "
-                                                          "attention, -1 ≈ 2.7x less")
+                                                     info="0 = as trained; positive values pull harder toward the cards")
                         snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="Fidelity",
-                                                     info="1 = keep every detail; lower follows the "
-                                                          "prompt more freely")
+                                                     info="1 = keep every detail; lower follows the prompt more freely")
                         snapref_megapixels = gr.Slider(0.25, 2.0,
                                                        value=float(os.environ.get("ANIMA_SNAPREF_MP", "1.0")),
                                                        step=0.05, label="Reference size (MP)")
                     with gr.Row():
                         snapref_in_uncond = gr.Checkbox(value=False, label="Reference in negative too",
-                                                        info="Off (trained): only the positive branch "
-                                                             "reads it, so CFG pushes toward it")
+                                                        info="Off (trained): only the positive branch reads it")
                         snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
-                                                    info="Extra model call per step; ignores "
-                                                         "'negative too' and fidelity")
+                                                    info="Extra model call per step; ignores negative-too and fidelity")
                         snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
-                                               info="Above CFG = closer to the reference, below = "
-                                                    "closer to the prompt")
+                                               info="Higher values pull closer to the references")
                         snapref_correction = gr.Dropdown(["apg", "rescale", "none"], value="apg",
                                                          label="Correction")
                     snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
                                                  placeholder="1girl, solo, brown hair, red jacket",
-                                                 info="Appearance tags of the reference; helps with "
-                                                      "accessories. No name, no artist.")
-                    snapref_state = gr.HTML(_snapref_state_html())
+                                                 info="Appearance tags from the cards; helps with accessories.")
                     gr.Markdown(
                         "Strength lives in the prompt, A1111 style: "
                         "`<lora:name:0.8>`. The server merges only when the set "
@@ -1493,11 +1517,12 @@ def build():
 
         # ---- SnapRef wiring ----------------------------------------------------
         snapref_save.click(save_snapref_reference, inputs=[snapref_upload],
-                           outputs=[snapref_ref, snapref_state])
+                           outputs=[snapref_ref, snapref_gallery, snapref_state])
         snapref_refresh.click(lambda: (gr.update(choices=[os.path.basename(p) for p in _snapref_files()]),
+                                       gr.update(value=_snapref_gallery_items()),
                                        gr.update(choices=[os.path.basename(p) for p in _snapref_adapters()]
                                                  or ["(none found)"])),
-                              inputs=[], outputs=[snapref_ref, snapref_adapter],
+                              inputs=[], outputs=[snapref_ref, snapref_gallery, snapref_adapter],
                               show_progress="hidden")
         # Guidance ignores 'reference in negative' and 'fidelity' (documented upstream), so
         # the controls say so instead of silently doing nothing.
