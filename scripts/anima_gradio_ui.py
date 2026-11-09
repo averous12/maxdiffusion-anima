@@ -366,24 +366,45 @@ def _preview_fragment(prog, preview_every):
 PROMPT_STYLES = ("comfy", "a1111", "safe")
 
 SYNTAX_HELP = """\
-**Weights** — `(tag:1.3)` strengthens, `(tag:0.7)` weakens, groups nest and multiply. \
-`(tag)` alone is `(tag:1.1)`. Range clamps to 0–3.
+### Quick start
+Write ordinary descriptive text in the Prompt box. Use **Prompt style** in Settings to choose how parentheses, brackets, and braces are interpreted. The default is **Comfy**.
 
-**Schedules** — switch mid-denoise on a fraction of the steps:
-`[before:after:0.5]` · `[cat:0.5]` (empty before) · `[before:during:after:0.3,0.7]` \
-range · `[a|b:0.25]` alternating · `[SEQ:a:0.2:b:0.5:c]` chain · `[a:b:TAG]` with the \
-Tags box. All nest, e.g. `a [red:[blue::0.7]:0.5] cat`.
+### Emphasis
+- `(blue eyes:1.3)` strengthens a phrase; `(blue eyes:0.7)` softens it.
+- `(blue eyes)` is shorthand for `(blue eyes:1.1)` in Comfy and A1111 modes.
+- Nested weights multiply: `(soft (blue eyes:1.2):1.1)` applies both weights.
+- Explicit weights are clamped to the supported 0–3 range.
 
-**Combinators** — `AND` and `CAT` join prompts; `AVG(0.3)` averages them. \
-`BREAK` is a no-op here: prompt-control ignores it for T5 encoders, which is what we use.
+### Change prompts during denoising
+The number is a fraction of the generation, from `0` to `1`:
 
-**Literals** — `#` starts a comment; escape with `\\#`, `\\:`, `\\\\`. \
-Text inside `"double quotes"` never triggers operators.
+- `[cat:dog:0.5]` uses `cat` first, then switches to `dog` halfway through.
+- `[dog:0.5]` starts with no text for this part, then adds `dog` halfway through.
+- `[early:middle:late:0.3,0.7]` uses three phases, switching at 30% and 70%.
+- `[day|night:0.1]` alternates choices every 10% by default; the interval is configurable in the syntax.
+- `[SEQ:a:0.2:b:0.5:c]` changes through `a`, `b`, then `c` at the listed fractions.
+- `[first:second:SECOND_PASS]` selects `first` normally and `second` when the **Tags** field contains `SECOND_PASS`.
 
-**Styles** — `comfy`: bare `(x)` is emphasis (ComfyUI behaviour), so a danbooru tag \
-like `fern (sousou no frieren)` must be escaped as `\\(...\\)`. `a1111`: additionally \
-`[x]` weakens and `{x}` strengthens. `safe`: only `(x:weight)` is syntax, so plain \
-parentheses stay literal — pick this to keep old prompts byte-identical.
+Schedules can be nested. For example: `a [red:[blue::0.7]:0.5] cat`.
+
+### Prompt styles
+- **Comfy**: `(phrase)` adds emphasis at 1.1. Escape literal parentheses in names, such as `fern \\(Sousou no Frieren\\)`, or choose Safe.
+- **A1111**: supports the same explicit weights, plus `[phrase]` to soften and `{phrase}` to strengthen.
+- **Safe**: only explicit `(phrase:weight)` forms are interpreted as weights. Ordinary parentheses stay literal, which is useful for character names.
+
+### Combining prompt segments
+- `AND` and `CAT` split a prompt into separately encoded segments that are combined for conditioning.
+- `AVG(0.3)` combines segments by weighted average; the default weight is 0.5.
+- `BREAK` is a no-op for this app’s T5 text encoder. Use `CAT` when you need separate segments.
+- Operators inside double quotes are treated as literal text, for example `\"rock AND roll\"`.
+
+### Comments and literal characters
+`#` starts a comment through the end of that line. Escape syntax characters with a backslash, including `\\#`, `\\:`, `\\\\`, `\\(`, `\\)`, `\\[`, `\\]`, `\\{`, and `\\}`. Quoted text also keeps operators such as `AND` literal.
+
+### LoRAs
+Add a LoRA from the LoRAs tab or use a prompt tag such as `<lora:style-name:0.8>`. LoRA strength stays fixed for the whole generation because the weights are merged before sampling. Changing the active LoRA or its strength requires a re-merge; per-step LoRA schedules are not supported.
+
+**Not supported:** regional prompting, `MASK`, `COUPLE`, `CUT`, per-encoder `TE()` prompts, `SDXL()`, `NOISE()`, macros, and Jinja templates.
 """
 
 
@@ -995,7 +1016,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_on=False, snapref_mode="cs", snapref_adapter="", snapref_refs=None,
               snapref_strength=0.0, snapref_fidelity=1.0, snapref_megapixels=1.0,
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
-              snapref_correction="apg", snapref_caption=""):
+              snapref_correction="apg", snapref_caption="", snapref_layout="separate",
+              snapref_weight_1=1.0, snapref_weight_2=1.0, snapref_weight_3=1.0):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1033,7 +1055,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             "enabled": True,
             "adapter": snapref_adapter or "",
             "images": _paths,
-            "weights": [1.0] * len(_paths),
+            "weights": [float(snapref_weight_1), float(snapref_weight_2), float(snapref_weight_3)][:len(_paths)],
+            "multi_layout": snapref_layout or "separate",
             "mode": snapref_mode or "cs",
             "strength": float(snapref_strength or 0.0),
             "fidelity": float(snapref_fidelity if snapref_fidelity is not None else 1.0),
@@ -1236,18 +1259,24 @@ RESPONSIVE_CSS = """
   object-fit: contain;
 }
 
+/* Wide screens: prompt and output share the first row. */
+#anima-main { align-items: stretch; }
+#anima-main > * { min-width: 0 !important; }
+#anima-quick-settings { align-items: end; }
+#anima-tabs { margin-top: 8px; }
 #anima-actions { flex-wrap: wrap; }
-#anima-controls .gr-row, #anima-controls .flex { flex-wrap: wrap !important; }
+#anima-prompt-column .gr-row, #anima-prompt-column .flex,
+#anima-quick-settings .gr-row, #anima-quick-settings .flex { flex-wrap: wrap !important; }
 
-/* Narrow: collapse to a single column, preserving DOM order
-   (result, then prompt, then the button). */
+/* Narrow screens preserve the requested action order: prompt, result, settings. */
 @media (max-width: 900px) {
   #anima-main { flex-direction: column !important; }
   #anima-main > * { min-width: 100% !important; }
-  #anima-actions { flex-direction: column !important; }
-  #anima-actions > * { width: 100% !important; }
+  #anima-actions { flex-direction: row !important; }
+  #anima-actions > * { min-width: 0 !important; }
   #anima-result img, #anima-result video { max-height: 42vh !important; }
-  #anima-controls .gr-row, #anima-controls .flex { flex-direction: column !important; }
+  #anima-prompt-column .gr-row, #anima-prompt-column .flex,
+  #anima-quick-settings .gr-row, #anima-quick-settings .flex { flex-direction: row !important; }
   #anima-advanced .gr-row > *, #anima-advanced .flex > * { min-width: 100% !important; }
   .gradio-container { padding: 8px !important; }
   #anima-status textarea { font-size: 0.85rem; }
@@ -1275,24 +1304,10 @@ def build():
     w0, h0 = size_for_aspect(1, 1, MP_TARGETS["1.0 MP"])
 
     with gr.Blocks(title="Anima Aesthetic TPU", fill_height=True) as demo:
-        # Wide screens get two columns (result | controls). Below 900px the CSS
-        # stacks them, and because the result comes first in the DOM that
-        # collapse reads as result -> prompt -> button on a phone.
+        # Main workspace: prompt and output are peers. On narrow screens, the
+        # prompt naturally comes first, followed by the result.
         with gr.Row(elem_id="anima-main"):
-            with gr.Column(scale=3):
-                result = gr.Image(label="Result", height=560, elem_id="anima-result")
-                # Individual images only mean something for a batch, so this stays
-                # hidden until a batch actually produces them. It shares this column
-                # with the result, so showing one hides the other.
-                gallery = gr.Gallery(label="Individual images (with seeds)", columns=3,
-                                     height=560, object_fit="contain", visible=False,
-                                     elem_id="anima-gallery")
-                # Below BOTH panels: the bar describes whichever one is showing, and
-                # stays in place when the gallery takes the result's spot.
-                progress = gr.HTML(progress_bar_html(0, "idle"),
-                                   elem_id="anima-progress")
-            with gr.Column(scale=2, elem_id="anima-controls"):
-                # Prompt and negative belong together: one group, no accordion.
+            with gr.Column(scale=1, elem_id="anima-prompt-column"):
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
                                     placeholder="prompt — supports (weights:1.3) "
                                                 "and [before:after:0.5] schedules")
@@ -1302,144 +1317,152 @@ def build():
                     btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
                     stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4,
                                      visible=False)
+            with gr.Column(scale=1, elem_id="anima-result-column"):
+                result = gr.Image(label="Result", height=440, elem_id="anima-result")
+                # A batch temporarily replaces the single-image result in this slot.
+                gallery = gr.Gallery(label="Individual images (with seeds)", columns=3,
+                                     height=440, object_fit="contain", visible=False,
+                                     elem_id="anima-gallery")
+                progress = gr.HTML(progress_bar_html(0, "idle"),
+                                   elem_id="anima-progress")
                 status = gr.Textbox(label="Status", interactive=False, show_label=False,
                                     placeholder="idle", elem_id="anima-status")
 
-                with gr.Row():
-                    steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
-                    batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
-                                            label="Batch count",
-                                            info="Images generated together, step by "
-                                                 "step. Image k uses seed + k.")
+        gr.Markdown("### Quick settings")
+        with gr.Row(elem_id="anima-quick-settings"):
+            steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
+            batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
+                                    label="Batch count",
+                                    info="Images generated together, step by step. Image k uses seed + k.")
+            guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                 label="CFG guidance")
+            seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
+            preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Aspect preset",
+                                 info="Quick-fill the ratio")
+            mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Image size",
+                                 info="Custom size is available in Settings.")
 
+        with gr.Tabs(elem_id="anima-tabs"):
+            with gr.Tab("Settings"):
                 gr.Markdown("### Resolution")
                 with gr.Row():
                     aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
                     aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
-                    preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Preset",
-                                         info="Quick-fill the ratio")
                     swap = gr.Button("Swap W/H", size="sm")
-                mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Megapixels",
-                                     info="1 MP = 1024 x 1024 px. Custom size lets you "
-                                          "type the pixels.")
                 with gr.Row():
                     width = gr.Number(value=w0, label="Width (px)", precision=0,
                                       interactive=False)
                     height = gr.Number(value=h0, label="Height (px)", precision=0,
                                        interactive=False)
                 shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
-
-                with gr.Row():
-                    guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
-                                         label="CFG guidance")
-                    seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)",
-                                     precision=0)
-                    preview_every = gr.Slider(0, 10, value=5, step=1,
-                                              label="VAE preview every N steps (0 = off)",
-                                              info="Each preview decodes every image "
-                                                   "in the batch.")
+                gr.Markdown("### Sampling & prompt options")
+                preview_every = gr.Slider(0, 10, value=5, step=1,
+                                          label="VAE preview every N steps (0 = off)",
+                                          info="Each preview decodes every image in the batch.")
                 with gr.Row():
                     prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
                                                label="Prompt style",
-                                               info="comfy = ComfyUI core rules. a1111 "
-                                                    "adds [x] / {x}. safe = only "
-                                                    "(x:weight), plain parens stay literal.")
+                                               info="Comfy = core rules; a1111 adds [x] / {x}; safe treats plain parentheses literally.")
                     tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
                                       info="Space or comma separated, e.g. SECOND_PASS")
-                with gr.Accordion("LoRA picker — click a name to add it to the prompt",
-                                  open=False):
-                    lora_menu = gr.HTML(_lora_menu_html(""))
-                    lora_pick = gr.Dropdown(choices=_installed_loras(), value=None,
-                                            multiselect=False, label="Add a LoRA",
-                                            info="Pick one and its <lora:name:scale> "
-                                                 "tag is appended to the prompt.")
-                    with gr.Row():
-                        lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
-                                               label="Strength for the picked LoRA")
-                        lora_refresh = gr.Button("Refresh list", size="sm")
-                        lora_remove = gr.Button("Remove tags from prompt", size="sm")
-                    # Fetching a file is safe while the TPU generates: only a
-                    # merge touches the weights, and that now happens on request.
-                    lora_url = gr.Textbox(
-                        label="Add from link (HuggingFace or CivitAI)",
-                        placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors "
-                                    "or https://civitai.com/models/12345",
-                        info="Downloads and validates into /content/anima_lora. "
-                             "A CivitAI model page becomes its API download route; "
-                             "a bare HuggingFace repo picks a .safetensors file.")
-                    lora_add = gr.Button("Download & validate", variant="secondary")
-                    lora_state = gr.HTML(_lora_state_html())
-                with gr.Accordion("SnapRef — character reference (reference adapter)", open=False):
-                    gr.HTML(
-                        "<div class='snapref-board'><h3>Build your character board</h3>"
-                        "<div class='snapref-hint'>Add one or more pictures of the same character. "
-                        "The selected cards become the visual identity for your generation.</div></div>"
-                    )
-                    with gr.Row(elem_classes="snapref-board"):
-                        with gr.Column(scale=1, min_width=250):
-                            snapref_on = gr.Checkbox(value=False, label="Use these references",
-                                                     info="Off keeps the plain pipeline. On uses the selected cards.")
-                            snapref_upload = gr.File(label="Drop reference images here",
-                                                     file_count="multiple", file_types=["image"],
-                                                     type="filepath", height=145)
-                            snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
-                        with gr.Column(scale=2, min_width=360):
-                            snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
-                                                         label="Saved references",
-                                                         columns=3, rows=1, height=220,
-                                                         object_fit="cover", allow_preview=True,
-                                                         show_label=True, elem_classes="snapref-gallery",
-                                                         type="filepath")
-                            snapref_state = gr.HTML(_snapref_state_html())
-                    with gr.Row():
-                        snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
-                                                  multiselect=True, label="Use these cards",
-                                                  info="Select one or several cards. They must show the SAME character.")
-                        snapref_refresh = gr.Button("↻ Refresh board", size="sm")
-                    with gr.Row():
-                        snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Reference mode",
-                                                   info="cs = character + style; char = character only")
-                        snapref_adapter = gr.Dropdown(
-                            choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
-                            value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
-                            label="Adapter", info="snapref_v1a.safetensors (bf16 or fp8)")
-                    with gr.Row():
-                        snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1, label="Strength",
-                                                     info="0 = as trained; positive values pull harder toward the cards")
-                        snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="Fidelity",
-                                                     info="1 = keep every detail; lower follows the prompt more freely")
-                        snapref_megapixels = gr.Slider(0.25, 2.0,
-                                                       value=float(os.environ.get("ANIMA_SNAPREF_MP", "1.0")),
-                                                       step=0.05, label="Reference size (MP)")
-                    with gr.Row():
-                        snapref_in_uncond = gr.Checkbox(value=False, label="Reference in negative too",
-                                                        info="Off (trained): only the positive branch reads it")
-                        snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
-                                                    info="Extra model call per step; ignores negative-too and fidelity")
-                        snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
-                                               info="Higher values pull closer to the references")
-                        snapref_correction = gr.Dropdown(["apg", "rescale", "none"], value="apg",
-                                                         label="Correction")
-                    snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
-                                                 placeholder="1girl, solo, brown hair, red jacket",
-                                                 info="Appearance tags from the cards; helps with accessories.")
-                    gr.Markdown(
-                        "Strength lives in the prompt, A1111 style: "
-                        "`<lora:name:0.8>`. The server merges only when the set "
-                        "or a strength actually changes (~4 s warm), so editing "
-                        "words between generations costs nothing. `<lora:none>` "
-                        "goes back to the bare base. The first generation after "
-                        "a change pays the merge; the next ones do not.\n\n"
-                        "*Fallback:* if a hot swap ever leaves the server in a "
-                        "bad state, restart it with nothing merged —")
-                    with gr.Row():
-                        lora_restart = gr.Button("Restart server with base weights",
-                                                 size="sm", variant="stop")
-                with gr.Accordion("Prompt syntax reference", open=False):
-                    gr.Markdown(SYNTAX_HELP)
 
-        gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
-                    f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
+            with gr.Tab("LoRAs"):
+                gr.Markdown("### LoRA picker — click a name to add it to the prompt")
+                lora_menu = gr.HTML(_lora_menu_html(""))
+                lora_pick = gr.Dropdown(choices=_installed_loras(), value=None,
+                                        multiselect=False, label="Add a LoRA",
+                                        info="Pick one and its <lora:name:scale> tag is appended to the prompt.")
+                with gr.Row():
+                    lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
+                                           label="Strength for the picked LoRA")
+                    lora_refresh = gr.Button("Refresh list", size="sm")
+                    lora_remove = gr.Button("Remove tags from prompt", size="sm")
+                # Downloading is safe during generation; only a merge touches weights.
+                lora_url = gr.Textbox(
+                    label="Add from link (HuggingFace or CivitAI)",
+                    placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors or https://civitai.com/models/12345",
+                    info="Downloads and validates into the LoRA directory.")
+                lora_add = gr.Button("Download & validate", variant="secondary")
+                lora_state = gr.HTML(_lora_state_html())
+                gr.Markdown(
+                    "Strength lives in the prompt, A1111 style: `<lora:name:0.8>`. "
+                    "The server merges only when the set or strength changes. "
+                    "`<lora:none>` returns to the base model.")
+                lora_restart = gr.Button("Restart server with base weights",
+                                         size="sm", variant="stop")
+
+            with gr.Tab("SnapRef"):
+                gr.Markdown(
+                    "### Character reference\nAdd one or more pictures of the same character. "
+                    "Selected cards guide visual identity.")
+                with gr.Row(elem_classes="snapref-board"):
+                    with gr.Column(scale=1, min_width=250):
+                        snapref_on = gr.Checkbox(value=False, label="Use these references",
+                                                 info="Off keeps the plain pipeline. On uses selected cards.")
+                        snapref_upload = gr.File(label="Drop reference images here",
+                                                 file_count="multiple", file_types=["image"],
+                                                 type="filepath", height=145)
+                        snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
+                    with gr.Column(scale=2, min_width=360):
+                        snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
+                                                     label="Saved references", columns=3,
+                                                     rows=1, height=220, object_fit="cover",
+                                                     allow_preview=True, show_label=True,
+                                                     elem_classes="snapref-gallery", type="filepath")
+                        snapref_state = gr.HTML(_snapref_state_html())
+                with gr.Row():
+                    snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
+                                              multiselect=True, label="Use these cards",
+                                              info="Select cards showing the SAME character.")
+                    snapref_refresh = gr.Button("↻ Refresh board", size="sm")
+                with gr.Row():
+                    snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Reference mode",
+                                               info="cs = character + style; char = character only")
+                    snapref_layout = gr.Dropdown(["separate", "stitch"], value="separate",
+                                                 label="Reference layout",
+                                                 info="separate = each card contributes independently; stitch = side-by-side board")
+                    snapref_adapter = gr.Dropdown(
+                        choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
+                        value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
+                        label="Adapter", info="SnapRef v1a/v1b/v2a adapters; select any installed compatible release")
+                with gr.Row():
+                    snapref_weight_1 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 1 weight",
+                                                 info="v2: separate layout only; 0 skips this card")
+                    snapref_weight_2 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 2 weight",
+                                                 info="v2: separate layout only; 0 skips this card")
+                    snapref_weight_3 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 3 weight",
+                                                 info="v2: separate layout only; 0 skips this card")
+                with gr.Row():
+                    snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1, label="Strength",
+                                                 info="0 = as trained; positive pulls harder toward references")
+                    snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="Fidelity",
+                                                 info="1 = keep details; lower follows the prompt more freely")
+                    snapref_megapixels = gr.Slider(0.25, 2.0,
+                                                   value=float(os.environ.get("ANIMA_SNAPREF_MP", "1.0")),
+                                                   step=0.05, label="Reference size (MP)")
+                with gr.Row():
+                    snapref_in_uncond = gr.Checkbox(value=False, label="Reference in negative too",
+                                                    info="Off (trained): only the positive branch reads it")
+                    snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
+                                                info="Extra model call per step; ignores negative-too and fidelity")
+                    snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
+                                           info="Higher values pull closer to references")
+                    snapref_correction = gr.Dropdown(["apg", "rescale", "none"], value="apg",
+                                                     label="Correction")
+                snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
+                                             placeholder="1girl, solo, brown hair, red jacket",
+                                             info="Appearance tags from the cards; helps with accessories.")
+
+            with gr.Tab("Help"):
+                gr.Markdown(
+                    "### v1 / v2 reference features\n"
+                    "**v1a/v1b:** one or more cards, Character & Style or Character, strength and fidelity.\n\n"
+                    "**v2a:** adds `char` mode, multiple views of the same character, per-card weights, and `separate` / `stitch` layout. "
+                    "Weights apply in `separate` layout; `stitch` builds one side-by-side reference.\n\n"
+                    "The backend accepts published v1a, v1b, v2a and v2a-pre2 adapters. There is currently no public v2b release."
+                )
+                gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
+                            f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
 
         # ---- resolution wiring -------------------------------------------------------
         def apply_size(aw, ah, mp, w, h):
@@ -1501,7 +1524,8 @@ def build():
                           snapref_on, snapref_mode, snapref_adapter, snapref_ref,
                           snapref_strength, snapref_fidelity, snapref_megapixels,
                           snapref_in_uncond, snapref_rg_on, snapref_rg, snapref_correction,
-                          snapref_caption],
+                          snapref_caption, snapref_layout, snapref_weight_1, snapref_weight_2,
+                          snapref_weight_3],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app

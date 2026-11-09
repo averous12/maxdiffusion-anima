@@ -654,12 +654,12 @@ def get_snapref_adapter(name):
         _SNAPREF_ADAPTERS[path] = anima_snapref.load_snapref(path, num_layers=28, dtype=jnp.float32)
         ad = _SNAPREF_ADAPTERS[path]
         log(f"SnapRef adapter loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)} "
-            f"(streams {list(ad.stream_names())}, ref_t {ad.ref_t}, modes {list(ad.modes)}, "
+            f"(release {ad.meta.get('version', 'unknown')}, step {ad.meta.get('step', '?')}, "
+            f"streams {list(ad.stream_names())}, ref_t {ad.ref_t}, modes {list(ad.modes)}, "
             f"mode_embed {None if ad.mode_embed is None else ad.mode_embed.shape})")
     return _SNAPREF_ADAPTERS[path]
 
-def _load_reference_pixels(path, megapixels):
-    """Reference image file -> (1,3,1,h,w) pixels in [-1,1] at the adapter's reference size."""
+def _open_reference_image(path):
     from PIL import Image, ImageOps
     img = ImageOps.exif_transpose(Image.open(path))
     if img.mode in ("RGBA", "LA", "P"):
@@ -667,11 +667,39 @@ def _load_reference_pixels(path, megapixels):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[3])
         img = bg
-    img = img.convert("RGB")
+    return img.convert("RGB")
+
+
+def _load_reference_pixels(path, megapixels):
+    """Reference image file -> (1,3,1,h,w) pixels in [-1,1] at the adapter's reference size."""
+    img = _open_reference_image(path)
     w, h = anima_snapref.reference_latent_size(img.width, img.height, megapixels)
     img = img.resize((w, h), Image.LANCZOS)
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))[None, :, None]          # (1,3,1,h,w)
+    return jnp.asarray(arr * 2.0 - 1.0), (w, h)
+
+
+def _load_stitched_reference_pixels(paths, megapixels):
+    """Stitch references side-by-side, preserving each image's aspect ratio."""
+    from PIL import Image
+    imgs = [_open_reference_image(p) for p in paths]
+    if not imgs:
+        raise anima_snapref.SnapRefError("stitch layout has no positive references")
+    target_h = max(im.height for im in imgs)
+    resized = []
+    for im in imgs:
+        w = max(1, round(im.width * target_h / im.height))
+        resized.append(im.resize((w, target_h), Image.LANCZOS))
+    canvas = Image.new("RGB", (sum(im.width for im in resized), target_h), "white")
+    x = 0
+    for im in resized:
+        canvas.paste(im, (x, 0))
+        x += im.width
+    w, h = anima_snapref.reference_latent_size(canvas.width, canvas.height, megapixels)
+    canvas = canvas.resize((w, h), Image.LANCZOS)
+    arr = np.asarray(canvas, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))[None, :, None]
     return jnp.asarray(arr * 2.0 - 1.0), (w, h)
 
 def _snapref_cond_tensor(text):
@@ -698,27 +726,45 @@ def prepare_snapref(cfg, target_hw):
     caption = str(cfg.get("ref_caption") or "")
     ref_ctx = _snapref_cond_tensor(caption)
     mode_vec = ad.mode_vector(mode)
-    records, sizes = [], []
-    for path, w in zip(refs, weights):
-        if w <= 0:
-            continue
-        px, (pw, ph) = _load_reference_pixels(path, megapixels)
+    layout = str(cfg.get("multi_layout") or "separate").lower()
+    if layout not in ("separate", "stitch"):
+        raise anima_snapref.SnapRefError("snapref.multi_layout must be 'separate' or 'stitch'")
+    active = [(p, w) for p, w in zip(refs, weights) if w > 0]
+    if not active:
+        raise anima_snapref.SnapRefError("every reference has weight 0")
+    if layout == "stitch":
+        paths = [p for p, _w in active]
+        px, (pw, ph) = _load_stitched_reference_pixels(paths, megapixels)
         lat = snapref_encode_latent(px)
-        rh, rw = max(1, ph // 16), max(1, pw // 16)      # VAE stride 8, patch 2
+        rh, rw = max(1, ph // 16), max(1, pw // 16)
         th, tw = max(1, target_hw[0] // 16), max(1, target_hw[1] // 16)
         cos, sin = anima_snapref.reference_rope((th, tw), (rh, rw), ad.ref_t)
         _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
             (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
             ad.lora_tree("ref"))
         kv[0][0].block_until_ready()
-        records.append(kv)
-        sizes.append(int(kv[0][0].shape[1]))
-        log(f"SnapRef reference {os.path.basename(path)} -> {pw}x{ph}px, {sizes[-1]} tokens, weight {w}")
+        records, sizes = [kv], [int(kv[0][0].shape[1])]
+        effective_weights = [max(weights)]
+        log(f"SnapRef stitched {len(paths)} references -> {pw}x{ph}px, {sizes[0]} tokens")
+    else:
+        records, sizes, effective_weights = [], [], []
+        for path, w in active:
+            px, (pw, ph) = _load_reference_pixels(path, megapixels)
+            lat = snapref_encode_latent(px)
+            rh, rw = max(1, ph // 16), max(1, pw // 16)
+            th, tw = max(1, target_hw[0] // 16), max(1, target_hw[1] // 16)
+            cos, sin = anima_snapref.reference_rope((th, tw), (rh, rw), ad.ref_t)
+            _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
+                (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
+                ad.lora_tree("ref"))
+            kv[0][0].block_until_ready()
+            records.append(kv); sizes.append(int(kv[0][0].shape[1])); effective_weights.append(w)
+            log(f"SnapRef reference {os.path.basename(path)} -> {pw}x{ph}px, {sizes[-1]} tokens, weight {w}")
     cache = anima_snapref.concat_reference_kv(records)
-    size_list = [s for s, w in zip(sizes, [w for w in weights if w > 0])]
+    size_list = list(sizes)
     bias = anima_snapref.key_biases(size_list,
                                     anima_snapref.reference_biases(cfg.get("strength", 0.0),
-                                                                   [w for w in weights if w > 0]),
+                                                                   effective_weights),
                                     (target_hw[0] // 16) * (target_hw[1] // 16))
     _SNAPREF_STATE["kv"] = cache
     secs = time.perf_counter() - t0

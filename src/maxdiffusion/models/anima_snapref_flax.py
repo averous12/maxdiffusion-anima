@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,7 @@ import numpy as np
 from safetensors import safe_open
 
 SNAPREF_FORMAT = "anima_ref_kv/1"
+SUPPORTED_SNAPREF_RELEASES = ("v1a", "v1b", "v2a", "v2a-pre1", "v2a-pre2")
 
 # adapter module name -> path inside one block's LoRA tree.
 # The tree mirrors the model: {"attn1": {dense name: (A, B)}, "attn2": {...},
@@ -129,6 +131,20 @@ def load_snapref(path, num_layers=28, dtype=jnp.float32, expect_layers=None):
   with safe_open(path, framework="np") as handle:
     meta = handle.metadata() or {}
     raw = json.loads(meta.get("snapref") or meta.get("anima_ref_kv") or "{}")
+    release = str(raw.get("version") or "")
+    if not release:
+      stem = os.path.basename(path).lower()
+      release = next((name for name in SUPPORTED_SNAPREF_RELEASES if name.replace("-", "_") in stem), "unknown")
+    if release == "unknown":
+      # v2a stable omitted `version` metadata; its filename is the authoritative release hint.
+      stem = os.path.basename(path).lower()
+      if "v2a" in stem:
+        release = "v2a"
+    if release != "unknown" and release not in SUPPORTED_SNAPREF_RELEASES:
+      raise SnapRefError(f"unsupported SnapRef release {release!r}; supported releases: "
+                         + ", ".join(SUPPORTED_SNAPREF_RELEASES))
+    if raw.get("base") and raw["base"] != "anima-base-v1.0.safetensors":
+      raise SnapRefError(f"adapter targets unsupported base {raw['base']!r}")
     if raw.get("format") != SNAPREF_FORMAT:
       raise SnapRefError(f"{path} is not an {SNAPREF_FORMAT} adapter (metadata: {raw.get('format')!r})")
     keys = set(handle.keys())

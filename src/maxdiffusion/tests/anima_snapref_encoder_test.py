@@ -113,6 +113,26 @@ def test_bias_covers_the_latent_grid_divided_by_patch_area():
   assert bias.shape[0] != 972 + lat_hw[0] * lat_hw[1], "the raw latent grid must not be used"
 
 
+def test_reference_biases_reject_zero_weight():
+  try:
+    sf.reference_biases(0.0, [0.0])
+  except (ValueError, ZeroDivisionError):
+    return
+  raise AssertionError("zero reference weight must be rejected before log-bias construction")
+
+
+def test_reference_biases_support_v2_weights():
+  vals = sf.reference_biases(0.0, [1.0, 0.4])
+  assert vals[0] == 0.0
+  assert vals[1] < 0.0
+
+
+def test_stitched_reference_geometry_is_side_by_side():
+  # v2 stitch uses one cache record, so its bias has one reference segment.
+  bias = sf.key_biases([128], sf.reference_biases(0.0, [1.0]), 4096)
+  assert bias.shape == (128 + 4096,)
+
+
 def test_reference_rope_length_matches_reference_tokens():
   """The RoPE table and the reference token count must agree, or attention cannot broadcast."""
   for (pw, ph) in [(432, 576), (512, 512), (768, 1024)]:
