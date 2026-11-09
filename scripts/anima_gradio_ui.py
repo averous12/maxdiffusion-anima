@@ -99,10 +99,71 @@ def _snapref_gallery_items():
     return [(path, f"Reference · {os.path.basename(path)}") for path in _snapref_files()]
 
 
+def _snapref_selection_html(selected):
+    """Compact selected-reference summary; filenames are escaped for HTML."""
+    import html as _html
+
+    names = [os.path.basename(p) for p in (selected or [])]
+    if not names:
+        return "<div class='snapref-selection'>No reference cards selected</div>"
+    chips = " ".join(f"<code>{_html.escape(n)}</code>" for n in names)
+    return (f"<div class='snapref-selection'>{len(names)} selected: {chips}</div>")
+
+
+def toggle_snapref_selection(selected, evt):
+    """Toggle a reference image from Gallery.select into a multi-select path list."""
+    paths = _snapref_files()
+    index = evt.index
+    if isinstance(index, (tuple, list)):
+        index = index[0] if index else -1
+    try:
+        path = paths[int(index)]
+    except (ValueError, TypeError, IndexError):
+        selected = [p for p in (selected or []) if p in paths]
+        return selected, _snapref_selection_html(selected)
+
+    chosen = [p for p in (selected or []) if p in paths]
+    if getattr(evt, "selected", True):
+        if path not in chosen and len(chosen) < 3:
+            chosen.append(path)
+    else:
+        chosen = [p for p in chosen if p != path]
+    return chosen, _snapref_selection_html(chosen)
+
+
+def clear_snapref_selection():
+    return [], _snapref_selection_html([])
+
+
+def _snapref_choice_names():
+    return [os.path.basename(p) for p in _snapref_files()]
+
+
+def _snapref_selection_note(names):
+    """Explain the current selection without mutating the checkbox state mid-click."""
+    names = [name for name in (names or []) if name in set(_snapref_choice_names())]
+    if len(names) > 3:
+        return f"{len(names)} selected — choose no more than three before generating."
+    if not names:
+        return "No reference cards selected"
+    return f"{len(names)} reference card(s) selected"
+
+
+def _clamp_snapref_selection(names):
+    """Keep only installed reference names and enforce the three-card limit."""
+    allowed = set(_snapref_choice_names())
+    chosen = [name for name in (names or []) if name in allowed]
+    overflow = len(chosen) > 3
+    chosen = chosen[:3]
+    note = "Select up to three reference cards. Extra selections were cleared." if overflow else (
+        f"{len(chosen)} reference card(s) selected" if chosen else "No reference cards selected")
+    return chosen, note
+
+
 def save_snapref_reference(files):
-    """Copy uploaded reference pictures and refresh both visual and precise pickers."""
+    """Copy uploaded reference pictures and refresh the image-first library."""
     if not files:
-        return _upd(), _upd(), _snapref_state_html("no file picked")
+        return _upd(), _snapref_state_html("no file picked"), _upd(choices=_snapref_choice_names())
     from PIL import Image, ImageOps
 
     imported, bad = [], []
@@ -125,7 +186,8 @@ def save_snapref_reference(files):
     note = f"saved {', '.join(imported)}" if imported else "nothing saved"
     if bad:
         note += f" — failed: {', '.join(bad)}"
-    return _upd(choices=names), _upd(value=_snapref_gallery_items()), _snapref_state_html(note)
+    return (_upd(value=_snapref_gallery_items()), _snapref_state_html(note),
+            _upd(choices=_snapref_choice_names()))
 
 
 def _snapref_state_html(note=""):
@@ -507,6 +569,13 @@ def _installed_loras():
         return []
 
 
+def _filter_loras(query=""):
+    """Return installed LoRA filenames matching the search query."""
+    query = (query or "").strip().casefold()
+    names = _installed_loras()
+    return [name for name in names if query in name.casefold()] if query else names
+
+
 def _loaded_loras():
     """What the RUNNING server merged, read back from its own boot log.
 
@@ -577,7 +646,7 @@ def _lora_state_html(note="", pct=None):
             extra = f" ({n} tensors)" if n else ""
             out += (f"<div class='lora-dl'>✓ "
                     f"{_html.escape(str(dl.get('name') or 'file'))}{extra} ready — "
-                    f"select it above, then Apply</div>")
+                    f"available in the LoRA library</div>")
 
     if pct is not None:
         pct = max(0, min(100, int(pct)))
@@ -733,11 +802,10 @@ def _lora_menu_html(prompt_text):
 
 
 def insert_lora(prompt_text, name, scale):
-    """Picker callback: put the tag in the prompt and reset the dropdown.
+    """Put the selected LoRA tag in the prompt, then clear the card selection.
 
-    Resetting to None matters: Gradio only fires .change when the value
-    actually changes, so without this a second click on the same name would do
-    nothing.
+    Clearing the Radio value allows the same card to be selected again after a
+    strength change, just as resetting the old dropdown did.
     """
     import gradio as gr
 
@@ -1041,6 +1109,9 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     # same shape as before (no "snapref" key), so the server's plain path is untouched.
     if snapref_on:
         _refs = [r for r in (snapref_refs or []) if r]
+        if len(_refs) > 3:
+            return ("select no more than three reference pictures",
+                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
         if not _refs:
             return ("pick at least one reference picture, or untick 'Use SnapRef'",
                     _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
@@ -1210,7 +1281,13 @@ RESPONSIVE_CSS = """
 }
 
 /* Boot tracker: shown only while a LoRA reboot is running, then it clears. */
-.lora-state { font-size: 12px; margin-bottom: 4px; }
+.anima-lora-menu { margin: 8px 0; }
+#anima-lora-cards .wrap { display: grid !important; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+#anima-lora-cards label { min-height: 62px; align-items: flex-start !important; border: 1px solid var(--border-color-primary, #3a3a3a); border-radius: 10px; padding: 10px !important; background: var(--background-fill-secondary, #20212b); }
+#anima-lora-cards label:hover { border-color: var(--color-accent, #f97316); }
+#anima-lora-cards label:has(input:checked) { border-color: var(--color-accent, #f97316); box-shadow: 0 0 0 1px var(--color-accent, #f97316); }
+#anima-lora-cards label span { overflow-wrap: anywhere; font-size: 12px; }
+#anima-lora-cards input { margin-top: 3px; }
 .lora-bar {
   position: relative;
   width: 100%;
@@ -1240,16 +1317,12 @@ RESPONSIVE_CSS = """
 }
 .lora-dl.lora-err { color: var(--error-text-color, #f87171); }
 
-# SnapRef reference board
-# The gallery is intentionally image-first: filenames and precise multi-select remain available,
-# but users can understand their references at a glance.
-.snapref-board { border: 1px solid var(--border-color-primary, #3a3a3a); border-radius: 14px; padding: 14px; }
-.snapref-board h3 { margin: 0 0 4px 0; font-size: 16px; }
-.snapref-board .snapref-hint { color: var(--body-text-color-subdued, #aaa); font-size: 12px; margin-bottom: 12px; }
-.snapref-gallery { min-height: 150px; }
-.snapref-gallery .grid-wrap { gap: 10px !important; }
-.snapref-gallery .thumbnail-item { border-radius: 12px !important; overflow: hidden; }
-.snapref-gallery img { object-fit: cover !important; }
+# SnapRef reference board: fixed thumbnail height; never crop the source image.
+#anima-snapref-gallery .gallery-item { min-width: 0 !important; }
+#anima-snapref-gallery .thumbnail-item { width: 100% !important; height: 150px !important; aspect-ratio: auto !important; }
+#anima-snapref-gallery img { display: block !important; width: auto !important; height: 150px !important; max-width: 100% !important; object-fit: contain !important; margin: 0 auto !important; }
+#anima-snapref-ref .wrap { display: grid !important; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
+#anima-snapref-ref label { border: 1px solid var(--border-color-primary, #3a3a3a); border-radius: 9px; padding: 8px !important; background: var(--background-fill-secondary, #20212b); }
 .snapref-empty { min-height: 120px; display: flex; align-items: center; justify-content: center;
   border: 1px dashed var(--border-color-primary, #555); border-radius: 12px;
   color: var(--body-text-color-subdued, #aaa); font-size: 13px; }
@@ -1360,22 +1433,24 @@ def build():
                                           label="VAE preview every N steps (0 = off)",
                                           info="Each preview decodes every image in the batch.")
                 with gr.Row():
-                    prompt_style = gr.Dropdown(list(PROMPT_STYLES), value="comfy",
-                                               label="Prompt style",
-                                               info="Comfy = core rules; a1111 adds [x] / {x}; safe treats plain parentheses literally.")
+                    prompt_style = gr.Radio(list(PROMPT_STYLES), value="comfy",
+                                            label="Prompt style",
+                                            info="Comfy = core rules; a1111 adds [x] / {x}; safe treats plain parentheses literally.")
                     tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
                                       info="Space or comma separated, e.g. SECOND_PASS")
 
             with gr.Tab("LoRAs"):
-                gr.Markdown("### LoRA picker — click a name to add it to the prompt")
+                gr.Markdown("### LoRA library")
+                lora_query = gr.Textbox(label="Search LoRAs", placeholder="Filter by filename…",
+                                        show_label=False)
+                lora_pick = gr.Radio(choices=_installed_loras(), value=None,
+                                     label="Installed LoRAs", interactive=True,
+                                     elem_id="anima-lora-cards")
                 lora_menu = gr.HTML(_lora_menu_html(""))
-                lora_pick = gr.Dropdown(choices=_installed_loras(), value=None,
-                                        multiselect=False, label="Add a LoRA",
-                                        info="Pick one and its <lora:name:scale> tag is appended to the prompt.")
                 with gr.Row():
                     lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
-                                           label="Strength for the picked LoRA")
-                    lora_refresh = gr.Button("Refresh list", size="sm")
+                                           label="Strength for selected LoRA")
+                    lora_refresh = gr.Button("Refresh library", size="sm")
                     lora_remove = gr.Button("Remove tags from prompt", size="sm")
                 # Downloading is safe during generation; only a merge touches weights.
                 lora_url = gr.Textbox(
@@ -1395,36 +1470,39 @@ def build():
                 gr.Markdown(
                     "### Character reference\nAdd one or more pictures of the same character. "
                     "Selected cards guide visual identity.")
-                with gr.Row(elem_classes="snapref-board"):
-                    with gr.Column(scale=1, min_width=250):
-                        snapref_on = gr.Checkbox(value=False, label="Use these references",
-                                                 info="Off keeps the plain pipeline. On uses selected cards.")
-                        snapref_upload = gr.File(label="Drop reference images here",
-                                                 file_count="multiple", file_types=["image"],
-                                                 type="filepath", height=145)
-                        snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
-                    with gr.Column(scale=2, min_width=360):
-                        snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
-                                                     label="Saved references", columns=3,
-                                                     rows=1, height=220, object_fit="cover",
-                                                     allow_preview=True, show_label=True,
-                                                     elem_classes="snapref-gallery", type="filepath")
-                        snapref_state = gr.HTML(_snapref_state_html())
+                snapref_on = gr.Checkbox(value=False, label="Use these references",
+                                         info="Off keeps the plain pipeline. On uses selected cards.")
                 with gr.Row():
-                    snapref_ref = gr.Dropdown(choices=[os.path.basename(p) for p in _snapref_files()],
-                                              multiselect=True, label="Use these cards",
-                                              info="Select cards showing the SAME character.")
-                    snapref_refresh = gr.Button("↻ Refresh board", size="sm")
+                    snapref_upload = gr.File(label="Drop reference images here",
+                                             file_count="multiple", file_types=["image"],
+                                             type="filepath", height=145)
+                    snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
+                snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
+                                             label="Reference library",
+                                             columns=4, rows=2, height=340, object_fit="contain",
+                                             allow_preview=True, show_label=True,
+                                             elem_id="anima-snapref-gallery",
+                                             elem_classes="snapref-gallery", type="filepath")
+                snapref_state = gr.HTML(_snapref_state_html())
+                snapref_ref = gr.CheckboxGroup(choices=_snapref_choice_names(), value=[],
+                                               label="Select up to three reference cards",
+                                               info="Pick multiple images of the same character.",
+                                               elem_id="anima-snapref-ref")
+                snapref_selection_state = gr.Textbox(label="Selection", interactive=False,
+                                                     show_label=False, max_lines=1,
+                                                     placeholder="No reference cards selected")
+                snapref_clear = gr.Button("Clear selection", size="sm")
+                snapref_refresh = gr.Button("↻ Refresh board", size="sm")
                 with gr.Row():
-                    snapref_mode = gr.Dropdown(["cs", "char"], value="cs", label="Reference mode",
-                                               info="cs = character + style; char = character only")
-                    snapref_layout = gr.Dropdown(["separate", "stitch"], value="separate",
-                                                 label="Reference layout",
-                                                 info="separate = each card contributes independently; stitch = side-by-side board")
-                    snapref_adapter = gr.Dropdown(
+                    snapref_mode = gr.Radio(["cs", "char"], value="cs", label="Reference mode",
+                                            info="cs = character + style; char = character only")
+                    snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
+                                              label="Reference layout",
+                                              info="Separate = each card contributes independently; stitch = side-by-side board")
+                    snapref_adapter = gr.Radio(
                         choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
                         value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
-                        label="Adapter", info="SnapRef v1a/v1b/v2a adapters; select any installed compatible release")
+                        label="Adapter", info="Choose an installed compatible SnapRef adapter")
                 with gr.Row():
                     snapref_weight_1 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 1 weight",
                                                  info="v2: separate layout only; 0 skips this card")
@@ -1447,8 +1525,8 @@ def build():
                                                 info="Extra model call per step; ignores negative-too and fidelity")
                     snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
                                            info="Higher values pull closer to references")
-                    snapref_correction = gr.Dropdown(["apg", "rescale", "none"], value="apg",
-                                                     label="Correction")
+                    snapref_correction = gr.Radio(["apg", "rescale", "none"], value="apg",
+                                                  label="Correction")
                 snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
                                              placeholder="1girl, solo, brown hair, red jacket",
                                              info="Appearance tags from the cards; helps with accessories.")
@@ -1540,13 +1618,23 @@ def build():
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
 
         # ---- SnapRef wiring ----------------------------------------------------
+        def update_snapref_selection(names):
+            return _snapref_selection_note(names)
+        snapref_ref.change(update_snapref_selection, inputs=[snapref_ref],
+                           outputs=[snapref_selection_state],
+                           show_progress="hidden")
+        snapref_clear.click(lambda: ([], "No reference cards selected"), inputs=[],
+                            outputs=[snapref_ref, snapref_selection_state],
+                            show_progress="hidden")
         snapref_save.click(save_snapref_reference, inputs=[snapref_upload],
-                           outputs=[snapref_ref, snapref_gallery, snapref_state])
-        snapref_refresh.click(lambda: (gr.update(choices=[os.path.basename(p) for p in _snapref_files()]),
-                                       gr.update(value=_snapref_gallery_items()),
-                                       gr.update(choices=[os.path.basename(p) for p in _snapref_adapters()]
-                                                 or ["(none found)"])),
-                              inputs=[], outputs=[snapref_ref, snapref_gallery, snapref_adapter],
+                           outputs=[snapref_gallery, snapref_state, snapref_ref])
+        def refresh_snapref_board():
+            return (gr.update(value=_snapref_gallery_items()),
+                    gr.update(choices=_snapref_choice_names(), value=[]),
+                    gr.update(choices=[os.path.basename(p) for p in _snapref_adapters()]
+                              or ["(none found)"]))
+        snapref_refresh.click(refresh_snapref_board, inputs=[],
+                              outputs=[snapref_gallery, snapref_ref, snapref_adapter],
                               show_progress="hidden")
         # Guidance ignores 'reference in negative' and 'fidelity' (documented upstream), so
         # the controls say so instead of silently doing nothing.
@@ -1558,15 +1646,16 @@ def build():
             show_progress="hidden")
 
         # ---- LoRA picker wiring ------------------------------------------------
-        lora_refresh.click(lambda: gr.update(choices=_installed_loras()),
+        lora_query.input(lambda query: gr.update(choices=_filter_loras(query), value=None),
+                         inputs=[lora_query], outputs=[lora_pick], show_progress="hidden")
+        lora_refresh.click(lambda: gr.update(choices=_filter_loras(), value=None),
                            inputs=[], outputs=[lora_pick], show_progress="hidden")
         # Fetching is independent of the sampler, so it is not gated on a run;
         # the handler refuses only if another download is already in flight.
         lora_add.click(add_lora_from_link, inputs=[lora_url], outputs=[lora_state],
                        concurrency_limit=1)
-        # Picking a name appends <lora:name:scale> to the prompt. The handler
-        # resets the dropdown so the SAME name can be picked again after a
-        # strength change (Gradio only fires .change on an actual value change).
+        # Selecting a card upserts its prompt tag; clearing selection lets the
+        # same card be picked again after changing strength.
         lora_pick.change(insert_lora, inputs=[prompt, lora_pick, lora_scale],
                          outputs=[prompt, lora_menu, lora_pick, lora_state],
                          show_progress="hidden")
@@ -1590,10 +1679,13 @@ if __name__ == "__main__":
     _port = int(os.environ.get("ANIMA_UI_PORT", "7860"))
     print("sse-safe compression patch:", disable_compression_for_sse(), flush=True)
     demo = build()
+    _allowed_paths = sorted({os.path.abspath(CONTENT), os.path.abspath(SNAPREF_DIR)})
+    print("gradio allowed paths:", _allowed_paths, flush=True)
     demo.launch(
         server_name=os.environ.get("ANIMA_UI_HOST", "0.0.0.0"),
         server_port=_port,
         share=False,
+        allowed_paths=_allowed_paths,
         prevent_thread_lock=True,
         show_error=True,
         css=RESPONSIVE_CSS,   # Gradio 6 moved css/head here from the Blocks ctor
