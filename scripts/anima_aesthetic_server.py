@@ -672,6 +672,7 @@ def _open_reference_image(path):
 
 def _load_reference_pixels(path, megapixels):
     """Reference image file -> (1,3,1,h,w) pixels in [-1,1] at the adapter's reference size."""
+    from PIL import Image
     img = _open_reference_image(path)
     w, h = anima_snapref.reference_latent_size(img.width, img.height, megapixels)
     img = img.resize((w, h), Image.LANCZOS)

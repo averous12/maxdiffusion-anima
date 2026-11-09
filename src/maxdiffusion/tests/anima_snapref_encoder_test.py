@@ -13,8 +13,10 @@ level where they were caused:
 
 Run: python -c "import anima_snapref_encoder_test as t; [getattr(t,n)() for n in dir(t) if n.startswith('test_')]"
 """
+import ast
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -140,6 +142,41 @@ def test_reference_rope_length_matches_reference_tokens():
     cos, sin = sf.reference_rope((64, 64), (rh, rw), 10)
     assert cos.shape[0] == rh * rw, f"{pw}x{ph}: rope {cos.shape[0]} vs tokens {rh * rw}"
     assert cos.shape[1] == 128, f"rope width {cos.shape[1]}"
+
+
+def test_reference_pixel_loader_resizes_uploaded_image():
+  """The production pixel loader must resolve its own Pillow resize constant."""
+  from PIL import Image
+  server_path = Path(__file__).resolve().parents[3] / "scripts" / "anima_aesthetic_server.py"
+  outer = ast.parse(server_path.read_text(encoding="utf-8"))
+  code_node = next(n.value for n in outer.body
+                   if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "code" for t in n.targets))
+  inner = ast.parse(code_node.value)
+  functions = [n for n in inner.body if isinstance(n, ast.FunctionDef)
+               and n.name in {"_open_reference_image", "_load_reference_pixels"}]
+  assert {n.name for n in functions} == {"_open_reference_image", "_load_reference_pixels"}
+
+  class _SnaprefGeometry:
+    @staticmethod
+    def reference_latent_size(width, height, megapixels):
+      return (8, 8)
+
+  class _JaxStub:
+    @staticmethod
+    def asarray(value):
+      return np.asarray(value)
+
+  namespace = {"np": np, "jnp": _JaxStub, "anima_snapref": _SnaprefGeometry}
+  exec(compile(ast.Module(body=functions, type_ignores=[]), str(server_path), "exec"), namespace)
+  fixture = Path(__file__).with_name("snapref_pixel_fixture.png")
+  try:
+    Image.new("RGB", (16, 12), (128, 64, 32)).save(fixture)
+    pixels, size = namespace["_load_reference_pixels"](str(fixture), 1.0)
+    assert size == (8, 8), f"unexpected resized geometry {size}"
+    assert pixels.shape == (1, 3, 1, 8, 8), f"unexpected pixel tensor {pixels.shape}"
+  finally:
+    fixture.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
