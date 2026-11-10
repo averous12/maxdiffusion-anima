@@ -86,6 +86,39 @@ def snapref_adapter_names():
     return [os.path.basename(path) for path in _snapref_adapters()]
 
 
+def build_snapref_config(enabled, adapter, images, mode="cs", layout="separate",
+                         weights=None, strength=0.0, fidelity=1.0, megapixels=1.0,
+                         ref_in_uncond=False, ref_guidance_on=False,
+                         ref_guidance=4.5, correction="apg", caption=""):
+    """Validate UI values and build SnapRef request data, or return an error message."""
+    if not enabled:
+        return None
+    images = [getattr(image, "name", image) for image in (images or []) if image]
+    if not images:
+        return "upload at least one reference image or turn SnapRef off"
+    if len(images) > 3:
+        return "choose no more than three reference images"
+    missing = [path for path in images if not os.path.isfile(path)]
+    if missing:
+        return f"reference image not found: {missing[0]}"
+    if layout not in ("separate", "stitch"):
+        return "reference layout must be separate or stitch"
+    weights = list(weights or [])
+    if len(weights) < len(images):
+        weights.extend([1.0] * (len(images) - len(weights)))
+    weights = [float(weight) for weight in weights[:len(images)]]
+    if not any(weight > 0 for weight in weights):
+        return "at least one reference weight must be above zero"
+    return {
+        "enabled": True, "adapter": adapter or "", "images": images,
+        "weights": weights, "multi_layout": layout, "mode": mode or "cs",
+        "strength": float(strength), "fidelity": float(fidelity),
+        "ref_megapixels": float(megapixels), "ref_in_uncond": bool(ref_in_uncond),
+        "ref_guidance_on": bool(ref_guidance_on), "ref_guidance": float(ref_guidance),
+        "correction": correction or "apg", "ref_caption": caption or "",
+    }
+
+
 # True while this process has a generation in flight. The 1 Hz progress poll
 # stays silent otherwise, so a freshly loaded page does not resurrect the last
 # run's progress (the server's progress file survives restarts) and an idle page
@@ -998,7 +1031,11 @@ def poll_progress():
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
               guidance, preview_every, batch_count, prompt_style="comfy", tags="",
-              snapref_on=False, snapref_adapter="", snapref_image=None):
+              snapref_on=False, snapref_adapter="", snapref_images=None,
+              snapref_mode="cs", snapref_layout="separate", snapref_weights=None,
+              snapref_strength=0.0, snapref_fidelity=1.0,
+              snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
+              snapref_caption=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1018,19 +1055,15 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
     if _tags:
         req["tags"] = _tags
-    # SnapRef keeps a single upload and fixed defaults; only adapter version is user-selectable.
-    if snapref_on:
-        image_path = getattr(snapref_image, "name", snapref_image)
-        if not image_path or not os.path.isfile(image_path):
-            return ("upload a reference image or turn SnapRef off",
-                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
-        req["snapref"] = {
-            "enabled": True, "adapter": snapref_adapter or "", "images": [image_path],
-            "weights": [1.0], "multi_layout": "separate", "mode": "cs",
-            "strength": 0.0, "fidelity": 1.0, "ref_megapixels": 1.0,
-            "ref_in_uncond": False, "ref_guidance_on": False, "ref_guidance": 4.5,
-            "correction": "apg", "ref_caption": "",
-        }
+    # Build and validate all SnapRef settings through one tested request path.
+    snap_cfg = build_snapref_config(
+        snapref_on, snapref_adapter, snapref_images, snapref_mode, snapref_layout,
+        snapref_weights, snapref_strength, snapref_fidelity, 1.0,
+        snapref_in_uncond, snapref_rg_on, snapref_rg, "apg", snapref_caption)
+    if isinstance(snap_cfg, str):
+        return (snap_cfg, _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+    if snap_cfg is not None:
+        req["snapref"] = snap_cfg
     else:
         req.pop("snapref", None)
     t_submit = time.time()
@@ -1210,6 +1243,10 @@ RESPONSIVE_CSS = """
 }
 .lora-dl.lora-err { color: var(--error-text-color, #f87171); }
 
+#anima-snapref-preview .gallery-item { min-width: 0 !important; }
+#anima-snapref-preview .thumbnail-item { width: 100% !important; height: 150px !important; aspect-ratio: auto !important; }
+#anima-snapref-preview img { display: block !important; width: auto !important; height: 150px !important; max-width: 100% !important; object-fit: contain !important; margin: 0 auto !important; }
+
 #anima-result img, #anima-result video {
   max-height: 72vh !important;
   object-fit: contain;
@@ -1350,14 +1387,46 @@ def build():
                                          size="sm", variant="stop")
 
             with gr.Tab("SnapRef"):
-                gr.Markdown("Upload one reference image, enable SnapRef, and choose the adapter version.")
+                gr.Markdown("Upload one or more reference images. Choose a mode; advanced tuning stays tucked away.")
                 snapref_on = gr.Checkbox(value=False, label="Use SnapRef")
-                snapref_upload = gr.Image(label="Reference image", type="filepath", image_mode="RGB")
+                snapref_upload = gr.File(label="Reference images", file_count="multiple",
+                                         file_types=["image"], type="filepath")
+                snapref_preview = gr.Gallery(value=[], label="Selected references", columns=4,
+                                             height=190, object_fit="contain", allow_preview=True,
+                                             elem_id="anima-snapref-preview",
+                                             elem_classes="snapref-preview")
                 adapters = snapref_adapter_names()
                 snapref_adapter = gr.Radio(
                     choices=adapters or ["(none found)"],
                     value=adapters[0] if adapters else "(none found)",
                     label="Adapter version")
+                snapref_mode = gr.Radio(["cs", "char"], value="cs", label="Reference mode",
+                                        info="cs = character + style · char = character only")
+                with gr.Accordion("Advanced SnapRef settings", open=False):
+                    snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
+                                              label="Reference layout",
+                                              info="Separate encodes each card; stitch joins them side by side.")
+                    snapref_weight_1 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
+                                                 label="Reference 1 weight")
+                    snapref_weight_2 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
+                                                 label="Reference 2 weight")
+                    snapref_weight_3 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
+                                                 label="Reference 3 weight")
+                    snapref_weights = gr.State([1.0, 1.0, 1.0])
+                    snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1,
+                                                 label="Reference strength")
+                    snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
+                                                 label="Fidelity")
+                    snapref_in_uncond = gr.Checkbox(value=False,
+                                                    label="Also apply reference to negative branch")
+                    snapref_rg_on = gr.Checkbox(value=False, label="Enable reference guidance",
+                                                info="Adds an extra model call per denoise step.")
+                    snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1,
+                                           label="Reference guidance strength")
+                    snapref_correction = gr.Radio(["apg", "rescale", "none"], value="apg",
+                                                  label="Guidance correction")
+                    snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
+                                                 placeholder="blue hair, red jacket")
 
             with gr.Tab("Help"):
                 gr.Markdown(
@@ -1423,7 +1492,9 @@ def build():
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
                           seed, guidance, preview_every, batch_count, prompt_style, tags,
-                          snapref_on, snapref_adapter, snapref_upload],
+                          snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
+                          snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
+                          snapref_rg_on, snapref_rg, snapref_caption],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app
@@ -1437,6 +1508,17 @@ def build():
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
 
+        def update_snapref_weights(w1, w2, w3):
+            return [float(w1), float(w2), float(w3)]
+        gr.on(triggers=[snapref_weight_1.change, snapref_weight_2.change,
+                        snapref_weight_3.change],
+              fn=update_snapref_weights,
+              inputs=[snapref_weight_1, snapref_weight_2, snapref_weight_3],
+              outputs=[snapref_weights], show_progress="hidden")
+        def update_snapref_preview(files):
+            return files or []
+        snapref_upload.upload(update_snapref_preview, inputs=[snapref_upload],
+                              outputs=[snapref_preview], show_progress="hidden")
         demo.load(lambda: gr.update(choices=snapref_adapter_names()
                                     or ["(none found)"]), inputs=[],
                   outputs=[snapref_adapter], show_progress="hidden")
