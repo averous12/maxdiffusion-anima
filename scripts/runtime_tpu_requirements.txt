@@ -1,6 +1,3 @@
-# JAX/Flax/libtpu are pinned to the recorded TPU stack. jaxlib is matched to JAX;
-# the original TPU log did not record its resolved version separately.
-jax==0.7.2
-jaxlib==0.7.2
+# Install the supported TPU extra as one resolved JAX/jaxlib/libtpu set.
+jax[tpu]==0.7.2
 flax==0.11.2
-libtpu==0.0.34
