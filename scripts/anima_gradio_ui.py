@@ -64,143 +64,27 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ADD_LORA_SCRIPT = os.path.join(REPO_ROOT, "scripts", "add_lora.py")
 SNAP_PATH = os.path.join(CONTENT, "anima_snap.png")
 INTERRUPT_PATH = os.path.join(CONTENT, "anima_interrupt")   # create to cancel the running generation
-# SnapRef reference images live on the VM and are handed to the server by path.
+# SnapRef uploads are request-scoped; adapter files are runtime-local.
 SNAPREF_DIR = os.environ.get("ANIMA_SNAPREF_DIR", os.path.join(CONTENT, "anima_snapref"))
-SNAPREF_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
-
-
-def _snapref_files():
-    """Reference images available to the server (uploaded / saved on the VM)."""
-    try:
-        os.makedirs(SNAPREF_DIR, exist_ok=True)
-        out = [os.path.join(SNAPREF_DIR, f) for f in sorted(os.listdir(SNAPREF_DIR))
-               if f.lower().endswith(SNAPREF_EXTS)]
-        return out
-    except OSError:
-        return []
 
 
 def _snapref_adapters():
-    """SnapRef adapter files the server can load."""
-    dirs = [SNAPREF_DIR, LORA_DIR]
+    """Installed SnapRef adapter files, selectable by version in the UI."""
     out = []
-    for d in dirs:
+    for directory in (SNAPREF_DIR, LORA_DIR):
         try:
-            for f in sorted(os.listdir(d)):
-                if f.lower().endswith(".safetensors") and ("snapref" in f.lower() or "anima_ref_kv" in f.lower()):
-                    out.append(os.path.join(d, f))
+            out.extend(os.path.join(directory, name)
+                       for name in sorted(os.listdir(directory))
+                       if name.lower().endswith(".safetensors")
+                       and ("snapref" in name.lower() or "anima_ref_kv" in name.lower()))
         except OSError:
             pass
     return out
 
 
-def _snapref_gallery_items():
-    """Gallery cards for saved references; captions keep filenames visible."""
-    return [(path, f"Reference · {os.path.basename(path)}") for path in _snapref_files()]
+def snapref_adapter_names():
+    return [os.path.basename(path) for path in _snapref_adapters()]
 
-
-def _snapref_selection_html(selected):
-    """Compact selected-reference summary; filenames are escaped for HTML."""
-    import html as _html
-
-    names = [os.path.basename(p) for p in (selected or [])]
-    if not names:
-        return "<div class='snapref-selection'>No reference cards selected</div>"
-    chips = " ".join(f"<code>{_html.escape(n)}</code>" for n in names)
-    return (f"<div class='snapref-selection'>{len(names)} selected: {chips}</div>")
-
-
-def toggle_snapref_selection(selected, evt):
-    """Toggle a reference image from Gallery.select into a multi-select path list."""
-    paths = _snapref_files()
-    index = evt.index
-    if isinstance(index, (tuple, list)):
-        index = index[0] if index else -1
-    try:
-        path = paths[int(index)]
-    except (ValueError, TypeError, IndexError):
-        selected = [p for p in (selected or []) if p in paths]
-        return selected, _snapref_selection_html(selected)
-
-    chosen = [p for p in (selected or []) if p in paths]
-    if getattr(evt, "selected", True):
-        if path not in chosen and len(chosen) < 3:
-            chosen.append(path)
-    else:
-        chosen = [p for p in chosen if p != path]
-    return chosen, _snapref_selection_html(chosen)
-
-
-def clear_snapref_selection():
-    return [], _snapref_selection_html([])
-
-
-def _snapref_choice_names():
-    return [os.path.basename(p) for p in _snapref_files()]
-
-
-def _snapref_selection_note(names):
-    """Explain the current selection without mutating the checkbox state mid-click."""
-    names = [name for name in (names or []) if name in set(_snapref_choice_names())]
-    if len(names) > 3:
-        return f"{len(names)} selected — choose no more than three before generating."
-    if not names:
-        return "No reference cards selected"
-    return f"{len(names)} reference card(s) selected"
-
-
-def _clamp_snapref_selection(names):
-    """Keep only installed reference names and enforce the three-card limit."""
-    allowed = set(_snapref_choice_names())
-    chosen = [name for name in (names or []) if name in allowed]
-    overflow = len(chosen) > 3
-    chosen = chosen[:3]
-    note = "Select up to three reference cards. Extra selections were cleared." if overflow else (
-        f"{len(chosen)} reference card(s) selected" if chosen else "No reference cards selected")
-    return chosen, note
-
-
-def save_snapref_reference(files):
-    """Copy uploaded reference pictures and refresh the image-first library."""
-    if not files:
-        return _upd(), _snapref_state_html("no file picked"), _upd(choices=_snapref_choice_names())
-    from PIL import Image, ImageOps
-
-    imported, bad = [], []
-    for f in (files if isinstance(files, (list, tuple)) else [files]):
-        path = getattr(f, "name", f)
-        try:
-            img = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
-            stem = os.path.splitext(os.path.basename(path))[0][:60] or "reference"
-            dst = os.path.join(SNAPREF_DIR, stem + ".png")
-            n = 1
-            while os.path.exists(dst):
-                dst = os.path.join(SNAPREF_DIR, f"{stem}_{n}.png")
-                n += 1
-            os.makedirs(SNAPREF_DIR, exist_ok=True)
-            img.save(dst, "PNG")
-            imported.append(os.path.basename(dst))
-        except Exception as e:
-            bad.append(f"{os.path.basename(str(path))}: {type(e).__name__}")
-    names = [os.path.basename(p) for p in _snapref_files()]
-    note = f"saved {', '.join(imported)}" if imported else "nothing saved"
-    if bad:
-        note += f" — failed: {', '.join(bad)}"
-    return (_upd(value=_snapref_gallery_items()), _snapref_state_html(note),
-            _upd(choices=_snapref_choice_names()))
-
-
-def _snapref_state_html(note=""):
-    import html as _html
-
-    refs = [os.path.basename(p) for p in _snapref_files()]
-    ads = [os.path.basename(p) for p in _snapref_adapters()]
-    body = (f"{len(refs)} reference image(s)" if refs else "no reference image")
-    body += f" · adapter: {', '.join(ads) if ads else 'none found'}"
-    out = f"<div class='lora-state'>SnapRef: {body}</div>"
-    if note:
-        out += f"<div class='lora-note'>{_html.escape(note)}</div>"
-    return out
 
 # True while this process has a generation in flight. The 1 Hz progress poll
 # stays silent otherwise, so a freshly loaded page does not resurrect the last
@@ -353,22 +237,46 @@ def save_dir():
     return os.environ.get(SAVE_ENV, "").strip()
 
 
-def _unique(path):
-    if not os.path.exists(path):
-        return path
+def _sha256_file(path):
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_new(path, writer):
+    """Create a new file exclusively; do not overwrite existing Drive files."""
     stem, ext = os.path.splitext(path)
-    n = 1
-    while os.path.exists(f"{stem}_{n}{ext}"):
-        n += 1
-    return f"{stem}_{n}{ext}"
+    n = 0
+    while True:
+        candidate = path if n == 0 else f"{stem}_{n}{ext}"
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            n += 1
+            continue
+        try:
+            with os.fdopen(fd, "wb") as f:
+                writer(f)
+        except Exception:
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+            raise
+        return candidate
+
+
+def _copy_file(src, dst):
+    with open(src, "rb") as source:
+        shutil.copyfileobj(source, dst)
 
 
 def save_outputs(prog, req):
-    """Archive every image of a finished run (plus the grid) with a JSON sidecar each.
-
-    Each individual image's sidecar has its own seed and batch_count 1, so it can be
-    regenerated on its own. Returns a status string, or None when archiving is disabled.
-    """
+    """Archive new content-addressed images and JSON sidecars without overwrites."""
     d = save_dir()
     if not d:
         return None
@@ -379,21 +287,30 @@ def save_outputs(prog, req):
         seeds = prog.get("seeds") or [prog.get("seed", req.get("seed"))]
         meta = {k: v for k, v in req.items() if k not in ("go", "out", "gen_id")}
         tag = f"steps{req['steps']}_{req['width']}x{req['height']}"
-        n = 0
+        count = 0
         for k, src in enumerate(images):
             seed = seeds[k] if k < len(seeds) else seeds[0]
-            dst = _unique(os.path.join(d, f"anima_{ts}_seed{seed}_{tag}.png"))
-            shutil.copy2(src, dst)
-            with open(os.path.splitext(dst)[0] + ".json", "w") as f:
-                json.dump({**meta, "seed": seed, "batch_count": 1}, f, indent=2, sort_keys=True)
-            n += 1
+            digest = _sha256_file(src)
+            stem = f"anima_{ts}_{digest[:16]}_seed{seed}_{tag}"
+            dst = _write_new(os.path.join(d, stem + ".png"),
+                             lambda f, source=src: _copy_file(source, f))
+            sidecar = {**meta, "seed": seed, "batch_count": 1, "image_sha256": digest}
+            _write_new(os.path.splitext(dst)[0] + ".json",
+                       lambda f, data=sidecar: f.write(
+                           json.dumps(data, indent=2, sort_keys=True).encode()))
+            count += 1
         if len(images) > 1 and prog.get("grid"):
-            dst = _unique(os.path.join(d, f"anima_{ts}_grid{len(images)}_seed{seeds[0]}_{tag}.png"))
-            shutil.copy2(prog["grid"], dst)
-            with open(os.path.splitext(dst)[0] + ".json", "w") as f:
-                json.dump({**meta, "seeds": seeds}, f, indent=2, sort_keys=True)
-            n += 1
-        return f"saved {n} file(s) to {d}"
+            src = prog["grid"]
+            digest = _sha256_file(src)
+            stem = f"anima_{ts}_grid{len(images)}_{digest[:16]}_seed{seeds[0]}_{tag}"
+            dst = _write_new(os.path.join(d, stem + ".png"),
+                             lambda f, source=src: _copy_file(source, f))
+            sidecar = {**meta, "seeds": seeds, "image_sha256": digest}
+            _write_new(os.path.splitext(dst)[0] + ".json",
+                       lambda f, data=sidecar: f.write(
+                           json.dumps(data, indent=2, sort_keys=True).encode()))
+            count += 1
+        return f"saved {count} new file(s) to {d}"
     except Exception as e:  # noqa: BLE001
         return f"<archive failed: {type(e).__name__}: {e}>"
 
@@ -1081,11 +998,7 @@ def poll_progress():
 
 def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, seed,
               guidance, preview_every, batch_count, prompt_style="comfy", tags="",
-              snapref_on=False, snapref_mode="cs", snapref_adapter="", snapref_refs=None,
-              snapref_strength=0.0, snapref_fidelity=1.0, snapref_megapixels=1.0,
-              snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
-              snapref_correction="apg", snapref_caption="", snapref_layout="separate",
-              snapref_weight_1=1.0, snapref_weight_2=1.0, snapref_weight_3=1.0):
+              snapref_on=False, snapref_adapter="", snapref_image=None):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1105,38 +1018,18 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
     if _tags:
         req["tags"] = _tags
-    # SnapRef is strictly additive: without the checkbox the request is byte-for-byte the
-    # same shape as before (no "snapref" key), so the server's plain path is untouched.
+    # SnapRef keeps a single upload and fixed defaults; only adapter version is user-selectable.
     if snapref_on:
-        _refs = [r for r in (snapref_refs or []) if r]
-        if len(_refs) > 3:
-            return ("select no more than three reference pictures",
+        image_path = getattr(snapref_image, "name", snapref_image)
+        if not image_path or not os.path.isfile(image_path):
+            return ("upload a reference image or turn SnapRef off",
                     _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
-        if not _refs:
-            return ("pick at least one reference picture, or untick 'Use SnapRef'",
-                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
-        _paths = []
-        for r in _refs:
-            p = r if os.path.isabs(r) else os.path.join(SNAPREF_DIR, r)
-            if not os.path.exists(p):
-                return (f"reference picture not found: {p}",
-                        _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
-            _paths.append(p)
         req["snapref"] = {
-            "enabled": True,
-            "adapter": snapref_adapter or "",
-            "images": _paths,
-            "weights": [float(snapref_weight_1), float(snapref_weight_2), float(snapref_weight_3)][:len(_paths)],
-            "multi_layout": snapref_layout or "separate",
-            "mode": snapref_mode or "cs",
-            "strength": float(snapref_strength or 0.0),
-            "fidelity": float(snapref_fidelity if snapref_fidelity is not None else 1.0),
-            "ref_megapixels": float(snapref_megapixels or 1.0),
-            "ref_in_uncond": bool(snapref_in_uncond),
-            "ref_guidance_on": bool(snapref_rg_on),
-            "ref_guidance": float(snapref_rg or 4.5),
-            "correction": snapref_correction or "apg",
-            "ref_caption": snapref_caption or "",
+            "enabled": True, "adapter": snapref_adapter or "", "images": [image_path],
+            "weights": [1.0], "multi_layout": "separate", "mode": "cs",
+            "strength": 0.0, "fidelity": 1.0, "ref_megapixels": 1.0,
+            "ref_in_uncond": False, "ref_guidance_on": False, "ref_guidance": 4.5,
+            "correction": "apg", "ref_caption": "",
         }
     else:
         req.pop("snapref", None)
@@ -1317,16 +1210,6 @@ RESPONSIVE_CSS = """
 }
 .lora-dl.lora-err { color: var(--error-text-color, #f87171); }
 
-# SnapRef reference board: fixed thumbnail height; never crop the source image.
-#anima-snapref-gallery .gallery-item { min-width: 0 !important; }
-#anima-snapref-gallery .thumbnail-item { width: 100% !important; height: 150px !important; aspect-ratio: auto !important; }
-#anima-snapref-gallery img { display: block !important; width: auto !important; height: 150px !important; max-width: 100% !important; object-fit: contain !important; margin: 0 auto !important; }
-#anima-snapref-ref .wrap { display: grid !important; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; }
-#anima-snapref-ref label { border: 1px solid var(--border-color-primary, #3a3a3a); border-radius: 9px; padding: 8px !important; background: var(--background-fill-secondary, #20212b); }
-.snapref-empty { min-height: 120px; display: flex; align-items: center; justify-content: center;
-  border: 1px dashed var(--border-color-primary, #555); border-radius: 12px;
-  color: var(--body-text-color-subdued, #aaa); font-size: 13px; }
-
 #anima-result img, #anima-result video {
   max-height: 72vh !important;
   object-fit: contain;
@@ -1467,80 +1350,21 @@ def build():
                                          size="sm", variant="stop")
 
             with gr.Tab("SnapRef"):
-                gr.Markdown(
-                    "### Character reference\nAdd one or more pictures of the same character. "
-                    "Selected cards guide visual identity.")
-                snapref_on = gr.Checkbox(value=False, label="Use these references",
-                                         info="Off keeps the plain pipeline. On uses selected cards.")
-                with gr.Row():
-                    snapref_upload = gr.File(label="Drop reference images here",
-                                             file_count="multiple", file_types=["image"],
-                                             type="filepath", height=145)
-                    snapref_save = gr.Button("＋ Add to reference board", variant="secondary")
-                snapref_gallery = gr.Gallery(value=_snapref_gallery_items(),
-                                             label="Reference library",
-                                             columns=4, rows=2, height=340, object_fit="contain",
-                                             allow_preview=True, show_label=True,
-                                             elem_id="anima-snapref-gallery",
-                                             elem_classes="snapref-gallery", type="filepath")
-                snapref_state = gr.HTML(_snapref_state_html())
-                snapref_ref = gr.CheckboxGroup(choices=_snapref_choice_names(), value=[],
-                                               label="Select up to three reference cards",
-                                               info="Pick multiple images of the same character.",
-                                               elem_id="anima-snapref-ref")
-                snapref_selection_state = gr.Textbox(label="Selection", interactive=False,
-                                                     show_label=False, max_lines=1,
-                                                     placeholder="No reference cards selected")
-                snapref_clear = gr.Button("Clear selection", size="sm")
-                snapref_refresh = gr.Button("↻ Refresh board", size="sm")
-                with gr.Row():
-                    snapref_mode = gr.Radio(["cs", "char"], value="cs", label="Reference mode",
-                                            info="cs = character + style; char = character only")
-                    snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
-                                              label="Reference layout",
-                                              info="Separate = each card contributes independently; stitch = side-by-side board")
-                    snapref_adapter = gr.Radio(
-                        choices=[os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"],
-                        value=([os.path.basename(p) for p in _snapref_adapters()] or ["(none found)"])[0],
-                        label="Adapter", info="Choose an installed compatible SnapRef adapter")
-                with gr.Row():
-                    snapref_weight_1 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 1 weight",
-                                                 info="v2: separate layout only; 0 skips this card")
-                    snapref_weight_2 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 2 weight",
-                                                 info="v2: separate layout only; 0 skips this card")
-                    snapref_weight_3 = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="Card 3 weight",
-                                                 info="v2: separate layout only; 0 skips this card")
-                with gr.Row():
-                    snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1, label="Strength",
-                                                 info="0 = as trained; positive pulls harder toward references")
-                    snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05, label="Fidelity",
-                                                 info="1 = keep details; lower follows the prompt more freely")
-                    snapref_megapixels = gr.Slider(0.25, 2.0,
-                                                   value=float(os.environ.get("ANIMA_SNAPREF_MP", "1.0")),
-                                                   step=0.05, label="Reference size (MP)")
-                with gr.Row():
-                    snapref_in_uncond = gr.Checkbox(value=False, label="Reference in negative too",
-                                                    info="Off (trained): only the positive branch reads it")
-                    snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
-                                                info="Extra model call per step; ignores negative-too and fidelity")
-                    snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1, label="RG strength",
-                                           info="Higher values pull closer to references")
-                    snapref_correction = gr.Radio(["apg", "rescale", "none"], value="apg",
-                                                  label="Correction")
-                snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
-                                             placeholder="1girl, solo, brown hair, red jacket",
-                                             info="Appearance tags from the cards; helps with accessories.")
+                gr.Markdown("Upload one reference image, enable SnapRef, and choose the adapter version.")
+                snapref_on = gr.Checkbox(value=False, label="Use SnapRef")
+                snapref_upload = gr.Image(label="Reference image", type="filepath", image_mode="RGB")
+                adapters = snapref_adapter_names()
+                snapref_adapter = gr.Radio(
+                    choices=adapters or ["(none found)"],
+                    value=adapters[0] if adapters else "(none found)",
+                    label="Adapter version")
 
             with gr.Tab("Help"):
                 gr.Markdown(
-                    "### v1 / v2 reference features\n"
-                    "**v1a/v1b:** one or more cards, Character & Style or Character, strength and fidelity.\n\n"
-                    "**v2a:** adds `char` mode, multiple views of the same character, per-card weights, and `separate` / `stitch` layout. "
-                    "Weights apply in `separate` layout; `stitch` builds one side-by-side reference.\n\n"
-                    "The backend accepts published v1a, v1b, v2a and v2a-pre2 adapters. There is currently no public v2b release."
-                )
-                gr.Markdown(f"Seed `-1` picks a random seed and reports the value used. "
-                            f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
+                    "### SnapRef adapters\n"
+                    "Select the installed adapter release. Supported releases: v1a and v2a-pre2.\n\n"
+                    f"Seed `-1` picks a random seed and reports the value used. "
+                    f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
 
         # ---- resolution wiring -------------------------------------------------------
         def apply_size(aw, ah, mp, w, h):
@@ -1599,11 +1423,7 @@ def build():
         btn.click(start_gen,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
                           seed, guidance, preview_every, batch_count, prompt_style, tags,
-                          snapref_on, snapref_mode, snapref_adapter, snapref_ref,
-                          snapref_strength, snapref_fidelity, snapref_megapixels,
-                          snapref_in_uncond, snapref_rg_on, snapref_rg, snapref_correction,
-                          snapref_caption, snapref_layout, snapref_weight_1, snapref_weight_2,
-                          snapref_weight_3],
+                          snapref_on, snapref_adapter, snapref_upload],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app
@@ -1617,33 +1437,9 @@ def build():
         # A plain queued call, so it can run while start_gen is still streaming.
         stop.click(interrupt_gen, inputs=[], outputs=[status], queue=False)
 
-        # ---- SnapRef wiring ----------------------------------------------------
-        def update_snapref_selection(names):
-            return _snapref_selection_note(names)
-        snapref_ref.change(update_snapref_selection, inputs=[snapref_ref],
-                           outputs=[snapref_selection_state],
-                           show_progress="hidden")
-        snapref_clear.click(lambda: ([], "No reference cards selected"), inputs=[],
-                            outputs=[snapref_ref, snapref_selection_state],
-                            show_progress="hidden")
-        snapref_save.click(save_snapref_reference, inputs=[snapref_upload],
-                           outputs=[snapref_gallery, snapref_state, snapref_ref])
-        def refresh_snapref_board():
-            return (gr.update(value=_snapref_gallery_items()),
-                    gr.update(choices=_snapref_choice_names(), value=[]),
-                    gr.update(choices=[os.path.basename(p) for p in _snapref_adapters()]
-                              or ["(none found)"]))
-        snapref_refresh.click(refresh_snapref_board, inputs=[],
-                              outputs=[snapref_gallery, snapref_ref, snapref_adapter],
-                              show_progress="hidden")
-        # Guidance ignores 'reference in negative' and 'fidelity' (documented upstream), so
-        # the controls say so instead of silently doing nothing.
-        snapref_rg_on.change(
-            lambda on: (gr.update(interactive=not on), gr.update(interactive=not on),
-                        gr.update(interactive=bool(on)), gr.update(interactive=bool(on))),
-            inputs=[snapref_rg_on],
-            outputs=[snapref_in_uncond, snapref_fidelity, snapref_rg, snapref_correction],
-            show_progress="hidden")
+        demo.load(lambda: gr.update(choices=snapref_adapter_names()
+                                    or ["(none found)"]), inputs=[],
+                  outputs=[snapref_adapter], show_progress="hidden")
 
         # ---- LoRA picker wiring ------------------------------------------------
         lora_query.input(lambda query: gr.update(choices=_filter_loras(query), value=None),
