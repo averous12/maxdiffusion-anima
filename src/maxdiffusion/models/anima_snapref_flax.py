@@ -298,17 +298,21 @@ def snapref_correct(guided, pos, correction="apg", rescale_phi=0.5):
 
 
 def concat_reference_kv(records):
-  """[(k, v) per layer] for several references -> one cached set, concatenated on the token axis."""
+  """[(stacked_k, stacked_v) per reference] -> one scan-compatible cache.
+
+  The recorder returns two arrays, each shaped (layers, batch, tokens, heads, dim).
+  Multiple references concatenate only their token axis; the leading layer axis must
+  remain intact for ``nn.scan`` (otherwise it sees a length-1 input against 28 layers).
+  """
   if len(records) == 1:
     return records[0]
-  return [(jnp.concatenate([r[i][0] for r in records], axis=1),
-           jnp.concatenate([r[i][1] for r in records], axis=1))
-          for i in range(len(records[0]))]
+  return (jnp.concatenate([r[0] for r in records], axis=2),
+          jnp.concatenate([r[1] for r in records], axis=2))
 
 
 def reference_sizes(records):
   """Token count of each reference, in the order they were encoded."""
-  return [int(r[0][0].shape[1]) for r in records]
+  return [int(r[0].shape[2]) for r in records]
 
 
 def encode_reference_latent(vae, image_chw, latents_mean, latents_std):

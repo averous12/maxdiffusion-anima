@@ -93,6 +93,21 @@ def test_plain_forward_is_bit_identical_to_head():
     assert jnp.array_equal(oa, ob), f"scan={scan}: default forward is not bit-identical (max {float(jnp.abs(oa-ob).max())})"
 
 
+def test_scan_accepts_three_concatenated_reference_records():
+  """Three reference records must preserve the scan layer axis through target attention."""
+  hs, ts, ctx, mask = _tiny_inputs()
+  tr = FlaxAnimaCosmosTransformer(scan_blocks=True, **TINY)
+  params = tr.init(jax.random.PRNGKey(17), hs, ts, ctx, mask)
+  records = [(jnp.zeros((TINY["layers"], 1, 2, TINY["heads"], TINY["head_dim"])),
+              jnp.zeros((TINY["layers"], 1, 2, TINY["heads"], TINY["head_dim"])))
+             for _ in range(3)]
+  cached = sf.concat_reference_kv(records)
+  bias = jnp.zeros((6 + 4,), dtype=jnp.float32)
+  out = tr.apply(params, hs, ts, ctx, mask, ref_kv=cached, ref_bias=bias)
+  assert out.shape == hs.shape
+  assert bool(jnp.isfinite(out).all()), "multi-reference scan produced non-finite output"
+
+
 def test_reference_kv_matches_numpy_oracle():
   """The Flax attention with cached reference K/V == the node's masked-attention semantics."""
   hidden, heads, head_dim = 72, 2, 36
@@ -248,13 +263,18 @@ def test_guidance_and_correction_algebra():
 
 
 def test_reference_sizes_and_bias_layout():
-  recs = [[(jnp.zeros((1, 6, 2, 4)), jnp.zeros((1, 6, 2, 4)))],
-          [(jnp.zeros((1, 5, 2, 4)), jnp.zeros((1, 5, 2, 4)))]]
+  # The recorder returns (stacked_k, stacked_v), each with scan axis 0.
+  recs = [(jnp.zeros((28, 1, 6, 2, 4)), jnp.zeros((28, 1, 6, 2, 4))),
+          (jnp.zeros((28, 1, 5, 2, 4)), jnp.zeros((28, 1, 5, 2, 4))),
+          (jnp.zeros((28, 1, 4, 2, 4)), jnp.zeros((28, 1, 4, 2, 4)))]
   kv = sf.concat_reference_kv(recs)
-  assert kv[0][0].shape[1] == 11
-  assert sf.reference_sizes(recs) == [6, 5]
-  b = sf.key_biases([6, 5], sf.reference_biases(0.5, [1.0, 2.0]), 4)
-  assert b.shape == (15,)
-  assert np.allclose(b[:6], 0.5) and np.allclose(b[6:11], 0.5 + math.log(2.0))
-  assert np.allclose(b[11:], 0.0)
+  assert kv[0].shape == (28, 1, 15, 2, 4)
+  assert kv[1].shape == (28, 1, 15, 2, 4)
+  assert sf.reference_sizes(recs) == [6, 5, 4]
+  b = sf.key_biases([6, 5, 4], sf.reference_biases(0.5, [1.0, 2.0, 0.5]), 4)
+  assert b.shape == (19,)
+  assert np.allclose(b[:6], 0.5)
+  assert np.allclose(b[6:11], 0.5 + math.log(2.0))
+  assert np.allclose(b[11:15], 0.5 + math.log(0.5))
+  assert np.allclose(b[15:], 0.0)
   assert sf.reference_biases(0.0, [1.0]) == [0.0]

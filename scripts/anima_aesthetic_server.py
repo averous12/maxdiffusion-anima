@@ -743,8 +743,8 @@ def prepare_snapref(cfg, target_hw):
         _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
             (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
             ad.lora_tree("ref"))
-        kv[0][0].block_until_ready()
-        records, sizes = [kv], [int(kv[0][0].shape[1])]
+        kv[0].block_until_ready()
+        records, sizes = [kv], [int(kv[0].shape[2])]
         effective_weights = [max(weights)]
         log(f"SnapRef stitched {len(paths)} references -> {pw}x{ph}px, {sizes[0]} tokens")
     else:
@@ -758,8 +758,8 @@ def prepare_snapref(cfg, target_hw):
             _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
                 (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
                 ad.lora_tree("ref"))
-            kv[0][0].block_until_ready()
-            records.append(kv); sizes.append(int(kv[0][0].shape[1])); effective_weights.append(w)
+            kv[0].block_until_ready()
+            records.append(kv); sizes.append(int(kv[0].shape[2])); effective_weights.append(w)
             log(f"SnapRef reference {os.path.basename(path)} -> {pw}x{ph}px, {sizes[-1]} tokens, weight {w}")
     cache = anima_snapref.concat_reference_kv(records)
     size_list = list(sizes)

@@ -117,11 +117,11 @@ def main():
 
   t0 = time.perf_counter()
   out, kv = refpass(t_params, ref_lat, ctx, pad)
-  kv[0][0].block_until_ready()
+  kv[0].block_until_ready()
   print(f"reference pass (compile+run): {time.perf_counter()-t0:.1f}s  "
-        f"(k,v) stacked {kv[0][0].shape}  per-layer k {kv[0][0][0].shape}  rss {rss_gb():.2f} GB", flush=True)
+        f"(k,v) stacked {kv[0].shape}  per-layer k {kv[0][0].shape}  rss {rss_gb():.2f} GB", flush=True)
 
-  sizes = [int(kv[0][0].shape[1])]
+  sizes = [int(kv[0].shape[2])]
   bias = jnp.asarray(sf.key_biases(sizes, sf.reference_biases(0.0, [1.0]), 16))
 
   t0 = time.perf_counter()
