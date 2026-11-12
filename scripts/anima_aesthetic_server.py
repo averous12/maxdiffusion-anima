@@ -22,6 +22,7 @@ print("server interpreter:", py, flush=True)
 code = r'''
 import os
 import time
+import hashlib
 
 # Content root. Colab keeps the historical /content; ANIMA_CONTENT_ROOT lets the same
 # script run (and be tested) on a normal machine without touching any other default.
@@ -625,6 +626,20 @@ SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
 _SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
 _SNAPREF_ACTIVE_ADAPTER = None
 _SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
+_SNAPREF_HOST_CACHE = {}         # one host-side prepared reference result; never TPU-resident
+
+
+def _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout):
+    refs = []
+    for path, weight in active:
+        try:
+            st = os.stat(path)
+            refs.append((os.path.abspath(path), st.st_size, st.st_mtime_ns, float(weight)))
+        except OSError:
+            refs.append((os.path.abspath(path), None, None, float(weight)))
+    payload = repr((ad.path, target_hw, layout, megapixels, cfg.get("mode") or "cs",
+                    cfg.get("ref_caption") or "", cfg.get("strength", 0.0), refs)).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 def clear_snapref_runtime():
     """Release request-scoped reference K/V without evicting reusable XLA executables."""
@@ -664,6 +679,7 @@ def get_snapref_adapter(name):
     path = resolve_snapref_adapter(name)
     if _SNAPREF_ACTIVE_ADAPTER != path:
         _SNAPREF_ADAPTERS.clear()
+        _SNAPREF_HOST_CACHE.clear()
         gc.collect()
         _SNAPREF_ACTIVE_ADAPTER = path
     if path not in _SNAPREF_ADAPTERS:
@@ -765,8 +781,24 @@ def prepare_snapref(cfg, target_hw):
     if canvas_size is not None:
         log(f"SnapRef separate layout: canonical reference canvas {canvas_size[0]}x{canvas_size[1]}")
     caption = str(cfg.get("ref_caption") or "")
-    ref_ctx = _snapref_cond_tensor(caption)
     mode_vec = ad.mode_vector(mode)
+    cache_key = _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout)
+    cached = _SNAPREF_HOST_CACHE.get(cache_key)
+    if cached is not None:
+        host_kv, size_list, effective_weights, ref_pixels = cached
+        cache = (jnp.asarray(host_kv[0]), jnp.asarray(host_kv[1]))
+        _SNAPREF_STATE["kv"] = cache
+        bias = anima_snapref.key_biases(
+            size_list,
+            anima_snapref.reference_biases(cfg.get("strength", 0.0), effective_weights),
+            (target_hw[0] // 16) * (target_hw[1] // 16))
+        log(f"SnapRef host cache hit: {len(size_list)} reference(s), "
+            f"{sum(size_list)} tokens, key {cache_key[:12]}")
+        return {"adapter": os.path.basename(ad.path), "mode": mode, "sizes": list(size_list),
+                "weights": [w for w in weights if w > 0], "biases": list(bias.shape),
+                "ref_seconds": round(time.perf_counter() - t0, 3),
+                "tokens": int(sum(size_list)), "ref_pixels": list(ref_pixels)}
+    ref_ctx = _snapref_cond_tensor(caption)
     if layout == "stitch":
         paths = [p for p, _w in active]
         px, (pw, ph) = _load_stitched_reference_pixels(paths, megapixels)
@@ -802,6 +834,12 @@ def prepare_snapref(cfg, target_hw):
                                                                    effective_weights),
                                     (target_hw[0] // 16) * (target_hw[1] // 16))
     _SNAPREF_STATE["kv"] = cache
+    _SNAPREF_HOST_CACHE.clear()
+    _SNAPREF_HOST_CACHE[cache_key] = (
+        (np.asarray(cache[0]), np.asarray(cache[1])),
+        list(size_list), list(effective_weights),
+        [_load_reference_pixels(p, megapixels, canvas_size)[1] if canvas_size is not None else
+         _load_reference_pixels(p, megapixels)[1] for p in refs][:len(records)])
     secs = time.perf_counter() - t0
     log(f"SnapRef reference cached: {len(records)} image(s), {sum(size_list)} tokens, "
         f"{secs:.2f}s, mode {mode}, strength {cfg.get('strength', 0.0)}")
