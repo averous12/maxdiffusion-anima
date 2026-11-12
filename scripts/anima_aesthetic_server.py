@@ -626,6 +626,12 @@ _SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
 _SNAPREF_ACTIVE_ADAPTER = None
 _SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
 
+def clear_snapref_runtime():
+    """Release request-scoped reference K/V without evicting reusable XLA executables."""
+    _SNAPREF_STATE["kv"] = None
+    gc.collect()
+
+
 def installed_snapref_files():
     out = []
     for d in SNAPREF_DIRS:
@@ -1352,6 +1358,7 @@ while True:
         if _interrupted:
             # Skip the VAE decode entirely: the run was cancelled, so producing
             # (and writing) an image would be misleading.
+            clear_snapref_runtime()
             json.dump({**d, "go": False, "status": "interrupted"}, open(REQ_PATH, "w"))
             last_mtime = os.path.getmtime(REQ_PATH)
             continue
@@ -1383,7 +1390,9 @@ while True:
                    **common, **_pv_state())
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
                   open(REQ_PATH, "w"))
+        clear_snapref_runtime()
     except Exception as _err:
+        clear_snapref_runtime()
         log("gen raised:\n" + traceback.format_exc())
         # The preview state must survive into the error record too: a run that OOMs during
         # the final decode used to lose the fact that previews had already failed.
