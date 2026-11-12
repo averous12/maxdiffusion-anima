@@ -262,6 +262,19 @@ def test_guidance_and_correction_algebra():
   assert float(jnp.abs(sf.snapref_correct(guided, pos, "rescale", 0.0) - guided).max()) == 0.0
 
 
+def test_reference_canvas_geometry_is_canonical():
+  assert sf.reference_canvas_size(1.0) == (1024, 1024)
+  assert sf.reference_canvas_size(1.0 / 3.0) == (576, 576)
+  assert sf.reference_canvas_size(0.5) == (720, 720)
+
+
+def test_reference_megapixel_budget_only_splits_separate_layout():
+  assert sf.reference_megapixels_for_layout(1.0, 1, "separate") == 1.0
+  assert sf.reference_megapixels_for_layout(1.0, 3, "separate") == 1.0 / 3.0
+  assert sf.reference_megapixels_for_layout(0.25, 3, "separate") == 0.25
+  assert sf.reference_megapixels_for_layout(1.0, 3, "stitch") == 1.0
+
+
 def test_reference_sizes_and_bias_layout():
   # The recorder returns (stacked_k, stacked_v), each with scan axis 0.
   recs = [(jnp.zeros((28, 1, 6, 2, 4)), jnp.zeros((28, 1, 6, 2, 4))),

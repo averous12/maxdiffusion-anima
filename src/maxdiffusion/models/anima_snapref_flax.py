@@ -255,6 +255,25 @@ def reference_latent_size(width, height, megapixels):
   return max(16, int(width * scale) // 16 * 16), max(16, int(height * scale) // 16 * 16)
 
 
+def reference_canvas_size(megapixels):
+  """Canonical square reference canvas, aligned to the VAE/patch strides."""
+  side = max(16, int(math.sqrt(max(0.0, float(megapixels)) * 1024.0 * 1024.0)) // 16 * 16)
+  return side, side
+
+
+def reference_megapixels_for_layout(requested, count, layout, total_budget=1.0):
+  """Per-image reference MP, keeping separate multi-reference memory bounded.
+
+  One reference and stitched references preserve the requested setting. Separate references
+  share a total pixel budget because their K/V tokens are concatenated into one attention call.
+  """
+  requested = max(0.0, float(requested))
+  count = max(1, int(count))
+  if str(layout).lower() != "separate" or count == 1:
+    return requested
+  return min(requested, max(0.0, float(total_budget)) / count)
+
+
 def uncond_bias_for_fidelity(fidelity, ref_in_uncond=False, ref_guidance_on=False):
   """log(1 - f) for the negative branch, or None when the setting does not apply (node semantics)."""
   f = float(fidelity)

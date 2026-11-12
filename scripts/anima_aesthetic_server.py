@@ -592,9 +592,13 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
                                    rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
 
 def snapref_encode_latent(z):
-    """Reference pixels (1,3,1,H,W) in [-1,1] -> sampler-space latent, jitted on (H, W)."""
+    """Reference pixels (1,3,1,H,W) -> sampler-space latent, jitted on one active shape."""
+    global _SNAPREF_ENC_KEY
     key = (int(z.shape[-2]), int(z.shape[-1]))
-    if key not in _SNAPREF_ENC:
+    if key != _SNAPREF_ENC_KEY:
+        _SNAPREF_ENC.clear()
+        _SNAPREF_ENC_CACHE.clear()
+        _SNAPREF_ENC_KEY = key
         _, merged = anima_snapref.encode_reference_latent(vae, z, vae.latents_mean, vae.latents_std)
         _SNAPREF_ENC_CACHE[key] = (merged,)
         _SNAPREF_ENC[key] = jax.jit(lambda q, _m=merged: anima_snapref.encode_reference_latent(
@@ -603,6 +607,7 @@ def snapref_encode_latent(z):
 
 _SNAPREF_ENC = {}
 _SNAPREF_ENC_CACHE = {}
+_SNAPREF_ENC_KEY = None
 
 def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
     t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
@@ -617,7 +622,8 @@ SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
                             os.path.join(CROOT, "anima_snapref"),
                             os.path.join(os.path.dirname(LORA_DIRS[0]), "snapref"))
                 if d]
-_SNAPREF_ADAPTERS = {}          # path -> SnapRefAdapter (lazy, one per file)
+_SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
+_SNAPREF_ACTIVE_ADAPTER = None
 _SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
 
 def installed_snapref_files():
@@ -648,10 +654,15 @@ def resolve_snapref_adapter(name):
     raise anima_snapref.SnapRefError(f"SnapRef adapter not found: {name} (have {[os.path.basename(f) for f in files]})")
 
 def get_snapref_adapter(name):
+    global _SNAPREF_ACTIVE_ADAPTER
     path = resolve_snapref_adapter(name)
+    if _SNAPREF_ACTIVE_ADAPTER != path:
+        _SNAPREF_ADAPTERS.clear()
+        gc.collect()
+        _SNAPREF_ACTIVE_ADAPTER = path
     if path not in _SNAPREF_ADAPTERS:
         t0 = time.perf_counter()
-        _SNAPREF_ADAPTERS[path] = anima_snapref.load_snapref(path, num_layers=28, dtype=jnp.float32)
+        _SNAPREF_ADAPTERS[path] = anima_snapref.load_snapref(path, num_layers=28, dtype=jnp.bfloat16)
         ad = _SNAPREF_ADAPTERS[path]
         log(f"SnapRef adapter loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)} "
             f"(release {ad.meta.get('version', 'unknown')}, step {ad.meta.get('step', '?')}, "
@@ -670,12 +681,19 @@ def _open_reference_image(path):
     return img.convert("RGB")
 
 
-def _load_reference_pixels(path, megapixels):
-    """Reference image file -> (1,3,1,h,w) pixels in [-1,1] at the adapter's reference size."""
+def _load_reference_pixels(path, megapixels, canvas_size=None):
+    """Reference image file -> (1,3,1,h,w) pixels in [-1,1]."""
     from PIL import Image
     img = _open_reference_image(path)
-    w, h = anima_snapref.reference_latent_size(img.width, img.height, megapixels)
-    img = img.resize((w, h), Image.LANCZOS)
+    if canvas_size is None:
+        w, h = anima_snapref.reference_latent_size(img.width, img.height, megapixels)
+        img = img.resize((w, h), Image.LANCZOS)
+    else:
+        w, h = (int(canvas_size[0]), int(canvas_size[1]))
+        img.thumbnail((w, h), Image.LANCZOS)
+        canvas = Image.new("RGB", (w, h), "white")
+        canvas.paste(img, ((w - img.width) // 2, (h - img.height) // 2))
+        img = canvas
     arr = np.asarray(img, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))[None, :, None]          # (1,3,1,h,w)
     return jnp.asarray(arr * 2.0 - 1.0), (w, h)
@@ -723,16 +741,26 @@ def prepare_snapref(cfg, target_hw):
     if sum(1 for w in weights if w > 0) == 0:
         raise anima_snapref.SnapRefError("every reference has weight 0")
     mode = str(cfg.get("mode") or "cs")
-    megapixels = float(cfg.get("ref_megapixels") or 1.0)
-    caption = str(cfg.get("ref_caption") or "")
-    ref_ctx = _snapref_cond_tensor(caption)
-    mode_vec = ad.mode_vector(mode)
+    requested_megapixels = float(cfg.get("ref_megapixels") or 1.0)
     layout = str(cfg.get("multi_layout") or "separate").lower()
     if layout not in ("separate", "stitch"):
         raise anima_snapref.SnapRefError("snapref.multi_layout must be 'separate' or 'stitch'")
     active = [(p, w) for p, w in zip(refs, weights) if w > 0]
     if not active:
         raise anima_snapref.SnapRefError("every reference has weight 0")
+    megapixels = anima_snapref.reference_megapixels_for_layout(
+        requested_megapixels, len(active), layout,
+        float(os.environ.get("ANIMA_SNAPREF_REF_MP_BUDGET", "1.0")))
+    canvas_size = (anima_snapref.reference_canvas_size(megapixels)
+                   if layout == "separate" else None)
+    if megapixels != requested_megapixels:
+        log(f"SnapRef separate layout: {len(active)} references share "
+            f"{requested_megapixels:.3g} MP -> {megapixels:.3g} MP each")
+    if canvas_size is not None:
+        log(f"SnapRef separate layout: canonical reference canvas {canvas_size[0]}x{canvas_size[1]}")
+    caption = str(cfg.get("ref_caption") or "")
+    ref_ctx = _snapref_cond_tensor(caption)
+    mode_vec = ad.mode_vector(mode)
     if layout == "stitch":
         paths = [p for p, _w in active]
         px, (pw, ph) = _load_stitched_reference_pixels(paths, megapixels)
@@ -750,7 +778,7 @@ def prepare_snapref(cfg, target_hw):
     else:
         records, sizes, effective_weights = [], [], []
         for path, w in active:
-            px, (pw, ph) = _load_reference_pixels(path, megapixels)
+            px, (pw, ph) = _load_reference_pixels(path, megapixels, canvas_size)
             lat = snapref_encode_latent(px)
             rh, rw = max(1, ph // 16), max(1, pw // 16)
             th, tw = max(1, target_hw[0] // 16), max(1, target_hw[1] // 16)
@@ -774,7 +802,11 @@ def prepare_snapref(cfg, target_hw):
     return {"adapter": os.path.basename(ad.path), "mode": mode, "sizes": size_list,
             "weights": [w for w in weights if w > 0], "biases": list(bias.shape),
             "ref_seconds": round(secs, 3), "tokens": int(sum(size_list)),
-            "ref_pixels": [_load_reference_pixels(p, megapixels)[1] for p in refs if True][:len(records)]}
+            "ref_pixels": [
+                (canvas_size if canvas_size is not None else
+                 _load_reference_pixels(p, megapixels)[1])
+                for p in refs
+            ][:len(records)]}
 
 def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidance, cfg):
     """CFG along the SnapRef branches, then the documented post-CFG steps.
