@@ -15,6 +15,7 @@ import math
 import os
 import sys
 
+import jax.numpy as jnp
 import numpy as np
 
 from maxdiffusion.models import anima_pixel_head_flax as ph
@@ -87,6 +88,59 @@ def _load_reference_module():
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
   return mod
+
+
+def test_server_call_sequence_produces_image_size():
+  """Replicate the server's exact pixel path: tap features + patchified latent -> image.
+
+  The server used to hand the head the RAW latent, which failed with
+  `feature grid (64, 64) != latent grid (16, 128)`. This pins the contract: the head
+  consumes lat_patches() output, and one token must yield PATCH x PATCH image pixels.
+  """
+  import jax
+
+  from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer
+
+  tiny = dict(in_channels=4, out_channels=4, heads=2, head_dim=36, layers=2,
+              context_dim=4, adaln_dim=4, patch_size=(1, 2, 2))
+  tr = FlaxAnimaCosmosTransformer(scan_blocks=True, return_final_feat=True, **tiny)
+  hs = jnp.zeros((1, 4, 1, 4, 4), jnp.float32)      # (B, C, T, h, w) latent grid 4x4
+  ctx = jnp.zeros((1, 5, 4), jnp.float32)
+  mask = jnp.ones((1, 5), jnp.float32)              # attention mask is [B, S_ctx]
+  params = tr.init(jax.random.PRNGKey(31), hs, jnp.zeros((1,), jnp.float32), ctx, mask)
+
+  # same timestep convention the server uses
+  t_vec = jnp.broadcast_to(jnp.float32(0.5) / jnp.float32(1000.0), (hs.shape[0],))
+  _out, feat = tr.apply(params, hs, t_vec, ctx, mask)
+
+  gh, gw = hs.shape[-2] // 2, hs.shape[-1] // 2
+  assert gh == 2 and gw == 2
+  assert feat.shape == (1, gh * gw, tiny["heads"] * tiny["head_dim"]), feat.shape
+
+  head = ph.PixelHead(d_feat=feat.shape[-1], d_lat=4 * hs.shape[1], width=8,
+                      depth=2, up=1, channels=3)
+  lat = ph.lat_patches(hs[0, :, 0])          # <- the step the server was missing
+  assert lat.shape == (gh, gw, 4 * hs.shape[1]), lat.shape
+  hp = head.init(jax.random.PRNGKey(32), feat[0].reshape(gh, gw, -1), lat)["params"]
+  img = head.apply({"params": hp}, feat[0].reshape(gh, gw, -1), lat)
+  # one token -> PATCH x PATCH pixels, so the decoded image matches the latent's pixels
+  assert img.shape == (3, gh * ph.PATCH, gw * ph.PATCH), img.shape
+  assert img.shape[-1] == hs.shape[-1] * 8   # latent w * VAE factor = image width
+
+
+def test_raw_latent_is_rejected_with_a_clear_error():
+  """Passing the un-patchified latent must fail loudly, naming both grids."""
+  head = ph.PixelHead(d_feat=32, width=8, depth=1, up=1, channels=3)
+  import jax
+  f = jnp.zeros((2, 2, 32), jnp.float32)
+  raw = jnp.zeros((16, 4, 4), jnp.float32)     # (C, h, w): not patchified
+  hp = head.init(jax.random.PRNGKey(33), f, ph.lat_patches(raw))["params"]
+  try:
+    head.apply({"params": hp}, f, raw)
+  except ph.PixelHeadError as e:
+    assert "feature grid" in str(e) and "latent grid" in str(e), str(e)
+    return
+  raise AssertionError("raw latent was accepted; the token contract is not enforced")
 
 
 def test_parity_with_reference_implementation():

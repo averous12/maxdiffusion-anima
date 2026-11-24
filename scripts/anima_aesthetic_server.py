@@ -682,7 +682,10 @@ def pixel_decode_images(feats, x_t, head_name):
     gh, gw = x_t.shape[-2] // 2, x_t.shape[-1] // 2
     out = []
     for b in range(x_t.shape[0]):
-        img = fn(params, feats[b].reshape(gh, gw, info["d_feat"]), x_t[b, :, 0])
+        # The head takes patchified tokens (gh, gw, 64), not the raw (16, h, w) latent:
+        # lat_patches is what turns 2x2 latent blocks into one 64-wide token each.
+        lat = anima_pixel_head.lat_patches(x_t[b, :, 0])
+        img = fn(params, feats[b].reshape(gh, gw, info["d_feat"]), lat)
         img = jnp.clip(img * 0.5 + 0.5, 0.0, 1.0)
         arr = np.asarray(jnp.transpose(img, (1, 2, 0)))
         out.append((arr * 255.0).round().astype(np.uint8))
