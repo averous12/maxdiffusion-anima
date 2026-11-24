@@ -103,7 +103,7 @@ def snapref_adapter_names():
 def build_snapref_config(enabled, adapter, images, mode="cs", layout="separate",
                          weights=None, strength=0.0, fidelity=1.0, megapixels=1.0,
                          ref_in_uncond=False, ref_guidance_on=False,
-                         ref_guidance=4.5, correction="apg", caption=""):
+                         ref_guidance=4.5, correction="apg", caption="", mp_budget=None):
     """Validate UI values and build SnapRef request data, or return an error message."""
     if not enabled:
         return None
@@ -123,7 +123,7 @@ def build_snapref_config(enabled, adapter, images, mode="cs", layout="separate",
     weights = [float(weight) for weight in weights[:len(images)]]
     if not any(weight > 0 for weight in weights):
         return "at least one reference weight must be above zero"
-    return {
+    cfg = {
         "enabled": True, "adapter": adapter or "", "images": images,
         "weights": weights, "multi_layout": layout, "mode": mode or "cs",
         "strength": float(strength), "fidelity": float(fidelity),
@@ -131,6 +131,17 @@ def build_snapref_config(enabled, adapter, images, mode="cs", layout="separate",
         "ref_guidance_on": bool(ref_guidance_on), "ref_guidance": float(ref_guidance),
         "correction": correction or "apg", "ref_caption": caption or "",
     }
+    # Separate references share this combined pixel budget. Left unset the server uses its
+    # own default (1.0 MP), which is what kept three references at 0.33 MP each.
+    if mp_budget is not None:
+        try:
+            budget = float(mp_budget)
+        except (TypeError, ValueError):
+            return "reference budget must be a number"
+        if budget < 0:
+            return "reference budget cannot be negative"
+        cfg["ref_mp_budget"] = budget
+    return cfg
 
 
 # True while this process has a generation in flight. The 1 Hz progress poll
@@ -1049,7 +1060,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_mode="cs", snapref_layout="separate", snapref_weights=None,
               snapref_strength=0.0, snapref_fidelity=1.0,
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
-              snapref_caption="", decode_mode="vae", pixel_head=""):
+              snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1066,12 +1077,12 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         "out": FINAL_PATH, "go": True,
         "gen_id": uuid.uuid4().hex,
     }
-    # Decode path: the VAE (default) or a pixel head reading the DiT's last-layer features.
+    # Decode path: pixel head by default, VAE when no head is selected. With no head we
+    # send nothing and let the server fall back (it resolves the default head itself, and
+    # logs + uses the VAE when none is installed) — refusing here would block a fresh
+    # install from generating at all.
     pixel_head = "" if str(pixel_head or "").strip() in ("", "(none found)") else str(pixel_head).strip()
-    if str(decode_mode or "vae").strip().lower() == "pixel":
-        if not pixel_head:
-            return ("choose a pixel head file or switch decode back to VAE",
-                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+    if str(decode_mode or "pixel").strip().lower() == "pixel" and pixel_head:
         req["decode"] = "pixel"
         req["pixel_head"] = pixel_head
     _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
@@ -1081,7 +1092,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     snap_cfg = build_snapref_config(
         snapref_on, snapref_adapter, snapref_images, snapref_mode, snapref_layout,
         snapref_weights, snapref_strength, snapref_fidelity, 1.0,
-        snapref_in_uncond, snapref_rg_on, snapref_rg, "apg", snapref_caption)
+        snapref_in_uncond, snapref_rg_on, snapref_rg, "apg", snapref_caption,
+        mp_budget=snapref_budget)
     if isinstance(snap_cfg, str):
         return (snap_cfg, _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
     if snap_cfg is not None:
@@ -1413,8 +1425,8 @@ def build():
                             "of the DiT's final-layer features that skips the VAE entirely — "
                             "much lower HBM during decode, and no VAE load needed for the output.")
                 _heads = pixel_head_names()
-                decode_mode = gr.Radio(["vae", "pixel"], value="vae", label="Decode path",
-                                       info="pixel needs a head file below")
+                decode_mode = gr.Radio(["pixel", "vae"], value="pixel", label="Decode path",
+                                       info="pixel reads the DiT's final features; vae is the fallback")
                 pixel_head_pick = gr.Dropdown(
                     choices=_heads or ["(none found)"],
                     value=_heads[0] if _heads else "(none found)",
@@ -1462,6 +1474,10 @@ def build():
                                                   label="Guidance correction")
                     snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
                                                  placeholder="blue hair, red jacket")
+                    snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
+                                                label="Reference pixel budget (MP, combined)",
+                                                info="Separate references share this. 3.0 = a full "
+                                                     "megapixel each; needs pixel decode for headroom.")
 
             with gr.Tab("Help"):
                 gr.Markdown(
@@ -1530,7 +1546,7 @@ def build():
                           snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
                           snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
                           snapref_rg_on, snapref_rg, snapref_caption,
-                          decode_mode, pixel_head_pick],
+                          decode_mode, pixel_head_pick, snapref_budget],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app

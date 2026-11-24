@@ -318,6 +318,10 @@ def test_reference_megapixel_budget_only_splits_separate_layout():
   assert sf.reference_megapixels_for_layout(1.0, 3, "separate") == 1.0 / 3.0
   assert sf.reference_megapixels_for_layout(0.25, 3, "separate") == 0.25
   assert sf.reference_megapixels_for_layout(1.0, 3, "stitch") == 1.0
+  # A 3 MP budget is how three full-megapixel references become possible at all.
+  assert sf.reference_megapixels_for_layout(1.0, 3, "separate", 3.0) == 1.0
+  assert sf.reference_megapixels_for_layout(1.0, 2, "separate", 3.0) == 1.0
+  assert sf.reference_megapixels_for_layout(2.0, 3, "separate", 3.0) == 1.0
 
 
 def test_reference_sizes_and_bias_layout():

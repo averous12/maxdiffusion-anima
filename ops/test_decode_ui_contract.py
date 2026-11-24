@@ -56,13 +56,22 @@ def test_blocks_build():
   print(f"blocks ok; pixel head choices: {ui.pixel_head_names()}")
 
 
-def test_plain_request_has_no_decode_key():
+def test_default_request_has_no_decode_key_without_head():
+  """Default is pixel, but with no head selected the UI sends nothing and the server falls
+  back. A fresh install must still be able to generate."""
   box, orig = _capture_request()
   req = _call(box, orig)
   assert req is not None, "request was not written"
   assert "decode" not in req, req.keys()
   assert "pixel_head" not in req
-  print("plain request: no decode key")
+  print("default (pixel, no head installed): no decode key -> server fallback")
+
+
+def test_explicit_vae_request_has_no_decode_key():
+  box, orig = _capture_request()
+  req = _call(box, orig, decode_mode="vae", pixel_head="base.safetensors")
+  assert "decode" not in req, req.keys()
+  print("vae request: no decode key")
 
 
 def test_pixel_request_sets_decode():
@@ -73,11 +82,22 @@ def test_pixel_request_sets_decode():
   print("pixel request: decode=pixel, head=base.safetensors")
 
 
-def test_pixel_without_head_is_rejected():
-  box, orig = _capture_request()
-  req = _call(box, orig, decode_mode="pixel", pixel_head="(none found)")
-  assert req is None, "expected a validation error, got a request"
-  print("pixel without head: rejected")
+def test_reference_budget_is_per_request():
+  """The combined separate-reference budget must travel in the request, not the env."""
+  png = os.path.join(CONTENT, "ref.png")
+  if not os.path.isfile(png):
+    from PIL import Image
+    Image.new("RGB", (32, 32), (200, 120, 90)).save(png)
+  base = dict(enabled=True, adapter="a.safetensors", images=[png])
+  loose = ui.build_snapref_config(**base, mp_budget=None)
+  assert isinstance(loose, dict) and "ref_mp_budget" not in loose, loose
+  tight = ui.build_snapref_config(**base, mp_budget=3.0)
+  assert isinstance(tight, dict) and tight["ref_mp_budget"] == 3.0, tight
+  neg = ui.build_snapref_config(**base, mp_budget=-1)
+  assert isinstance(neg, str) and "negative" in neg, neg
+  bad = ui.build_snapref_config(**base, mp_budget="lots")
+  assert isinstance(bad, str), bad
+  print("reference budget: unset omits, 3.0 passes, -1 and 'lots' rejected")
 
 
 def main():

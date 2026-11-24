@@ -599,7 +599,7 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
 # 1024px run (~8.7 GB measured), with a small head plus one 2048-wide feature tensor.
 PIXEL_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
                           os.path.join(CROOT, "anima_pixel_heads")) if d and os.path.isdir(d)]
-DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "vae").strip().lower()
+DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "pixel").strip().lower()
 PIXEL_HEAD_DEFAULT = (os.environ.get("ANIMA_PIXEL_HEAD") or "").strip()
 
 _PIXEL_TAP = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, return_final_feat=True)
@@ -752,6 +752,21 @@ def clear_snapref_runtime():
     gc.collect()
 
 
+def _ref_mp_budget(cfg):
+    """Combined pixel budget for separate references: request field, else env, else 1.0.
+
+    The request field exists because the budget used to be environment-only, so a client
+    could not ask for three full-megapixel references without a server restart.
+    """
+    raw = cfg.get("ref_mp_budget")
+    if raw is None or raw == "":
+        raw = os.environ.get("ANIMA_SNAPREF_REF_MP_BUDGET", "1.0")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def installed_snapref_files():
     out = []
     for d in SNAPREF_DIRS:
@@ -877,7 +892,7 @@ def prepare_snapref(cfg, target_hw):
         raise anima_snapref.SnapRefError("every reference has weight 0")
     megapixels = anima_snapref.reference_megapixels_for_layout(
         requested_megapixels, len(active), layout,
-        float(os.environ.get("ANIMA_SNAPREF_REF_MP_BUDGET", "1.0")))
+        _ref_mp_budget(cfg))
     canvas_size = (anima_snapref.reference_canvas_size(megapixels)
                    if layout == "separate" else None)
     if megapixels != requested_megapixels:
@@ -1429,9 +1444,20 @@ while True:
         prev_total = 0.0
         first_s = 0.0
         _interrupted = False
-        # Pixel decode needs the final timestep's (x_t, features). Capture them on the last
-        # step so nothing earlier in the loop changes; the VAE path stays the default.
+        # Pixel decode needs the final timestep's (x_t, features), captured on the last step
+        # so nothing earlier in the loop changes. Pixel is the default decode path; the VAE
+        # is the fallback when no head resolves.
         _want_pixel = (str(d.get("decode") or DECODE_MODE).strip().lower() == "pixel")
+        if _want_pixel:
+            # Resolve the head up front: a missing/!x1/RGBA head must degrade to the VAE
+            # instead of failing the run 20 steps in, and failing early keeps the error text
+            # in the log next to the request rather than inside the decode handler.
+            try:
+                get_pixel_head(d.get("pixel_head"))
+            except Exception as _pe:
+                log(f"pixel decode unavailable ({type(_pe).__name__}: {_pe}); "
+                    f"falling back to VAE")
+                _want_pixel = False
         x_last = None
         f_last = None
         for i in range(STEPS):
