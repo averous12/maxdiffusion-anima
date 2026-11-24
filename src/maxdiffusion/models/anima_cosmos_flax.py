@@ -152,7 +152,13 @@ class _Attention(nn.Module):
     b, q_len, h, d = y.shape
     y = y.reshape(b, q_len, h * d)
     out = self._proj(y, "to_out", lora, self.hidden)
-    return (out, (k, v)) if record else out
+    if record:
+      # The reference cache outlives every step of the denoise loop, so its dtype is paid
+      # for the whole run: 28x4028x16x128x2 is 1.85 GB in fp32 and 0.92 GB in bf16. The
+      # einsums above upcast to fp32 anyway, and these values were produced from bf16
+      # parameters, so storing them narrow costs no precision the compute would have kept.
+      return out, (k.astype(jnp.bfloat16), v.astype(jnp.bfloat16))
+    return out
 
   def _proj(self, x, name, lora, out_features):
     """Dense projection plus an optional SnapRef LoRA delta: delta = (x @ A) @ B.
@@ -309,6 +315,7 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   scan_blocks: bool = True  # lax.scan over blocks: one compiled body, not 28
   diag_sync: bool = False  # diagnostic only: block_until_ready per stage (destroys perf)
   record_kv: bool = False  # SnapRef reference pass: return every layer's self-attention (k, v)
+  return_final_feat: bool = False  # pixel head: also return the pre-proj_out features
   @nn.compact
   def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None,
                padding_mask=None, rope_override=None, t_embed_add=None, lora=None,
@@ -392,8 +399,13 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     shift, scale = jnp.split(y, 2, axis=-1)
     y = nn.LayerNorm(use_scale=False, use_bias=False, epsilon=1e-6)(x.astype(jnp.float32))
     y = y * (1 + scale[:, None, :]) + shift[:, None, :]
+    # The pixel head reads exactly this tensor (the input of final_layer.linear). Keep the
+    # reference before proj_out so the tap costs no extra forward.
+    feat = y if self.return_final_feat else None
     y = nn.Dense(self.out_channels * self.patch_size[0] * self.patch_size[1] * self.patch_size[2], use_bias=False, name="proj_out", dtype=jnp.float32, param_dtype=jnp.float32)(y)
     out = cosmos_unpatchify(y, self.out_channels, (t, h, w), self.patch_size)
+    if self.return_final_feat:
+      return (out, kv, feat) if self.record_kv else (out, feat)
     return (out, kv) if self.record_kv else out
 
 

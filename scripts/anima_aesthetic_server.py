@@ -120,6 +120,7 @@ from maxdiffusion.models.anima_text_conditioner_flax import (
     convert_anima_aesthetic_adapter_weights)
 from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_loras
 from maxdiffusion.models import anima_snapref_flax as anima_snapref
+from maxdiffusion.models import anima_pixel_head_flax as anima_pixel_head
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -592,6 +593,97 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
                                    jnp.zeros((lat.shape[0],), jnp.float32), ctx, None, pad,
                                    rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
 
+# --- pixel head decoder (optional) ------------------------------------------------------
+# A 25M-parameter ConvNeXt readout over the input of the DiT's final_layer.linear. It
+# replaces the VAE decode, whose decoder activations are the single largest transient in a
+# 1024px run (~8.7 GB measured), with a small head plus one 2048-wide feature tensor.
+PIXEL_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
+                          os.path.join(CROOT, "anima_pixel_heads")) if d and os.path.isdir(d)]
+DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "vae").strip().lower()
+PIXEL_HEAD_DEFAULT = (os.environ.get("ANIMA_PIXEL_HEAD") or "").strip()
+
+_PIXEL_TAP = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, return_final_feat=True)
+_PIXEL_HEADS = {}
+
+@jax.jit
+def pixel_tap_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
+    return _PIXEL_TAP.apply({"params": tp}, lat, t_vec, ctx, None, pad,
+                            lora=lora, ref_kv=refkv, ref_bias=refbias)
+
+def installed_pixel_heads():
+    out = []
+    for d in PIXEL_DIRS:
+        for root, _dirs, files in os.walk(d):
+            for f in files:
+                if f.lower().endswith(".safetensors"):
+                    out.append(os.path.join(root, f))
+    return sorted(set(out))
+
+def resolve_pixel_head(name):
+    want = (name or PIXEL_HEAD_DEFAULT or "").strip()
+    files = installed_pixel_heads()
+    if not want:
+        if not files:
+            raise anima_pixel_head.PixelHeadError(
+                "no pixel head installed; put a .safetensors under "
+                + (PIXEL_DIRS[0] if PIXEL_DIRS else os.path.join(CROOT, "anima_pixel_heads")))
+        return files[0]
+    if os.path.isfile(want):
+        return want
+    stem = want if want.endswith(".safetensors") else want + ".safetensors"
+    for f in files:
+        if os.path.basename(f) in (want, stem):
+            return f
+    raise anima_pixel_head.PixelHeadError(
+        f"pixel head not found: {want} (have {[os.path.basename(f) for f in files]})")
+
+def get_pixel_head(name):
+    path = resolve_pixel_head(name)
+    if path not in _PIXEL_HEADS:
+        t0 = time.perf_counter()
+        head, params, info = anima_pixel_head.load_pixel_head(path, dtype=jnp.float32)
+        params = jax.device_put(params, jax.devices()[0])
+        fn = jax.jit(lambda p, f, l, _h=head: _h.apply({"params": p}, f, l))
+        _PIXEL_HEADS.clear()   # one head at a time: the tap feature is the only big buffer
+        _PIXEL_HEADS[path] = (fn, params, info)
+        log(f"pixel head loaded in {time.perf_counter()-t0:.2f}s: {os.path.basename(path)} "
+            f"(width {info['width']}, depth {info['depth']}, up {info['up']}, "
+            f"patch {info['patch']}px, channels {info['channels']}) | {hbm_stats()}")
+    return _PIXEL_HEADS[path]
+
+def pixel_features(latents, t_vec, context, neg_context, pad, guidance, snap_cfg):
+    """CFG-combined final-layer features f_u + g*(f_c - f_u), as the node does.
+
+    The tap sits immediately before a linear map, so the combined feature maps to v_cfg.
+    Two extra forward passes at the final timestep; everything earlier is untouched.
+    """
+    lora = refkv = refbias = None
+    if snap_cfg:
+        ad = get_snapref_adapter(snap_cfg.get("adapter"))
+        lora = ad.lora_tree("tgt")
+        sizes = list(snap_cfg["_sizes"])
+        weights = list(snap_cfg["_weights"])
+        biases = [anima_snapref.reference_biases(snap_cfg.get("strength", 0.0), weights)[i]
+                  for i in range(len(weights))]
+        tgt_tokens = (latents.shape[-2] // 2) * (latents.shape[-1] // 2)
+        refkv = _SNAPREF_STATE["kv"]
+        refbias = jnp.asarray(anima_snapref.key_biases(sizes, biases, tgt_tokens))
+    _, fc = pixel_tap_forward(t_params, latents, t_vec, context, pad, lora, refkv, refbias)
+    _, fu = pixel_tap_forward(t_params, latents, t_vec, neg_context, pad, lora, None, None)
+    return fu + jnp.asarray(np.float32(guidance)) * (fc - fu)
+
+def pixel_decode_images(feats, x_t, head_name):
+    """Features (B, tokens, d_feat) + the last x_t -> list of B uint8 HxWx3 arrays."""
+    fn, params, info = get_pixel_head(head_name)
+    gh, gw = x_t.shape[-2] // 2, x_t.shape[-1] // 2
+    out = []
+    for b in range(x_t.shape[0]):
+        img = fn(params, feats[b].reshape(gh, gw, info["d_feat"]), x_t[b, :, 0])
+        img = jnp.clip(img * 0.5 + 0.5, 0.0, 1.0)
+        arr = np.asarray(jnp.transpose(img, (1, 2, 0)))
+        out.append((arr * 255.0).round().astype(np.uint8))
+    return out
+
 def snapref_encode_latent(z):
     """Reference pixels (1,3,1,H,W) -> sampler-space latent, jitted on one active shape."""
     global _SNAPREF_ENC_KEY
@@ -825,9 +917,14 @@ def prepare_snapref(cfg, target_hw):
                 (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
                 ad.lora_tree("ref"))
             kv[0].block_until_ready()
-            records.append(kv); sizes.append(int(kv[0].shape[2])); effective_weights.append(w)
+            # Park this reference on the host and drop the device copy now: keeping every
+            # record resident and then concatenating them doubles the TPU peak.
+            records.append((np.array(kv[0]), np.array(kv[1])))
+            del kv, _out
+            sizes.append(int(records[-1][0].shape[2])); effective_weights.append(w)
             log(f"SnapRef reference {os.path.basename(path)} -> {pw}x{ph}px, {sizes[-1]} tokens, weight {w}")
-    cache = anima_snapref.concat_reference_kv(records)
+    cache = (anima_snapref.concat_reference_kv(records) if layout == "stitch"
+             else anima_snapref.concat_reference_kv_host(records))
     size_list = list(sizes)
     bias = anima_snapref.key_biases(size_list,
                                     anima_snapref.reference_biases(cfg.get("strength", 0.0),
@@ -1319,6 +1416,11 @@ while True:
         prev_total = 0.0
         first_s = 0.0
         _interrupted = False
+        # Pixel decode needs the final timestep's (x_t, features). Capture them on the last
+        # step so nothing earlier in the loop changes; the VAE path stays the default.
+        _want_pixel = (str(d.get("decode") or DECODE_MODE).strip().lower() == "pixel")
+        x_last = None
+        f_last = None
         for i in range(STEPS):
             if os.path.exists(INTERRUPT_PATH):
                 try:
@@ -1339,6 +1441,11 @@ while True:
                 pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                       context, neg_context, pad, GUIDANCE)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
+            if _want_pixel and i == STEPS - 1:
+                x_last = latents
+                f_last = pixel_features(latents, jnp.asarray(np.float32(timesteps[i])),
+                                        context, neg_context, pad, GUIDANCE,
+                                        _snap if snap_info else None)
             latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
             latents.block_until_ready()
             step_s = time.perf_counter() - d0 - prev_total
@@ -1403,8 +1510,16 @@ while True:
         denoise_s = time.perf_counter() - d0 - prev_total
         write_prog(stage="decode", step=STEPS, **common, **_pv_state())
         v0 = time.perf_counter()
-        u8s = decode_latents(latents)
-        _vae_compiled.add((H, W))
+        if _want_pixel and x_last is not None and f_last is not None:
+            u8s = pixel_decode_images(f_last, x_last, d.get("pixel_head"))
+            decode_kind = "pixel"
+            log(f"pixel decode: {len(u8s)} image(s) via {os.path.basename(get_pixel_head(d.get('pixel_head'))[2]['path'])}")
+        else:
+            if _want_pixel:
+                log("pixel decode requested but no final-step capture; falling back to VAE")
+            u8s = decode_latents(latents)
+            _vae_compiled.add((H, W))
+            decode_kind = "vae"
         stem, ext = os.path.splitext(OUT)
         ext = ext or ".png"
         if BATCH == 1:
@@ -1425,7 +1540,7 @@ while True:
         write_prog(stage="done", step=STEPS, out=OUT, grid=OUT, images=images,
                    elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
                    decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(),
-                   **common, **_pv_state())
+                   decode_kind=decode_kind, **common, **_pv_state())
         json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
                   open(REQ_PATH, "w"))
         clear_snapref_runtime()

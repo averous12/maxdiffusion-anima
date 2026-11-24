@@ -329,6 +329,20 @@ def concat_reference_kv(records):
           jnp.concatenate([r[1] for r in records], axis=2))
 
 
+def concat_reference_kv_host(records):
+  """[(k, v) as host arrays] -> one scan-compatible cache, concatenated off-device.
+
+  Same join as concat_reference_kv, but on numpy so the per-reference buffers can be
+  released from TPU memory as soon as each one is encoded. Holding N records *and* the
+  concatenation doubles the peak for multi-reference runs.
+  """
+  if len(records) == 1:
+    k, v = records[0]
+    return jnp.asarray(k), jnp.asarray(v)
+  return (jnp.asarray(np.concatenate([np.asarray(r[0]) for r in records], axis=2)),
+          jnp.asarray(np.concatenate([np.asarray(r[1]) for r in records], axis=2)))
+
+
 def reference_sizes(records):
   """Token count of each reference, in the order they were encoded."""
   return [int(r[0].shape[2]) for r in records]

@@ -66,6 +66,20 @@ SNAP_PATH = os.path.join(CONTENT, "anima_snap.png")
 INTERRUPT_PATH = os.path.join(CONTENT, "anima_interrupt")   # create to cancel the running generation
 # SnapRef uploads are request-scoped; adapter files are runtime-local.
 SNAPREF_DIR = os.environ.get("ANIMA_SNAPREF_DIR", os.path.join(CONTENT, "anima_snapref"))
+# Pixel-head decoders (an alternative to the VAE decode). Runtime-local, like adapters.
+PIXEL_HEAD_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
+                               os.path.join(CONTENT, "anima_pixel_heads")) if d]
+
+
+def pixel_head_names():
+    out = []
+    for directory in PIXEL_HEAD_DIRS:
+        try:
+            out.extend(name for name in sorted(os.listdir(directory))
+                       if name.lower().endswith(".safetensors"))
+        except OSError:
+            pass
+    return out
 
 
 def _snapref_adapters():
@@ -1035,7 +1049,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_mode="cs", snapref_layout="separate", snapref_weights=None,
               snapref_strength=0.0, snapref_fidelity=1.0,
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
-              snapref_caption=""):
+              snapref_caption="", decode_mode="vae", pixel_head=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1052,6 +1066,14 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         "out": FINAL_PATH, "go": True,
         "gen_id": uuid.uuid4().hex,
     }
+    # Decode path: the VAE (default) or a pixel head reading the DiT's last-layer features.
+    pixel_head = "" if str(pixel_head or "").strip() in ("", "(none found)") else str(pixel_head).strip()
+    if str(decode_mode or "vae").strip().lower() == "pixel":
+        if not pixel_head:
+            return ("choose a pixel head file or switch decode back to VAE",
+                    _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+        req["decode"] = "pixel"
+        req["pixel_head"] = pixel_head
     _tags = [t.strip() for t in (tags or "").replace(",", " ").split() if t.strip()]
     if _tags:
         req["tags"] = _tags
@@ -1386,6 +1408,19 @@ def build():
                 lora_restart = gr.Button("Restart server with base weights",
                                          size="sm", variant="stop")
 
+            with gr.Tab("Decode"):
+                gr.Markdown("**VAE decode** (default) or a **pixel head**: a 25M-parameter readout "
+                            "of the DiT's final-layer features that skips the VAE entirely — "
+                            "much lower HBM during decode, and no VAE load needed for the output.")
+                _heads = pixel_head_names()
+                decode_mode = gr.Radio(["vae", "pixel"], value="vae", label="Decode path",
+                                       info="pixel needs a head file below")
+                pixel_head_pick = gr.Dropdown(
+                    choices=_heads or ["(none found)"],
+                    value=_heads[0] if _heads else "(none found)",
+                    label="Pixel head file",
+                    info="Place .safetensors heads in anima_pixel_heads/")
+
             with gr.Tab("SnapRef"):
                 gr.Markdown("Upload one or more reference images. Choose a mode; advanced tuning stays tucked away.")
                 snapref_on = gr.Checkbox(value=False, label="Use SnapRef")
@@ -1494,7 +1529,8 @@ def build():
                           seed, guidance, preview_every, batch_count, prompt_style, tags,
                           snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
                           snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
-                          snapref_rg_on, snapref_rg, snapref_caption],
+                          snapref_rg_on, snapref_rg, snapref_caption,
+                          decode_mode, pixel_head_pick],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app
