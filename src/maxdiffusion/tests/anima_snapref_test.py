@@ -93,6 +93,51 @@ def test_plain_forward_is_bit_identical_to_head():
     assert jnp.array_equal(oa, ob), f"scan={scan}: default forward is not bit-identical (max {float(jnp.abs(oa-ob).max())})"
 
 
+def test_pixel_tap_returns_features_without_changing_the_forward():
+  """The pixel-head tap must expose final-layer features and leave `out` untouched.
+
+  This is the integration the pixel decode depends on: the head reads the input of
+  proj_out, so `out` has to stay bit-identical or the pixel path silently changes the
+  sampler's velocity while claiming to only change the decoder.
+  """
+  hs, ts, ctx, mask = _tiny_inputs()
+  plain = FlaxAnimaCosmosTransformer(scan_blocks=True, **TINY)
+  tap = FlaxAnimaCosmosTransformer(scan_blocks=True, return_final_feat=True, **TINY)
+  params = plain.init(jax.random.PRNGKey(23), hs, ts, ctx, mask)
+  o_plain = plain.apply(params, hs, ts, ctx, mask)
+  o_tap, feat = tap.apply(params, hs, ts, ctx, mask)
+  hidden = TINY["heads"] * TINY["head_dim"]
+  n_tokens = hs.shape[-2] // 2 * hs.shape[-1] // 2
+  assert feat.shape == (1, n_tokens, hidden), f"feat {feat.shape} != {(1, n_tokens, hidden)}"
+  assert o_plain.shape == o_tap.shape
+  assert jnp.array_equal(o_plain, o_tap), \
+      f"tap changed the forward (max {float(jnp.abs(o_plain - o_tap).max())})"
+  # The tap reads the pre-proj_out tensor, so its width must be the model hidden size.
+  assert feat.shape[-1] == hidden
+
+
+def test_pixel_tap_needs_a_vector_timestep():
+  """A 0-d timestep must fail loudly: the transformer indexes it as (batch,).
+
+  The server's pixel_features used to pass the raw scalar and died inside the forward
+  with `Too many indices: 0-dimensional array indexed with 1 regular index`.
+  """
+  hs, ts, ctx, mask = _tiny_inputs()
+  tap = FlaxAnimaCosmosTransformer(scan_blocks=True, return_final_feat=True, **TINY)
+  params = tap.init(jax.random.PRNGKey(29), hs, ts, ctx, mask)
+  scalar = jnp.asarray(np.float32(0.5))
+  raised = False
+  try:
+    tap.apply(params, hs, scalar, ctx, mask)
+  except (IndexError, TypeError, ValueError):
+    raised = True
+  assert raised, "a 0-d timestep was accepted; the (batch,) convention is not enforced"
+  # And the documented convention works.
+  vec = jnp.broadcast_to(scalar / jnp.float32(1000.0), (hs.shape[0],))
+  out, feat = tap.apply(params, hs, vec, ctx, mask)
+  assert feat.shape[-1] == TINY["heads"] * TINY["head_dim"]
+
+
 def test_scan_accepts_three_concatenated_reference_records():
   """Three reference records must preserve the scan layer axis through target attention."""
   hs, ts, ctx, mask = _tiny_inputs()

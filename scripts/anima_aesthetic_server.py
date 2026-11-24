@@ -651,12 +651,16 @@ def get_pixel_head(name):
             f"patch {info['patch']}px, channels {info['channels']}) | {hbm_stats()}")
     return _PIXEL_HEADS[path]
 
-def pixel_features(latents, t_vec, context, neg_context, pad, guidance, snap_cfg):
+def pixel_features(latents, timestep, context, neg_context, pad, guidance, snap_cfg):
     """CFG-combined final-layer features f_u + g*(f_c - f_u), as the node does.
 
     The tap sits immediately before a linear map, so the combined feature maps to v_cfg.
     Two extra forward passes at the final timestep; everything earlier is untouched.
     """
+    # Same timestep convention as cfg_prediction / snapref_cfg_prediction: the transformer
+    # wants a (batch,) vector scaled by 1/1000, not the raw scalar.
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0),
+                             (latents.shape[0],)).astype(jnp.float32)
     lora = refkv = refbias = None
     if snap_cfg:
         ad = get_snapref_adapter(snap_cfg.get("adapter"))
@@ -722,13 +726,19 @@ _SNAPREF_HOST_CACHE = {}         # one host-side prepared reference result; neve
 
 
 def _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout):
+    """Content-keyed so the cache hits across generations.
+
+    The API writes each upload to ref_<gen_id>_<i>.png, so a path-based key never matches
+    twice even for byte-identical images. Hash the bytes instead.
+    """
     refs = []
     for path, weight in active:
         try:
-            st = os.stat(path)
-            refs.append((os.path.abspath(path), st.st_size, st.st_mtime_ns, float(weight)))
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
         except OSError:
-            refs.append((os.path.abspath(path), None, None, float(weight)))
+            digest = None
+        refs.append((digest, float(weight)))
     payload = repr((ad.path, target_hw, layout, megapixels, cfg.get("mode") or "cs",
                     cfg.get("ref_caption") or "", cfg.get("strength", 0.0), refs)).encode()
     return hashlib.sha256(payload).hexdigest()
