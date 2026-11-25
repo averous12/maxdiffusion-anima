@@ -145,6 +145,55 @@ def test_full_coverage_rejects_incomplete():
                                 {"box": [.5, 0, .5, 1]}], h, w)
 
 
+def test_common_block_is_prepended_to_every_region():
+    """A shared quality/artist preamble must reach every region, exactly once."""
+    common = {"prompt": "masterpiece, best quality, @sw33t,",
+              "negative_prompt": "worst quality, low quality"}
+    regions = r.normalize_schedule([
+        {"prompt": "1girl, red coat", "box": [0, 0, .5, 1]},
+        {"prompt": "1boy, blue coat", "box": [.5, 0, .5, 1]},
+    ], common=common)
+    assert regions[0]["prompt"] == "masterpiece, best quality, @sw33t, 1girl, red coat"
+    assert regions[1]["prompt"] == "masterpiece, best quality, @sw33t, 1boy, blue coat"
+    for region in regions:
+        assert region["negative_prompt"] == "worst quality, low quality"
+
+
+def test_common_from_schedule_object():
+    """The dict form carries `common` alongside `stages`."""
+    schedule = {"common": {"prompt": "masterpiece, best quality"},
+                "stages": [{"id": "s", "start": 0.0, "end": 1.0,
+                            "regions": [{"prompt": "1girl", "box": [0, 0, 1, 1]}]}]}
+    regions = r.normalize_schedule(schedule)
+    assert regions[0]["prompt"] == "masterpiece, best quality, 1girl"
+    assert regions[0]["negative_prompt"] == ""
+
+
+def test_disabled_region_is_dropped():
+    """The UI checkmark must cost nothing: no encode, no branch, no region slot."""
+    regions = r.normalize_schedule([
+        {"prompt": "1girl", "box": [0, 0, .5, 1]},
+        {"prompt": "1boy", "box": [.5, 0, .5, 1], "enabled": False},
+    ])
+    assert len(regions) == 1
+    assert regions[0]["prompt"] == "1girl"
+    # Disabled regions do not count against the region cap either.
+    many = [{"prompt": "x", "box": [0, 0, 1, 1], "enabled": False} for _ in range(40)]
+    assert r.normalize_schedule(many) == []
+
+
+def test_region_may_rely_on_common_prompt():
+    """A blank region prompt is legal when the shared block supplies the text."""
+    regions = r.normalize_schedule([{"prompt": "", "box": [0, 0, 1, 1]}],
+                                   common={"prompt": "masterpiece, 1girl"})
+    assert regions[0]["prompt"] == "masterpiece, 1girl"
+    try:
+        r.normalize_schedule([{"prompt": "", "box": [0, 0, 1, 1]}])
+    except r.RegionalPromptError:
+        return
+    raise AssertionError("empty prompt with no common block should fail")
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:

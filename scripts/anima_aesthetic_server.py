@@ -1010,10 +1010,12 @@ def prepare_snapref(cfg, target_hw):
                 for p in refs
             ][:len(records)]}
 
-def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative=""):
+def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative="",
+                     common=None):
     """Prepare regional text; SnapRef K/V is deliberately lazy per active interval."""
     prepared = []
-    for index, raw in enumerate(anima_regional.normalize_schedule(regions, maximum=16)):
+    for index, raw in enumerate(anima_regional.normalize_schedule(
+            regions, maximum=16, common=common)):
         if not raw["negative_prompt"]:
             raw = dict(raw, negative_prompt=default_negative)
         pos, neg = encode_texts(raw["prompt"], raw["negative_prompt"], steps=steps,
@@ -1476,13 +1478,15 @@ while True:
             _SNAPREF_STATE["kv"] = None
         regional_specs = d.get("regional") or d.get("regions") or []
         regional_info = []
-        regional_schedule = anima_regional.normalize_schedule(regional_specs, maximum=16) if regional_specs else []
+        regional_schedule = (anima_regional.normalize_schedule(
+            regional_specs, maximum=16, common=d.get("common")) if regional_specs else [])
         regional_active_key = None
         regional_active = {}
         if regional_specs:
             write_prog(stage="regional-text", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
                        gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts")
-            regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags, int(SEED), _n)
+            regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags,
+                                             int(SEED), _n, common=d.get("common"))
             for _r in regional_info:
                 if BATCH > 1:
                     _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]

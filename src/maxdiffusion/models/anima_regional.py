@@ -26,18 +26,47 @@ def _finite(value: Any, name: str) -> float:
   return result
 
 
-def normalize_region(spec: Any, index: int = 0) -> dict:
+def _join(prefix: str, text: str) -> str:
+  """Join a common prefix with per-region text, without stray separators."""
+  prefix = (prefix or "").strip().rstrip(",")
+  text = (text or "").strip().lstrip(",")
+  if prefix and text:
+    return f"{prefix}, {text}"
+  return prefix or text
+
+
+def normalize_common(common: Any) -> dict:
+  """Validate the shared prompt block that is prepended to every region.
+
+  The quality preamble and artist tags belong to every region, but repeating them by
+  hand is how halves drift apart. This carries them once and prepends them, so the
+  CLI, the API and the UI all produce identical text.
+  """
+  if not common or not isinstance(common, dict):
+    return {"prompt": "", "negative_prompt": ""}
+  return {"prompt": str(common.get("prompt", "") or "").strip(),
+          "negative_prompt": str(common.get("negative_prompt", "") or "").strip()}
+
+
+def normalize_region(spec: Any, index: int = 0, common: dict = None) -> dict:
   """Validate one public region and return a canonical copy.
 
   ``box`` is normalized ``[x, y, width, height]``. Alternatively, ``mask``
   is a request-local PNG path, normalized by the API before the server sees it.
   ``start``/``end`` are schedule fractions; ``snapref`` is passed through.
+  ``common`` (positive/negative) is prepended to this region's prompts.
+  Returns ``None`` for a region explicitly switched off, so a disabled row in the
+  UI costs nothing: it is never encoded and never runs.
   """
   if not isinstance(spec, dict):
     raise RegionalPromptError(f"region {index} must be an object")
-  prompt = str(spec.get("prompt", "")).strip()
+  if spec.get("enabled") is False:
+    return None
+  common = common or {"prompt": "", "negative_prompt": ""}
+  prompt = _join(common.get("prompt", ""), spec.get("prompt", ""))
   if not prompt:
     raise RegionalPromptError(f"region {index} prompt is empty")
+  negative = _join(common.get("negative_prompt", ""), spec.get("negative_prompt", ""))
   mask = spec.get("mask")
   box = spec.get("box")
   if mask:
@@ -70,7 +99,7 @@ def normalize_region(spec: Any, index: int = 0) -> dict:
     raise RegionalPromptError(f"region {index} strength cannot be negative")
   return {
     "prompt": prompt,
-    "negative_prompt": str(spec.get("negative_prompt", "")).strip(),
+    "negative_prompt": negative,
     "box": canonical_box,
     "mask": str(mask) if mask else None,
     "start": start,
@@ -81,26 +110,33 @@ def normalize_region(spec: Any, index: int = 0) -> dict:
   }
 
 
-def normalize_schedule(schedule: Any, maximum: int = 16) -> list[dict]:
+def normalize_schedule(schedule: Any, maximum: int = 16, common: Any = None) -> list[dict]:
   """Flatten a stage schedule while preserving arbitrary interval overlap.
 
   Accepted forms:
     * legacy list of region objects;
-    * {"stages": [{"id", "start", "end", "regions": [...]}]}.
+    * {"stages": [{"id", "start", "end", "regions": [...]}]};
+  Both may carry a shared ``common`` block whose prompt/negative is prepended to
+  every region. Regions with ``enabled: false`` are dropped entirely.
 
   Empty stages are valid composition-only phases and produce no regional branch.
   Region intervals override stage bounds when explicitly supplied.
   """
   if schedule in (None, "", []):
     return []
+  shared = normalize_common(common)
+  if isinstance(schedule, dict):
+    shared = normalize_common(schedule.get("common") or common)
   if isinstance(schedule, list):
-    if len(schedule) > maximum:
-      raise RegionalPromptError(f"at most {maximum} regional prompts are supported")
     out = []
     for i, item in enumerate(schedule):
-      region = normalize_region(item, i)
+      region = normalize_region(item, i, shared)
+      if region is None:
+        continue
       region["stage_id"] = "legacy"
       out.append(region)
+      if len(out) > maximum:
+        raise RegionalPromptError(f"at most {maximum} regional prompts are supported")
     return out
   if not isinstance(schedule, dict) or not isinstance(schedule.get("stages"), list):
     raise RegionalPromptError("regional must be a list or an object with stages")
@@ -120,9 +156,13 @@ def normalize_schedule(schedule: Any, maximum: int = 16) -> list[dict]:
       if not isinstance(raw, dict):
         raise RegionalPromptError(f"stage {stage_id!r} region {region_index} must be an object")
       item = dict(raw)
-      item.setdefault("start", start)
-      item.setdefault("end", end)
-      region = normalize_region(item, len(out))
+      if "start" not in item:
+        item["start"] = start
+      if "end" not in item:
+        item["end"] = end
+      region = normalize_region(item, len(out), shared)
+      if region is None:
+        continue
       region["stage_id"] = stage_id
       out.append(region)
       if len(out) > maximum:
