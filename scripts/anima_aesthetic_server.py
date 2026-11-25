@@ -120,6 +120,7 @@ from maxdiffusion.models.anima_text_conditioner_flax import (
     convert_anima_aesthetic_adapter_weights)
 from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_loras
 from maxdiffusion.models import anima_snapref_flax as anima_snapref
+from maxdiffusion.models import anima_regional
 from maxdiffusion.models import anima_pixel_head_flax as anima_pixel_head
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
@@ -664,7 +665,7 @@ def pixel_features(latents, timestep, context, neg_context, pad, guidance, snap_
     lora = refkv = refbias = None
     if snap_cfg:
         ad = get_snapref_adapter(snap_cfg.get("adapter"))
-        lora = ad.lora_tree("tgt")
+        lora = ad.lora_tree("tgt", snap_cfg.get("mode") or "cs")
         sizes = list(snap_cfg["_sizes"])
         weights = list(snap_cfg["_weights"])
         biases = [anima_snapref.reference_biases(snap_cfg.get("strength", 0.0), weights)[i]
@@ -882,7 +883,15 @@ def prepare_snapref(cfg, target_hw):
         raise anima_snapref.SnapRefError("snapref.weights must match snapref.images")
     if sum(1 for w in weights if w > 0) == 0:
         raise anima_snapref.SnapRefError("every reference has weight 0")
-    mode = str(cfg.get("mode") or "cs")
+    mode = str(cfg.get("mode") or "cs").lower()
+    if mode not in ad.modes:
+        raise anima_snapref.SnapRefError(
+            f"SnapRef adapter {os.path.basename(ad.path)} does not support mode {mode!r}; "
+            f"available modes: {list(ad.modes)}")
+    if mode == "style" and not any(mode in b["modes"] and b["stream"] == "ref" for b in ad.branches.values()):
+        raise anima_snapref.SnapRefError(
+            f"SnapRef adapter {os.path.basename(ad.path)} lists style without a style ref branch; "
+            "use snapref_v2s_pre1 or select cs/char")
     requested_megapixels = float(cfg.get("ref_megapixels") or 1.0)
     layout = str(cfg.get("multi_layout") or "separate").lower()
     if layout not in ("separate", "stitch"):
@@ -914,6 +923,7 @@ def prepare_snapref(cfg, target_hw):
             (target_hw[0] // 16) * (target_hw[1] // 16))
         log(f"SnapRef host cache hit: {len(size_list)} reference(s), "
             f"{sum(size_list)} tokens, key {cache_key[:12]}")
+        cfg["_kv"] = cache
         return {"adapter": os.path.basename(ad.path), "mode": mode, "sizes": list(size_list),
                 "weights": [w for w in weights if w > 0], "biases": list(bias.shape),
                 "ref_seconds": round(time.perf_counter() - t0, 3),
@@ -943,7 +953,7 @@ def prepare_snapref(cfg, target_hw):
             cos, sin = anima_snapref.reference_rope((th, tw), (rh, rw), ad.ref_t)
             _out, kv = snapref_reference_forward(t_params, lat, ref_ctx, jnp.zeros(
                 (1, 1, int(target_hw[0]), int(target_hw[1])), jnp.float32), cos, sin, mode_vec,
-                ad.lora_tree("ref"))
+                ad.lora_tree("ref", mode))
             kv[0].block_until_ready()
             # Park this reference on the host and drop the device copy now: keeping every
             # record resident and then concatenating them doubles the TPU peak.
@@ -959,6 +969,7 @@ def prepare_snapref(cfg, target_hw):
                                                                    effective_weights),
                                     (target_hw[0] // 16) * (target_hw[1] // 16))
     _SNAPREF_STATE["kv"] = cache
+    cfg["_kv"] = cache
     _SNAPREF_HOST_CACHE.clear()
     _SNAPREF_HOST_CACHE[cache_key] = (
         (np.asarray(cache[0]), np.asarray(cache[1])),
@@ -977,6 +988,39 @@ def prepare_snapref(cfg, target_hw):
                 for p in refs
             ][:len(records)]}
 
+def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative=""):
+    """Prepare scheduled regional conditioning and one independent SnapRef bank per region."""
+    prepared = []
+    for index, raw in enumerate(anima_regional.normalize_regions(regions)):
+        if not raw["negative_prompt"]:
+            raw = dict(raw, negative_prompt=default_negative)
+        pos, neg = encode_texts(raw["prompt"], raw["negative_prompt"], steps=steps,
+                                style=style, tags=tags, seed=seed + index)
+        item = dict(raw, pos_ctxs=pos[0], pos_map=pos[1], pos_plan=pos[2],
+                    neg_ctxs=neg[0], neg_map=neg[1], neg_plan=neg[2])
+        snap = raw.get("snapref")
+        if snap and "adapter" not in snap and snap.get("ref_adapter"):
+            snap = dict(snap, adapter=snap["ref_adapter"])
+            item["snapref"] = snap
+        if snap and snap.get("enabled", True) and snap.get("images"):
+            info = prepare_snapref(snap, target_hw)
+            snap["_sizes"], snap["_weights"] = info["sizes"], info["weights"]
+            item["snapinfo"] = info
+            item["snapcfg"] = snap
+        prepared.append(item)
+    return prepared
+
+
+def regional_prediction(latents, timestep, pad, guidance, region):
+    """One region's scheduled CFG prediction; its SnapRef bank is independent."""
+    pos = region["pos_ctxs"][region["pos_map"][region["_step"]]]
+    neg = region["neg_ctxs"][region["neg_map"][region["_step"]]]
+    snap = region.get("snapcfg")
+    if snap:
+        return snapref_cfg_prediction(latents, timestep, pos, neg, pad, guidance, snap)
+    return cfg_prediction(latents, timestep, pos, neg, pad, guidance)
+
+
 def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidance, cfg):
     """CFG along the SnapRef branches, then the documented post-CFG steps.
 
@@ -987,9 +1031,9 @@ def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidanc
     ref_guidance_on: both read it, plus one reference-free negative call per step, and
       guided = base + rg*(uncond_ref - base) + cfg*(cond_ref - uncond_ref), then APG.
     """
-    cache = _SNAPREF_STATE["kv"]
+    cache = (cfg.get("_kv") if cfg.get("_kv") is not None else _SNAPREF_STATE["kv"])
     ad = get_snapref_adapter(cfg.get("adapter"))
-    lora = ad.lora_tree("tgt")
+    lora = ad.lora_tree("tgt", cfg.get("mode") or "cs")
     sizes = list(cfg["_sizes"])
     biases = [anima_snapref.reference_biases(cfg.get("strength", 0.0), cfg["_weights"])[i]
               for i in range(len(cfg["_weights"]))]
@@ -1411,8 +1455,19 @@ while True:
                              ref_guidance=float(_snap.get("ref_guidance", 4.5)))
         else:
             _SNAPREF_STATE["kv"] = None
-
-        # All BATCH images share every transformer call: latents (B,16,1,h,w), context
+        regional_specs = d.get("regional") or []
+        regional_info = []
+        if regional_specs:
+            write_prog(stage="regional", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts/references")
+            regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags, int(SEED), _n)
+            for _r in regional_info:
+                if BATCH > 1:
+                    _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]
+                    _r["neg_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["neg_ctxs"]]
+        # Regional preparation uses cfg-local K/V handles; never leave the last region in
+        # the process-global slot used by the plain/global SnapRef path.
+        _SNAPREF_STATE["kv"] = _snap.get("_kv") if _snap.get("_kv") is not None else None
         # (B,512,1024), pad (B,1,H,W). The padding mask is concatenated channel-wise inside the
         # transformer, so its batch dim must equal the latents' batch dim.
         latents = jnp.asarray(np.concatenate(
@@ -1479,6 +1534,21 @@ while True:
             else:
                 pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                       context, neg_context, pad, GUIDANCE)
+            if regional_info:
+                _reg_t = jnp.asarray(np.float32(timesteps[i]))
+                _reg_pred = pred.astype(jnp.float32)
+                _reg_mass = jnp.zeros((1, 1, 1, H // 8, W // 8), dtype=jnp.float32)
+                _reg_delta = jnp.zeros_like(_reg_pred)
+                for _region in regional_info:
+                    _region["_step"] = i
+                    if not anima_regional.active(_region, i, STEPS):
+                        continue
+                    _mask = jnp.asarray(anima_regional.box_mask(
+                        _region, H // 8, W // 8), dtype=jnp.float32)
+                    _branch = regional_prediction(latents, _reg_t, pad, GUIDANCE, _region).astype(jnp.float32)
+                    _reg_delta = _reg_delta + _mask * (_branch - pred.astype(jnp.float32))
+                    _reg_mass = _reg_mass + _mask
+                pred = pred.astype(jnp.float32) + _reg_delta / jnp.maximum(_reg_mass, 1.0)
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
             if _want_pixel and i == STEPS - 1:
                 x_last = latents

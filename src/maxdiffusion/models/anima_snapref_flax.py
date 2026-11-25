@@ -31,7 +31,8 @@ import numpy as np
 from safetensors import safe_open
 
 SNAPREF_FORMAT = "anima_ref_kv/1"
-SUPPORTED_SNAPREF_RELEASES = ("v1a", "v1b", "v2a", "v2a-pre1", "v2a-pre2")
+SUPPORTED_SNAPREF_RELEASES = ("v1a", "v1b", "v2a", "v2a-pre1", "v2a-pre2", "v2s", "v2s-pre1")
+BRANCH_PREFIX = "anima_ref_kv.branch."
 
 # adapter module name -> path inside one block's LoRA tree.
 # The tree mirrors the model: {"attn1": {dense name: (A, B)}, "attn2": {...},
@@ -82,17 +83,27 @@ class SnapRefAdapter:
   mode_embed: Optional[jax.Array] = None
   layers: int = 28
   lora: dict = field(default_factory=dict)   # stream -> {path tuple: (A, B)} stacked per layer
+  branches: dict = field(default_factory=dict)  # name -> {stream, modes, tree}
   meta: dict = field(default_factory=dict)
 
   def stream_names(self):
     return tuple(sorted(self.lora))
 
-  def lora_tree(self, stream):
-    """The per-layer LoRA argument for one stream, or None if the stream is absent.
+  def lora_tree(self, stream, mode=None):
+    """Per-layer LoRA tree; style mode adds its metadata-declared mode branches.
 
-    Stacked arrays with a leading axis of `layers` — the shape nn.scan consumes directly.
+    Branch ranks are concatenated mathematically: A=[A_base, A_branch],
+    B=[B_base; B_branch]. That is exactly the sum of the two low-rank deltas,
+    without materializing or duplicating the transformer parameter tree.
     """
-    return self.lora.get(stream) or None
+    tree = self.lora.get(stream) or None
+    if not mode:
+      return tree
+    for branch in self.branches.values():
+      if branch["stream"] != stream or mode not in branch["modes"]:
+        continue
+      tree = combine_lora_trees(tree, branch["tree"])
+    return tree
 
   def mode_index(self, mode):
     try:
@@ -126,6 +137,80 @@ def _dequant(tensors, key):
   return w
 
 
+def combine_lora_trees(base, extra):
+  """Add two LoRA trees exactly by concatenating their rank dimensions."""
+  if base is None:
+    return extra
+  if extra is None:
+    return base
+  out = {}
+  for group in set(base) | set(extra):
+    out[group] = {}
+    a_group, b_group = base.get(group, {}), extra.get(group, {})
+    for name in set(a_group) | set(b_group):
+      if name not in a_group:
+        out[group][name] = b_group[name]
+      elif name not in b_group:
+        out[group][name] = a_group[name]
+      else:
+        a0, b0 = a_group[name]
+        a1, b1 = b_group[name]
+        if a0.shape[:-1] != a1.shape[:-1] or b0.shape[:-2] != b1.shape[:-2] or b0.shape[-1] != b1.shape[-1]:
+          raise SnapRefError(f"cannot combine LoRA ranks for {group}.{name}: {a0.shape}/{b0.shape} vs {a1.shape}/{b1.shape}")
+        out[group][name] = (jnp.concatenate([a0, a1], axis=-1),
+                            jnp.concatenate([b0, b1], axis=-2))
+  return out
+
+
+def _branch_tree(handle, keys, metadata, num_layers, dtype):
+  """Read v2s mode-gated LoRA branches using the upstream anima_ref_kv.branch.* contract."""
+  specs = metadata.get("branches") or {}
+  found = {}
+  for key in keys:
+    if not key.startswith(BRANCH_PREFIX) or not key.endswith(".down"):
+      continue
+    root = key[:-len("down")]
+    rest = root[len(BRANCH_PREFIX):-1]
+    branch, module = rest.split(".", 1)
+    if branch not in specs:
+      raise SnapRefError(f"branch weights for {branch!r} have no metadata specification")
+    stem = root
+    down = _dequant(handle, key)
+    up = _dequant(handle, stem + "up")
+    alpha_key = stem + "alpha"
+    alpha = float(handle.get_tensor(alpha_key)[()]) if alpha_key in keys else down.shape[0]
+    scale = alpha / down.shape[0]
+    A = down.T.astype(np.float32) * scale
+    B = up.T.astype(np.float32)
+    _, index, module_name = module.split(".", 2)
+    path_key = _flax_path(module_name)
+    found.setdefault(branch, {}).setdefault(path_key, {})[int(index)] = (A, B)
+  result = {}
+  for name, per_path in found.items():
+    spec = specs[name]
+    stream = spec.get("stream")
+    modes = tuple(str(m) for m in spec.get("modes", ()))
+    if stream not in ("ref", "tgt") or spec.get("combine", "add") != "add" or not modes:
+      raise SnapRefError(f"unsupported SnapRef branch {name!r}: stream={stream!r}, modes={modes}, combine={spec.get('combine')!r}")
+    tree = {}
+    for path_key, layers in per_path.items():
+      missing = sorted(set(range(num_layers)) - set(layers))
+      if missing:
+        raise SnapRefError(f"branch {name} {path_key}: missing layers {missing[:5]}")
+      A = jnp.asarray(np.stack([layers[i][0] for i in range(num_layers)]), dtype=dtype)
+      B = jnp.asarray(np.stack([layers[i][1] for i in range(num_layers)]), dtype=dtype)
+      _check_shapes(path_key, A, B)
+      if len(path_key) == 1:
+        tree[path_key[0]] = {"self": (A, B)}
+      else:
+        tree.setdefault(path_key[0], {})[path_key[1]] = (A, B)
+    result[name] = {"stream": stream, "modes": modes, "tree": tree}
+  for name, spec in specs.items():
+    if name not in result and spec.get("modes"):
+      raise SnapRefError(f"SnapRef branch {name!r} is declared but has no branch weights")
+  return result
+
+
 def load_snapref(path, num_layers=28, dtype=jnp.float32, expect_layers=None):
   """Load an `anima_ref_kv/1` adapter into (A, B) LoRA pairs + the mode embedding."""
   with safe_open(path, framework="np") as handle:
@@ -151,6 +236,7 @@ def load_snapref(path, num_layers=28, dtype=jnp.float32, expect_layers=None):
     mode_embed = None
     if "anima_ref_kv.mode_embed" in keys:
       mode_embed = jnp.asarray(handle.get_tensor("anima_ref_kv.mode_embed"), dtype=jnp.float32)
+    branches = _branch_tree(handle, keys, raw, num_layers, dtype)
     # stream -> path -> {layer: (A, B)}
     acc = {}
     for key in keys:
@@ -196,7 +282,7 @@ def load_snapref(path, num_layers=28, dtype=jnp.float32, expect_layers=None):
 
   return SnapRefAdapter(path=path, ref_t=int(raw.get("ref_t", 10)),
                         modes=tuple(raw.get("modes", ["cs"])), mode_embed=mode_embed,
-                        layers=num_layers, lora=lora, meta=raw)
+                        layers=num_layers, lora=lora, branches=branches, meta=raw)
 
 
 def _flax_path(module):

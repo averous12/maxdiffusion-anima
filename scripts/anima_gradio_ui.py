@@ -1060,7 +1060,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_mode="cs", snapref_layout="separate", snapref_weights=None,
               snapref_strength=0.0, snapref_fidelity=1.0,
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
-              snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None):
+              snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None,
+              regional_json=""):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1096,6 +1097,15 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         mp_budget=snapref_budget)
     if isinstance(snap_cfg, str):
         return (snap_cfg, _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
+    if regional_json and str(regional_json).strip():
+        try:
+            regional = json.loads(regional_json)
+            if not isinstance(regional, list):
+                raise ValueError("regional JSON must be a list")
+            req["regional"] = regional
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return (f"regional JSON invalid: {exc}", _upd(), progress_bar_html(0, "idle"),
+                    _upd(), _upd(), _upd())
     if snap_cfg is not None:
         req["snapref"] = snap_cfg
     else:
@@ -1447,8 +1457,8 @@ def build():
                     choices=adapters or ["(none found)"],
                     value=adapters[0] if adapters else "(none found)",
                     label="Adapter version")
-                snapref_mode = gr.Radio(["cs", "char"], value="cs", label="Reference mode",
-                                        info="cs = character + style · char = character only")
+                snapref_mode = gr.Radio(["cs", "char", "style"], value="cs", label="Reference mode",
+                                        info="cs = character + style · char = character only · style = style only (v2s)")
                 with gr.Accordion("Advanced SnapRef settings", open=False):
                     snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
                                               label="Reference layout",
@@ -1476,8 +1486,10 @@ def build():
                                                  placeholder="blue hair, red jacket")
                     snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
                                                 label="Reference pixel budget (MP, combined)",
-                                                info="Separate references share this. 3.0 = a full "
-                                                     "megapixel each; needs pixel decode for headroom.")
+                                                info="Separate references share this. 3.0 = a full megapixel each.")
+                    regional_json = gr.Textbox(value="", lines=5, label="Scheduled regional prompts (JSON, optional)",
+                                               placeholder='[{"prompt":"red-haired woman","box":[0,0,0.5,1],"start":0,"end":1,"ref_images_b64":[]}]',
+                                               info="Each region may include box, start/end, feather, prompt, and its own snapref.")
 
             with gr.Tab("Help"):
                 gr.Markdown(
@@ -1546,7 +1558,7 @@ def build():
                           snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
                           snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
                           snapref_rg_on, snapref_rg, snapref_caption,
-                          decode_mode, pixel_head_pick, snapref_budget],
+                          decode_mode, pixel_head_pick, snapref_budget, regional_json],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         # Progress is POLLED, not streamed. The tunnel in front of this app

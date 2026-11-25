@@ -56,6 +56,20 @@ def test_blocks_build():
   print(f"blocks ok; pixel head choices: {ui.pixel_head_names()}")
 
 
+def test_regional_json_is_sent_and_validated():
+  box, orig = _capture_request()
+  regional = [{"prompt": "blue-haired boy", "box": [0.5, 0, 0.5, 1],
+               "start": 0.25, "end": 0.75, "feather": 0.05,
+               "snapref": {"enabled": True, "ref_adapter": "snapref_v2s_pre1.safetensors",
+                           "mode": "style", "images": ["/tmp/ref.png"]}}]
+  _call(box, orig, regional_json=__import__("json").dumps(regional))
+  assert box["req"]["regional"] == regional, box["req"].get("regional")
+  box, orig = _capture_request()
+  _call(box, orig, regional_json="not json")
+  assert "req" not in box
+  print("regional UI: structured list sent; invalid JSON rejected")
+
+
 def test_default_request_has_no_decode_key_without_head():
   """Default is pixel, but with no head selected the UI sends nothing and the server falls
   back. A fresh install must still be able to generate."""

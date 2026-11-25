@@ -54,6 +54,37 @@ def _tiny_inputs():
           jnp.ones((1, 5), dtype=jnp.float32))          # attention mask is [B, S_ctx]
 
 
+def test_lora_tree_rank_concat_equals_sum():
+  """v2s branch + base stream can be represented by concatenated low-rank factors."""
+  base = {"attn1": {"to_q": (jnp.asarray([[[1.0], [2.0]]]),
+                                jnp.asarray([[[3.0, 4.0]]]))}}
+  extra = {"attn1": {"to_q": (jnp.asarray([[[5.0], [6.0]]]),
+                                 jnp.asarray([[[7.0, 8.0]]]))}}
+  merged = sf.combine_lora_trees(base, extra)
+  x = jnp.asarray([[2.0, -1.0]])
+  want = (x @ base["attn1"]["to_q"][0][0]) @ base["attn1"]["to_q"][1][0]
+  want += (x @ extra["attn1"]["to_q"][0][0]) @ extra["attn1"]["to_q"][1][0]
+  got = (x @ merged["attn1"]["to_q"][0][0]) @ merged["attn1"]["to_q"][1][0]
+  assert jnp.allclose(got, want)
+  assert merged["attn1"]["to_q"][0].shape == (1, 2, 2)
+
+
+def test_v2s_mode_lora_is_selected_only_for_declared_modes():
+  """A style branch must add only in style; cs/char retain the base object unchanged."""
+  base_pair = (jnp.ones((2, 4, 1)), jnp.ones((2, 1, 3)))
+  branch_pair = (jnp.full((2, 4, 2), 2.0), jnp.full((2, 2, 3), 3.0))
+  ad = sf.SnapRefAdapter(path="fake", layers=2,
+      lora={"ref": {"attn1": {"to_q": base_pair}}},
+      branches={"style": {"stream": "ref", "modes": ("style",),
+                           "tree": {"attn1": {"to_q": branch_pair}}}})
+  assert ad.lora_tree("ref", "cs") is ad.lora["ref"]
+  assert ad.lora_tree("ref", "char") is ad.lora["ref"]
+  style = ad.lora_tree("ref", "style")
+  assert style["attn1"]["to_q"][0].shape == (2, 4, 3)
+  assert style["attn1"]["to_q"][1].shape == (2, 3, 3)
+  assert ad.lora_tree("tgt", "style") is None
+
+
 def test_mode_embedding_keeps_the_timestep_stream_2d():
   """t_embed_add must not add an axis: the whole block stack breaks if it does."""
   hs, ts, ctx, mask = _tiny_inputs()
