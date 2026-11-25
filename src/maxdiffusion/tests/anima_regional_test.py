@@ -121,6 +121,30 @@ def test_max_regions():
     raise AssertionError("accepted >4 regions")
 
 
+def test_full_coverage_tiling_regions():
+    """Halves and thirds tile the canvas, so the base prediction can be skipped."""
+    h = w = 16
+    assert r.full_coverage([{"box": [0, 0, .5, 1]}, {"box": [.5, 0, .5, 1]}], h, w)
+    thirds = [{"box": [0, 0, .34, 1]}, {"box": [.34, 0, .32, 1]},
+              {"box": [.66, 0, .34, 1]}]
+    assert r.full_coverage(thirds, h, w)
+    # Overlapping regions exceed mass 1 everywhere: still a safe skip.
+    assert r.full_coverage([{"box": [0, 0, .7, 1]}, {"box": [.3, 0, .7, 1]}], h, w)
+
+
+def test_full_coverage_rejects_incomplete():
+    """Anything short of complete coverage must keep the base prediction."""
+    h = w = 16
+    assert not r.full_coverage([], h, w)
+    assert not r.full_coverage([{"box": [0, 0, .5, 1]}], h, w)
+    assert not r.full_coverage([{"box": [0, 0, .5, 1]}, {"box": [.6, 0, .4, 1]}], h, w)
+    # A vertical gap is just as disqualifying as a horizontal one.
+    assert not r.full_coverage([{"box": [0, 0, 1, .5]}, {"box": [0, .6, 1, .4]}], h, w)
+    # Strength < 1 scales the mask, so coverage is not complete even when it tiles.
+    assert not r.full_coverage([{"box": [0, 0, .5, 1], "strength": 0.5},
+                                {"box": [.5, 0, .5, 1]}], h, w)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:

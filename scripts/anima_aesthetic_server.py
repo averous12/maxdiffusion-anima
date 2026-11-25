@@ -613,6 +613,10 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
 PIXEL_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
                           os.path.join(CROOT, "anima_pixel_heads")) if d and os.path.isdir(d)]
 DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "pixel").strip().lower()
+# Skip the base CFG pair when active regions fully tile the canvas (the blend cancels it
+# exactly). Kept switchable so the optimisation can be A/B'd against the old maths.
+REGIONAL_FAST = (os.environ.get("ANIMA_REGIONAL_FAST", "1").strip().lower()
+                 not in ("0", "false", "no", "off"))
 PIXEL_HEAD_DEFAULT = (os.environ.get("ANIMA_PIXEL_HEAD") or "").strip()
 
 _PIXEL_TAP = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, return_final_feat=True)
@@ -1543,14 +1547,24 @@ while True:
                 break
             context = pos_ctxs[pos_map[i]]
             neg_context = neg_ctxs[neg_map[i]]
-            if snap_info:
+            # A regional set that fully tiles the canvas makes the base prediction
+            # algebraically redundant: the blend below cancels `pred` on every covered
+            # pixel, so running the base CFG pair is pure wasted compute. Decide before
+            # paying for it -- but only when coverage is genuinely complete.
+            _skip_base = False
+            if regional_specs and REGIONAL_FAST:
+                _active_key = anima_regional.active_indices(regional_schedule, i, STEPS)
+                _skip_base = anima_regional.full_coverage(
+                    [regional_schedule[x] for x in _active_key], H // 8, W // 8)
+            if _skip_base:
+                pred = None
+            elif snap_info:
                 pred = snapref_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                               context, neg_context, pad, GUIDANCE, _snap)
             else:
                 pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                       context, neg_context, pad, GUIDANCE)
             if regional_specs:
-                _active_key = anima_regional.active_indices(regional_schedule, i, STEPS)
                 if _active_key != regional_active_key:
                     _new_set = set(_active_key)
                     _old_set = set(regional_active_key or ())
@@ -1585,7 +1599,10 @@ while True:
                 _SNAPREF_STATE["kv"] = _snap.get("_kv")
             if regional_active:
                 _reg_t = jnp.asarray(np.float32(timesteps[i]))
-                _reg_delta = jnp.zeros_like(pred, dtype=jnp.float32)
+                _has_base = pred is not None
+                _reg_delta = jnp.zeros(
+                    (latents.shape[0], latents.shape[1], latents.shape[2],
+                     H // 8, W // 8), dtype=jnp.float32)
                 _reg_mass = jnp.zeros((1, 1, 1, H // 8, W // 8), dtype=jnp.float32)
                 for _ri, _region in regional_active.items():
                     _region["_step"] = i
@@ -1596,9 +1613,14 @@ while True:
                     # With a base global SnapRef plus regional references, each region's cfg
                     # uses its own cache. No reference state is retained after stage changes.
                     _branch = regional_prediction(latents, _reg_t, pad, GUIDANCE, _region).astype(jnp.float32)
-                    _reg_delta = _reg_delta + _mask * (_branch - pred.astype(jnp.float32))
+                    # With a skipped base there is nothing to subtract from: sum the masked
+                    # branches and normalize, which is exactly what the base-containing
+                    # expression collapses to wherever coverage is complete.
+                    _reg_delta = _reg_delta + _mask * (
+                        _branch if not _has_base else (_branch - pred.astype(jnp.float32)))
                     _reg_mass = _reg_mass + _mask
-                pred = pred.astype(jnp.float32) + _reg_delta / jnp.maximum(_reg_mass, 1.0)
+                _blend = _reg_delta / jnp.maximum(_reg_mass, 1.0)
+                pred = _blend if not _has_base else pred.astype(jnp.float32) + _blend
             sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
             if _want_pixel and i == STEPS - 1:
                 x_last = latents

@@ -146,6 +146,26 @@ def active(region: dict, step: int, steps: int) -> bool:
   )
 
 
+def full_coverage(regions: list[dict], height: int, width: int, eps: float = 1e-6) -> bool:
+  """True only when the active masks cover every latent cell with total mass >= 1.
+
+  In that case the server's blend `pred + sum(m*(branch-pred))/max(sum(m),1)` cancels
+  `pred` everywhere, so the base CFG pair can be skipped without changing the result.
+  Anything less than complete coverage keeps the base prediction.
+  """
+  import numpy as np
+  if not regions:
+    return False
+  total = None
+  for region in regions:
+    if region.get("mask"):
+      mask = mask_file_mask(region, height, width, (height * 8, width * 8))
+    else:
+      mask = box_mask(region, height, width)
+    total = mask if total is None else total + mask
+  return bool(np.all(total >= 1.0 - eps))
+
+
 def box_mask(region: dict, height: int, width: int):
   """Return normalized box-mask at latent grid resolution (5-D broadcast shape)."""
   import numpy as np
