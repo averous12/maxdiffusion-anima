@@ -114,9 +114,27 @@ def test_preview_warns_on_missing_common():
     check("warns when common empty", "Common prompt is empty" in html)
 
 
-def test_preview_from_widgets_flattens():
-    out = rui.preview_from_widgets(*(slot(True, "1girl", w=1.0) + ["mp, bq", "low"]))
-    check("gradio entry point", "Coverage complete" in out, out[:80])
+def test_preview_follows_aspect_ratio():
+    """The canvas must match the generated shape, not always be square."""
+    ss = slot(True, "1girl", w=1.0)
+    square = rui.preview_html(ss, "mp", "low", 1024, 1024)
+    wide = rui.preview_html(ss, "mp", "low", 1344, 768)
+    tall = rui.preview_html(ss, "mp", "low", 768, 1344)
+    check("square is 200x200", "width:200px;height:200px" in square)
+    check("wide is 200x114", "width:200px;height:114px" in wide, wide[wide.find("width:"):][:40])
+    check("tall is 114x200", "width:114px;height:200px" in tall, tall[tall.find("width:"):][:40])
+    check("size printed", "1344×768" in wide)
+    check("long side is always 200",
+          "width:200px" in wide and "height:200px" in tall)
+
+
+def test_preview_coverage_is_aspect_aware():
+    """A half-canvas box is 50% uncovered in any aspect."""
+    half = slot(True, "1girl", w=0.5, h=1.0)
+    for w_px, h_px in ((1024, 1024), (1536, 640), (640, 1536)):
+        html = rui.preview_html(half, "mp", "low", w_px, h_px)
+        check(f"50% gap at {w_px}x{h_px}", "50% of the canvas is uncovered" in html,
+              html[:120])
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ one it spawned.
 """
 import argparse
 import os
+import re
 import sys
 
 CHROME = r"C:/Program Files/imput/Helium/Application/chrome.exe"
@@ -105,7 +106,43 @@ def main():
         page.get_by_role("button", name="Refresh preview").click()
         page.wait_for_timeout(1500)
 
-        # ---- help tab ---------------------------------------------------------
+        # ---- preview follows the selected aspect ------------------------------
+        def canvas_size():
+            # Measure the real rendered box of the regional canvas. Matching on raw
+            # HTML picks up the main panel's resolution preview instead.
+            box = page.locator("#regional-canvas").first.bounding_box()
+            return (round(box["width"]), round(box["height"])) if box else (0, 0)
+
+        def set_aspect(aw, ah):
+            page.get_by_role("tab", name="Settings", exact=True).click()
+            page.wait_for_timeout(700)
+            for label, val in (("Aspect W", aw), ("Aspect H", ah)):
+                box = page.get_by_label(label, exact=True).first
+                box.fill(str(val))
+                box.blur()
+            page.wait_for_timeout(2500)   # change handlers redraw the preview
+            page.get_by_role("tab", name="Regional", exact=True).click()
+            page.wait_for_timeout(900)
+
+        w0, h0 = canvas_size()
+        check("default preview is square", w0 == h0 and w0 > 0, f"{w0}x{h0}")
+
+        set_aspect(16, 9)
+        w1, h1 = canvas_size()
+        check("16:9 makes the canvas wide", w1 > h1 > 0, f"{w1}x{h1}")
+        check("16:9 keeps the long side at 200", w1 == 200, f"{w1}")
+        check("16:9 ratio is close to 1.78",
+              abs((w1 / max(1, h1)) - 16 / 9) < 0.06, f"{w1 / max(1, h1):.2f}")
+        page.screenshot(path=os.path.join(args.out, "02b_landscape.png"), full_page=True)
+
+        set_aspect(9, 16)
+        w2, h2 = canvas_size()
+        check("9:16 makes the canvas tall", h2 > w2 > 0, f"{w2}x{h2}")
+        check("9:16 keeps the long side at 200", h2 == 200, f"{h2}")
+        page.screenshot(path=os.path.join(args.out, "02c_portrait.png"), full_page=True)
+
+        set_aspect(1, 1)
+
         page.get_by_role("tab", name="Help", exact=True).click()
         page.wait_for_timeout(1200)
         body = page.content()

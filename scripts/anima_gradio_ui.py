@@ -1706,9 +1706,28 @@ def build():
                     lines=1, label="Common negative — prepended to every checked box")
                 _regional_slots = regional_ui.build_slots(4)
                 _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
+
+                def _regional_preview(*values):
+                    """Region widgets, then common pos/neg, then the aspect + size controls.
+
+                    The canvas is drawn at the size that will actually be generated, so a
+                    16:9 request shows a wide preview instead of a square one.
+                    """
+                    vals = list(values)
+                    region_vals = vals[:-7]
+                    common_pos, common_neg, a_w, a_h, mp, w_px, h_px = vals[-7:]
+                    try:
+                        cw, ch = resolve_size(a_w, a_h, mp, w_px, h_px)
+                    except Exception:
+                        cw, ch = 1024, 1024
+                    return regional_ui.preview_html(region_vals, common_pos, common_neg, cw, ch)
+
+                _preview_src = [aspect_w, aspect_h, mp_target, width, height]
                 regional_preview = gr.HTML(regional_ui.preview_html(
                     [comp.value for comp in _regional_inputs],
-                    regional_common_pos.value, regional_common_neg.value))
+                    regional_common_pos.value, regional_common_neg.value,
+                    *resolve_size(aspect_w.value, aspect_h.value, mp_target.value,
+                                  width.value, height.value)))
                 regional_preview_btn = gr.Button("Refresh preview", size="sm")
                 regional_json = gr.Textbox(
                     value="", lines=4, label="Advanced: raw regional JSON (overrides the editor)",
@@ -1799,9 +1818,14 @@ def build():
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         regional_preview_btn.click(
-            regional_ui.preview_from_widgets,
-            inputs=_regional_inputs + [regional_common_pos, regional_common_neg],
+            _regional_preview,
+            inputs=_regional_inputs + [regional_common_pos, regional_common_neg] + _preview_src,
             outputs=[regional_preview], show_progress="hidden")
+        # Changing the shape should re-draw the canvas without a manual refresh.
+        for _src in (aspect_w, aspect_h, mp_target):
+            _src.change(_regional_preview,
+                        inputs=_regional_inputs + [regional_common_pos, regional_common_neg] + _preview_src,
+                        outputs=[regional_preview], show_progress="hidden")
         # Progress is POLLED, not streamed. The tunnel in front of this app
         # buffers the SSE stream, so streamed updates all arrive at once when the
         # run is already over (measured: 0 events during a 21.5 s run, 32 at the
