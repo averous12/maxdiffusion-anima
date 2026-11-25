@@ -166,11 +166,23 @@ SNAP_PATH = os.path.join(CROOT, "anima_snap.png")
 # The client creates this file to cancel the running generation.
 INTERRUPT_PATH = os.path.join(CROOT, "anima_interrupt")
 
+def _json_public(value):
+    """Drop private runtime handles before writing request/progress JSON."""
+    if isinstance(value, dict):
+        return {k: _json_public(v) for k, v in value.items()
+                if not str(k).startswith("_")}
+    if isinstance(value, (list, tuple)):
+        return [_json_public(v) for v in value]
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    return value
+
+
 def write_prog(**kw):
     try:
         tmp = PROG_PATH + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"t": time.time(), "rss_gb": round(rss_gb(), 2), **kw}, f)
+            json.dump(_json_public({"t": time.time(), "rss_gb": round(rss_gb(), 2), **kw}), f)
         os.replace(tmp, PROG_PATH)
     except Exception:
         pass
