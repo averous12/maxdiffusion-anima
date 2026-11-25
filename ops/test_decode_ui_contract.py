@@ -96,6 +96,18 @@ def test_pixel_request_sets_decode():
   print("pixel request: decode=pixel, head=base.safetensors")
 
 
+def test_generate_event_wires_reference_budget_slider():
+  demo = ui.build()
+  config = demo.config
+  budget_ids = {c["id"] for c in config["components"]
+                if c.get("props", {}).get("label") == "Reference pixel budget (MP, combined)"}
+  generate = next(d for d in config["dependencies"] if d.get("api_name") == "start_gen")
+  assert len(budget_ids) == 1, budget_ids
+  budget_id = next(iter(budget_ids))
+  assert budget_id in generate["inputs"], (budget_id, generate["inputs"])
+  print(f"Generate event wires reference budget component {budget_id}")
+
+
 def test_reference_budget_is_per_request():
   """The combined separate-reference budget must travel in the request, not the env."""
   png = os.path.join(CONTENT, "ref.png")
