@@ -1279,11 +1279,11 @@ while True:
     if gen_id and gen_id == last_gen_id:
         # Already ran this exact request (a duplicate write or a re-touched file).
         log(f"ignoring request gen_id {gen_id}: already handled")
-        json.dump({**d, "go": False, "status": "duplicate"}, open(REQ_PATH, "w"))
+        json.dump(_json_public({**d, "go": False, "status": "duplicate"}), open(REQ_PATH, "w"))
         last_mtime = os.path.getmtime(REQ_PATH)
         continue
     last_gen_id = gen_id
-    json.dump({**d, "go": False, "status": "running"}, open(REQ_PATH, "w"))
+    json.dump(_json_public({**d, "go": False, "status": "running"}), open(REQ_PATH, "w"))
 
     # --- hot LoRA swap: same process, no restart, no recompile -----------------
     # transformer_forward takes the params as a jitted argument, so replacing the
@@ -1307,7 +1307,7 @@ while True:
             log("LoRA swap failed:\n" + traceback.format_exc())
             write_prog(stage="error", step=0, gen_id=gen_id,
                        error="lora swap failed")
-            json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
+            json.dump(_json_public({**d, "go": False, "status": "error"}), open(REQ_PATH, "w"))
         last_mtime = os.path.getmtime(REQ_PATH)
         continue
     # Reset before the FIRST record of this request, so a client polling "starting" can
@@ -1663,7 +1663,7 @@ while True:
             # Skip the VAE decode entirely: the run was cancelled, so producing
             # (and writing) an image would be misleading.
             clear_snapref_runtime()
-            json.dump({**d, "go": False, "status": "interrupted"}, open(REQ_PATH, "w"))
+            json.dump(_json_public({**d, "go": False, "status": "interrupted"}), open(REQ_PATH, "w"))
             last_mtime = os.path.getmtime(REQ_PATH)
             continue
         denoise_s = time.perf_counter() - d0 - prev_total
@@ -1700,7 +1700,7 @@ while True:
                    elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
                    decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(),
                    decode_kind=decode_kind, **common, **_pv_state())
-        json.dump({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)},
+        json.dump(_json_public({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}),
                   open(REQ_PATH, "w"))
         clear_snapref_runtime()
     except Exception as _err:
@@ -1711,7 +1711,7 @@ while True:
         write_prog(stage="error", gen_id=gen_id, error=f"{type(_err).__name__}: {str(_err)[:300]}",
                    **_pv_state())
         try:
-            json.dump({**d, "go": False, "status": "error"}, open(REQ_PATH, "w"))
+            json.dump(_json_public({**d, "go": False, "status": "error"}), open(REQ_PATH, "w"))
         except Exception:
             pass
     last_mtime = os.path.getmtime(REQ_PATH)
