@@ -1509,26 +1509,32 @@ def build():
                     snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
                                                 label="Reference pixel budget (MP, combined)",
                                                 info="Separate references share this. 3.0 = a full megapixel each.")
-                    regional_common_pos = gr.Textbox(
-                        value="masterpiece, best quality, amazing quality, very aesthetic, "
-                              "absurdres, highres, extremely detailed, intricate details, "
-                              "year 2025, newest, safe",
-                        lines=2, label="Common prompt — prepended to every checked box",
-                        info="Quality preamble and @artist tags belong here, once.")
-                    regional_common_neg = gr.Textbox(
-                        value="worst quality, low quality, blurry, bad anatomy",
-                        lines=1, label="Common negative — prepended to every checked box")
-                    _regional_slots = regional_ui.build_slots(4)
-                    _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
-                    with gr.Row():
-                        regional_preview = gr.HTML(regional_ui.preview_html(
-                            [comp.value for comp in _regional_inputs],
-                            regional_common_pos.value, regional_common_neg.value))
-                    regional_preview_btn = gr.Button("Refresh preview", size="sm")
-                    regional_json = gr.Textbox(
-                        value="", lines=4, label="Advanced: raw regional JSON (overrides the editor)",
-                        placeholder='{"common":{"prompt":"..."},"stages":[...]}',
-                        info="Filled in, this replaces the editor boxes for that request.")
+
+            with gr.Tab("Regional"):
+                gr.Markdown(
+                    "Assign a prompt to a box, and optionally give each box its own "
+                    "reference. The **common** block is prepended to every checked box, so "
+                    "the quality preamble and `@artist` tags are written once instead of "
+                    "repeated per box.")
+                regional_common_pos = gr.Textbox(
+                    value="masterpiece, best quality, amazing quality, very aesthetic, "
+                          "absurdres, highres, extremely detailed, intricate details, "
+                          "year 2025, newest, safe",
+                    lines=2, label="Common prompt — prepended to every checked box",
+                    info="Quality preamble and @artist tags belong here, once.")
+                regional_common_neg = gr.Textbox(
+                    value="worst quality, low quality, blurry, bad anatomy",
+                    lines=1, label="Common negative — prepended to every checked box")
+                _regional_slots = regional_ui.build_slots(4)
+                _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
+                regional_preview = gr.HTML(regional_ui.preview_html(
+                    [comp.value for comp in _regional_inputs],
+                    regional_common_pos.value, regional_common_neg.value))
+                regional_preview_btn = gr.Button("Refresh preview", size="sm")
+                regional_json = gr.Textbox(
+                    value="", lines=4, label="Advanced: raw regional JSON (overrides the editor)",
+                    placeholder='{"common":{"prompt":"..."},"stages":[...]}',
+                    info="Filled in, this replaces the editor boxes for that request.")
 
             with gr.Tab("Help"):
                 gr.Markdown(
