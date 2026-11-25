@@ -1230,16 +1230,46 @@ try:
     gc.collect()
     log(f"warmup: transformer forward compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
     t0 = time.perf_counter()
-    # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
-    # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
-    # the latent dtype, so a bf16 warmup compiles an executable the server never
-    # calls -- the first real preview then recompiled the VAE (~50s, matching this
-    # warmup's own compile time).
-    _wz = jnp.zeros((1, 16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)
-    _wv = decode_latents(_wz)
-    log(f"warmup: VAE decode compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
-    _vae_compiled.add((_WPX, _WPX))
-    del _wz, _wv
+    # Warm the decoder the default path will actually call. Pixel decode is the default, and
+    # the VAE compile is the single most expensive part of boot (~52s at 1024px), so
+    # compiling the VAE when every request decodes with the pixel head was a fixed boot tax
+    # for an executable nobody runs. The VAE still compiles on first use for anyone who
+    # selects it (or when no pixel head is installed), which is the pre-existing behaviour.
+    if DECODE_MODE == "pixel":
+        _ph_name = os.environ.get("ANIMA_PIXEL_HEAD", "") or ""
+        _warmed = False
+        if _ph_name:
+            try:
+                _fn, _pp, _pinfo = get_pixel_head(_ph_name)
+                # Same shapes the real path uses (see pixel_decode_images): patchified
+                # latent tokens, not the raw (16, h, w) latent, and feats on the token grid.
+                _gh = (_WPX // 8) // 2
+                _wlat = anima_pixel_head.lat_patches(_lat[0, :, 0])
+                _wfeats = jnp.zeros((_gh, _gh, _pinfo["d_feat"]), dtype=jnp.float32)
+                _wimg = _fn(_pp, _wfeats, _wlat)
+                _wimg = jnp.clip(_wimg * 0.5 + 0.5, 0.0, 1.0)
+                _warr = np.asarray(jnp.transpose(_wimg, (1, 2, 0)))
+                _vae_compiled.add((_WPX, _WPX))
+                _warmed = True
+                log(f"warmup: pixel decode compiled+ran at {_WPX}px in "
+                    f"{time.perf_counter()-t0:.1f}s; out {_warr.shape}; {hbm_stats()}")
+                del _wlat, _wfeats, _wimg, _warr
+            except Exception as _we:
+                log(f"warmup: pixel head warmup skipped ({type(_we).__name__}: {_we}); "
+                    f"the first request will compile it")
+        if not _warmed:
+            log("warmup: no pixel head warmed; first decode will compile its own executable")
+    else:
+        # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
+        # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
+        # the latent dtype, so a bf16 warmup compiles an executable the server never
+        # calls -- the first real preview then recompiled the VAE (~50s, matching this
+        # warmup's own compile time).
+        _wz = jnp.zeros((1, 16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)
+        _wv = decode_latents(_wz)
+        log(f"warmup: VAE decode compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
+        _vae_compiled.add((_WPX, _WPX))
+        del _wz, _wv
     gc.collect()
     log(f"warmup done; executables compiled; host RSS {rss_gb():.2f} GB")
 except Exception:
