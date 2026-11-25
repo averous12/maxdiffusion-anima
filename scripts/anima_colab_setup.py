@@ -17,6 +17,11 @@ env = {**os.environ, "PATH": f"{VENV}/bin:/usr/local/bin:" + os.environ["PATH"],
        "PYTHONUNBUFFERED": "1", "MPLBACKEND": "agg"}
 env.pop("UV_SYSTEM_PYTHON", None)
 env.pop("ENABLE_PJRT_COMPATIBILITY", None)
+# The base image exports TPU_LIBRARY_PATH pointing at its own libtpu, which is built
+# against a newer PJRT API than this venv's jax. Left set, the TPU plugin refuses to
+# execute ("Unexpected PJRT_ExecuteOptions size: expected 112, got 88") while every
+# import still succeeds. The venv's own libtpu must win.
+env.pop("TPU_LIBRARY_PATH", None)
 
 if not PY.exists():
     subprocess.run(["uv", "venv", "--python", "3.12", str(VENV), "--seed"], check=True)
