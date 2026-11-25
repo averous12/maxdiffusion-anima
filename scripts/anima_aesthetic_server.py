@@ -1484,8 +1484,8 @@ while True:
         common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id,
                       batch_total=BATCH, prompt_states=prompt_states,
                       prompt_switches=prompt_switches, **_lora_note)
-        if snap_info:
-            common["snapref"] = snap_info
+        public_info = {k: v for k, v in snap_info.items() if not str(k).startswith("_")}
+        common["snapref"] = public_info
         if (BATCH, H, W) not in _tf_compiled:
             log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
             write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
