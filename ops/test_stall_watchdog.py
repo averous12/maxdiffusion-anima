@@ -37,6 +37,7 @@ def _load_watchdog():
   exits, dumps, logs = [], [], []
   g = {
       "time": time, "_HEARTBEAT": {"t": time.time()}, "_RUN_ACTIVE": {"on": False},
+      "_ARMED": {"on": True},
       "STALL_IDLE_S": 0.0, "log": lambda m: logs.append(m),
       "os": type("O", (), {"_exit": staticmethod(lambda c: exits.append(c))}),
       "faulthandler": type("F", (), {"dump_traceback": staticmethod(lambda: dumps.append(1))}),
@@ -71,17 +72,32 @@ def test_watchdog_stays_quiet_during_a_run():
   print("long run in flight -> no exit")
 
 
+def test_watchdog_ignores_the_boot_phase():
+  # Regression: a live boot (params + VAE merge + warmup) takes minutes and never touches
+  # the main loop, so an armed-immediately watchdog killed the server mid-boot.
+  g, src, exits, dumps, logs = _load_watchdog()
+  g["_ARMED"]["on"] = False
+  g["_HEARTBEAT"]["t"] = time.time() - 600
+  g["STALL_IDLE_S"] = 0.01
+  th = __import__("threading").Thread(target=g["_stall_watchdog"], daemon=True)
+  th.start()
+  th.join(timeout=13)
+  assert exits == [], f"watchdog fired before the loop was armed: exits={exits}"
+  print("boot phase -> not armed, no exit")
+
+
 def test_watchdog_source_has_both_guards():
   _, src, _, _, _ = _load_watchdog()
   assert 'not _RUN_ACTIVE["on"]' in src, src
+  assert 'not _ARMED["on"]' in src, src
   assert "os._exit(1)" in src, src
   assert "dump_traceback" in src, src
-  print("source keeps the run-guard, the dump and the non-zero exit")
+  print("source keeps the arming guard, the run-guard, the dump and the non-zero exit")
 
 
 if __name__ == "__main__":
   tests = [test_watchdog_exits_when_idle_stalled, test_watchdog_stays_quiet_during_a_run,
-           test_watchdog_source_has_both_guards]
+           test_watchdog_ignores_the_boot_phase, test_watchdog_source_has_both_guards]
   failed = 0
   for t in tests:
     try:

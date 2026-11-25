@@ -1276,12 +1276,18 @@ last_gen_id = ""          # id of the last request we actually ran
 # supervisor restarts a healthy process instead of leaving a zombie on the device.
 _HEARTBEAT = {"t": time.time()}
 _RUN_ACTIVE = {"on": False}
+# Booting the model (transformer params, VAE merge, warmup) legitimately takes minutes
+# and does not touch the main loop, so the watchdog must not be armed until the loop is
+# actually watching for requests. Without this the watchdog kills the server mid-boot.
+_ARMED = {"on": False}
 STALL_IDLE_S = float(os.environ.get("ANIMA_STALL_IDLE_S", "180") or 180)
 
 
 def _stall_watchdog():
     while True:
         time.sleep(10.0)
+        if not _ARMED["on"]:
+            continue
         idle = time.time() - _HEARTBEAT["t"]
         if not _RUN_ACTIVE["on"] and idle > STALL_IDLE_S:
             log(f"WATCHDOG: main loop stalled for {idle:.0f}s with no run in flight; "
@@ -1299,6 +1305,10 @@ try:
 except Exception as _e:
     log(f"stall watchdog unavailable ({type(_e).__name__}: {_e})")
 
+# Boot is finished and the loop is about to watch for requests: only now can a quiet
+# main loop be called a stall.
+_ARMED["on"] = True
+_HEARTBEAT["t"] = time.time()
 while True:
     _HEARTBEAT["t"] = time.time()
     try:
