@@ -22,6 +22,8 @@ import uuid
 import warnings
 from collections import OrderedDict
 
+import anima_regional_ui as regional_ui
+
 # Gradio wraps every queued call in MatplotlibBackendMananger(), which imports
 # matplotlib. Under Colab the kernel exports
 # MPLBACKEND=module://matplotlib_inline.backend_inline, which matplotlib rejects
@@ -1061,7 +1063,8 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_strength=0.0, snapref_fidelity=1.0,
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
               snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None,
-              regional_json=""):
+              regional_json="", regional_common_pos="", regional_common_neg="",
+              *regional_values):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1098,14 +1101,33 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
     if isinstance(snap_cfg, str):
         return (snap_cfg, _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
     if regional_json and str(regional_json).strip():
+        # Explicit JSON wins: it is the escape hatch for schedules the editor cannot
+        # express (per-region masks, explicit stage ids, negative prompts on stages).
         try:
             regional = json.loads(regional_json)
-            if not isinstance(regional, list):
-                raise ValueError("regional JSON must be a list")
-            req["regional"] = regional
+            if not isinstance(regional, (list, dict)):
+                raise ValueError("regional JSON must be a list or a stages object")
+            if isinstance(regional, list):
+                req["regional"] = regional
+            else:
+                req["regional"] = regional.get("stages", regional)
+                if isinstance(regional.get("common"), dict):
+                    req["common"] = regional["common"]
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return (f"regional JSON invalid: {exc}", _upd(), progress_bar_html(0, "idle"),
                     _upd(), _upd(), _upd())
+    elif regional_values:
+        try:
+            regions = regional_ui.assemble(list(regional_values))
+        except Exception as exc:
+            return (f"region editor invalid: {exc}", _upd(), progress_bar_html(0, "idle"),
+                    _upd(), _upd(), _upd())
+        if regions:
+            req["regional"] = regions
+    if (regional_common_pos or "").strip() or (regional_common_neg or "").strip():
+        req.setdefault("common", {})
+        req["common"] = {"prompt": (regional_common_pos or "").strip(),
+                         "negative_prompt": (regional_common_neg or "").strip()}
     if snap_cfg is not None:
         req["snapref"] = snap_cfg
     else:
@@ -1487,9 +1509,26 @@ def build():
                     snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
                                                 label="Reference pixel budget (MP, combined)",
                                                 info="Separate references share this. 3.0 = a full megapixel each.")
-                    regional_json = gr.Textbox(value="", lines=5, label="Scheduled regional prompts (JSON, optional)",
-                                               placeholder='[{"prompt":"red-haired woman","box":[0,0,0.5,1],"start":0,"end":1,"ref_images_b64":[]}]',
-                                               info="Each region may include box, start/end, feather, prompt, and its own snapref.")
+                    regional_common_pos = gr.Textbox(
+                        value="masterpiece, best quality, amazing quality, very aesthetic, "
+                              "absurdres, highres, extremely detailed, intricate details, "
+                              "year 2025, newest, safe",
+                        lines=2, label="Common prompt — prepended to every checked box",
+                        info="Quality preamble and @artist tags belong here, once.")
+                    regional_common_neg = gr.Textbox(
+                        value="worst quality, low quality, blurry, bad anatomy",
+                        lines=1, label="Common negative — prepended to every checked box")
+                    _regional_slots = regional_ui.build_slots(4)
+                    _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
+                    with gr.Row():
+                        regional_preview = gr.HTML(regional_ui.preview_html(
+                            [comp.value for comp in _regional_inputs],
+                            regional_common_pos.value, regional_common_neg.value))
+                    regional_preview_btn = gr.Button("Refresh preview", size="sm")
+                    regional_json = gr.Textbox(
+                        value="", lines=4, label="Advanced: raw regional JSON (overrides the editor)",
+                        placeholder='{"common":{"prompt":"..."},"stages":[...]}',
+                        info="Filled in, this replaces the editor boxes for that request.")
 
             with gr.Tab("Help"):
                 gr.Markdown(
@@ -1558,9 +1597,14 @@ def build():
                           snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
                           snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
                           snapref_rg_on, snapref_rg, snapref_caption,
-                          decode_mode, pixel_head_pick, snapref_budget, regional_json],
+                          decode_mode, pixel_head_pick, snapref_budget, regional_json,
+                          regional_common_pos, regional_common_neg, *_regional_inputs],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
+        regional_preview_btn.click(
+            regional_ui.preview_from_widgets,
+            inputs=_regional_inputs + [regional_common_pos, regional_common_neg],
+            outputs=[regional_preview], show_progress="hidden")
         # Progress is POLLED, not streamed. The tunnel in front of this app
         # buffers the SSE stream, so streamed updates all arrive at once when the
         # run is already over (measured: 0 events during a 21.5 s run, 32 at the
