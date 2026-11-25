@@ -726,7 +726,8 @@ SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
 _SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
 _SNAPREF_ACTIVE_ADAPTER = None
 _SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
-_SNAPREF_HOST_CACHE = {}         # one host-side prepared reference result; never TPU-resident
+_SNAPREF_HOST_CACHE = {}         # key -> host-side prepared result; never TPU-resident
+_SNAPREF_HOST_CACHE_MAX = max(1, int(os.environ.get("ANIMA_SNAPREF_HOST_CACHE_MAX", "8")))
 
 
 def _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout):
@@ -914,6 +915,8 @@ def prepare_snapref(cfg, target_hw):
     cache_key = _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout)
     cached = _SNAPREF_HOST_CACHE.get(cache_key)
     if cached is not None:
+        # LRU touch without retaining any device arrays.
+        _SNAPREF_HOST_CACHE[cache_key] = _SNAPREF_HOST_CACHE.pop(cache_key)
         host_kv, size_list, effective_weights, ref_pixels = cached
         cache = (jnp.asarray(host_kv[0]), jnp.asarray(host_kv[1]))
         _SNAPREF_STATE["kv"] = cache
@@ -970,12 +973,15 @@ def prepare_snapref(cfg, target_hw):
                                     (target_hw[0] // 16) * (target_hw[1] // 16))
     _SNAPREF_STATE["kv"] = cache
     cfg["_kv"] = cache
-    _SNAPREF_HOST_CACHE.clear()
+    # Keep all prepared banks on host RAM, bounded by LRU count. Do not retain the
+    # device `cache` tuple after this request; the caller owns the active copy.
     _SNAPREF_HOST_CACHE[cache_key] = (
         (np.asarray(cache[0]), np.asarray(cache[1])),
         list(size_list), list(effective_weights),
         [_load_reference_pixels(p, megapixels, canvas_size)[1] if canvas_size is not None else
          _load_reference_pixels(p, megapixels)[1] for p in refs][:len(records)])
+    while len(_SNAPREF_HOST_CACHE) > _SNAPREF_HOST_CACHE_MAX:
+        _SNAPREF_HOST_CACHE.pop(next(iter(_SNAPREF_HOST_CACHE)))
     secs = time.perf_counter() - t0
     log(f"SnapRef reference cached: {len(records)} image(s), {sum(size_list)} tokens, "
         f"{secs:.2f}s, mode {mode}, strength {cfg.get('strength', 0.0)}")
@@ -989,9 +995,9 @@ def prepare_snapref(cfg, target_hw):
             ][:len(records)]}
 
 def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative=""):
-    """Prepare scheduled regional conditioning and one independent SnapRef bank per region."""
+    """Prepare regional text; SnapRef K/V is deliberately lazy per active interval."""
     prepared = []
-    for index, raw in enumerate(anima_regional.normalize_regions(regions)):
+    for index, raw in enumerate(anima_regional.normalize_schedule(regions, maximum=16)):
         if not raw["negative_prompt"]:
             raw = dict(raw, negative_prompt=default_negative)
         pos, neg = encode_texts(raw["prompt"], raw["negative_prompt"], steps=steps,
@@ -1003,9 +1009,6 @@ def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negat
             snap = dict(snap, adapter=snap["ref_adapter"])
             item["snapref"] = snap
         if snap and snap.get("enabled", True) and snap.get("images"):
-            info = prepare_snapref(snap, target_hw)
-            snap["_sizes"], snap["_weights"] = info["sizes"], info["weights"]
-            item["snapinfo"] = info
             item["snapcfg"] = snap
         prepared.append(item)
     return prepared
@@ -1455,19 +1458,19 @@ while True:
                              ref_guidance=float(_snap.get("ref_guidance", 4.5)))
         else:
             _SNAPREF_STATE["kv"] = None
-        regional_specs = d.get("regional") or []
+        regional_specs = d.get("regional") or d.get("regions") or []
         regional_info = []
+        regional_schedule = anima_regional.normalize_schedule(regional_specs, maximum=16) if regional_specs else []
+        regional_active_key = None
+        regional_active = {}
         if regional_specs:
-            write_prog(stage="regional", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                       gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts/references")
+            write_prog(stage="regional-text", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts")
             regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags, int(SEED), _n)
             for _r in regional_info:
                 if BATCH > 1:
                     _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]
                     _r["neg_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["neg_ctxs"]]
-        # Regional preparation uses cfg-local K/V handles; never leave the last region in
-        # the process-global slot used by the plain/global SnapRef path.
-        _SNAPREF_STATE["kv"] = _snap.get("_kv") if _snap.get("_kv") is not None else None
         # (B,512,1024), pad (B,1,H,W). The padding mask is concatenated channel-wise inside the
         # transformer, so its batch dim must equal the latents' batch dim.
         latents = jnp.asarray(np.concatenate(
@@ -1534,17 +1537,52 @@ while True:
             else:
                 pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                       context, neg_context, pad, GUIDANCE)
-            if regional_info:
+            if regional_specs:
+                _active_key = anima_regional.active_indices(regional_schedule, i, STEPS)
+                if _active_key != regional_active_key:
+                    _new_set = set(_active_key)
+                    _old_set = set(regional_active_key or ())
+                    _leaving = _old_set - _new_set
+                    _entering = _new_set - _old_set
+                    # Release only regions that just ended. Banks that remain active
+                    # across a transition keep their K/V and are not re-encoded.
+                    for _ri in _leaving:
+                        _old = regional_info[_ri]
+                        _old_snap = _old.get("snapcfg") or {}
+                        _old_snap.pop("_kv", None)
+                        _old_snap.pop("_sizes", None)
+                        _old_snap.pop("_weights", None)
+                        regional_active.pop(_ri, None)
+                    if _leaving:
+                        _SNAPREF_STATE["kv"] = None
+                        gc.collect()
+                    for _ri in sorted(_entering):
+                        _entry = regional_info[_ri]
+                        _snapcfg = _entry.get("snapcfg")
+                        if _snapcfg and _snapcfg.get("images"):
+                            _info = prepare_snapref(_snapcfg, (H, W))
+                            _snapcfg["_sizes"] = _info["sizes"]
+                            _snapcfg["_weights"] = _info["weights"]
+                        regional_active[_ri] = _entry
+                    regional_active_key = _active_key
+                    if _active_key:
+                        _tokens = sum(sum(x.get("snapcfg", {}).get("_sizes", []))
+                                      for x in regional_active.values())
+                        log(f"regional active at step {i+1}: regions {_active_key}; "
+                            f"{_tokens} ref tokens ({len(_entering)} entered, {len(_leaving)} released)")
+                _SNAPREF_STATE["kv"] = _snap.get("_kv")
+            if regional_active:
                 _reg_t = jnp.asarray(np.float32(timesteps[i]))
-                _reg_pred = pred.astype(jnp.float32)
+                _reg_delta = jnp.zeros_like(pred, dtype=jnp.float32)
                 _reg_mass = jnp.zeros((1, 1, 1, H // 8, W // 8), dtype=jnp.float32)
-                _reg_delta = jnp.zeros_like(_reg_pred)
-                for _region in regional_info:
+                for _ri, _region in regional_active.items():
                     _region["_step"] = i
-                    if not anima_regional.active(_region, i, STEPS):
-                        continue
-                    _mask = jnp.asarray(anima_regional.box_mask(
-                        _region, H // 8, W // 8), dtype=jnp.float32)
+                    _mask_np = (anima_regional.mask_file_mask(_region, H // 8, W // 8, (H, W))
+                               if _region.get("mask") else
+                               anima_regional.box_mask(_region, H // 8, W // 8))
+                    _mask = jnp.asarray(_mask_np, dtype=jnp.float32)
+                    # With a base global SnapRef plus regional references, each region's cfg
+                    # uses its own cache. No reference state is retained after stage changes.
                     _branch = regional_prediction(latents, _reg_t, pad, GUIDANCE, _region).astype(jnp.float32)
                     _reg_delta = _reg_delta + _mask * (_branch - pred.astype(jnp.float32))
                     _reg_mass = _reg_mass + _mask
