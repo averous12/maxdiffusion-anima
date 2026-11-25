@@ -1243,7 +1243,7 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
               snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None,
               regional_json="", regional_common_pos="", regional_common_neg="",
-              *regional_values):
+              regional_end=0.35, *regional_values):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1307,6 +1307,13 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         req.setdefault("common", {})
         req["common"] = {"prompt": (regional_common_pos or "").strip(),
                          "negative_prompt": (regional_common_neg or "").strip()}
+    if "regional" in req:
+        # Measured: cutting the window to 0.35 is faster AND avoids the two halves
+        # fighting into a single split figure. Never silently drop it.
+        try:
+            req["regional_end"] = min(1.0, max(0.0, float(regional_end)))
+        except (TypeError, ValueError):
+            req["regional_end"] = 1.0
     if snap_cfg is not None:
         req["snapref"] = snap_cfg
     else:
@@ -1704,6 +1711,11 @@ def build():
                 regional_common_neg = gr.Textbox(
                     value="worst quality, low quality, blurry, bad anatomy",
                     lines=1, label="Common negative — prepended to every checked box")
+                regional_end = gr.Slider(
+                    0.10, 1.00, value=0.35, step=0.05,
+                    label="Regional routing window",
+                    info="Share of steps that use the boxes. Composition settles early: "
+                         "0.35 is faster and stops the boxes fighting into one split figure.")
                 _regional_slots = regional_ui.build_slots(4)
                 _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
 
@@ -1814,7 +1826,8 @@ def build():
                           snapref_weights, snapref_strength, snapref_fidelity, snapref_in_uncond,
                           snapref_rg_on, snapref_rg, snapref_caption,
                           decode_mode, pixel_head_pick, snapref_budget, regional_json,
-                          regional_common_pos, regional_common_neg, *_regional_inputs],
+                          regional_common_pos, regional_common_neg, regional_end,
+                          *_regional_inputs],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
         regional_preview_btn.click(

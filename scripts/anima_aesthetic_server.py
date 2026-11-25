@@ -21,6 +21,7 @@ print("server interpreter:", py, flush=True)
 
 code = r'''
 import os
+import threading
 import time
 import hashlib
 
@@ -68,6 +69,13 @@ import faulthandler
 # Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
 # It dumps the live stack of every thread once, which is what localizes a stall.
 faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
+# A dump on SIGUSR1 lets a stall be inspected without killing the process:
+#   kill -USR1 <pid>   -> every thread's stack goes to the log.
+try:
+    import signal as _signal
+    faulthandler.register(_signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
 import jax
 jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
 
@@ -1259,7 +1267,40 @@ if not os.path.exists(REQ_PATH):
 
 last_mtime = 0.0
 last_gen_id = ""          # id of the last request we actually ran
+
+# --- stall watchdog -----------------------------------------------------------------
+# Observed failure mode: the process stays alive and keeps the TPU, but stops picking
+# up new requests, with nothing in the log. A file mtime cannot be trusted to reappear,
+# so treat "main loop has not iterated for STALL_IDLE_S while no run is in flight" as a
+# stall: dump every thread's stack (so the cause is on record) and exit non-zero so the
+# supervisor restarts a healthy process instead of leaving a zombie on the device.
+_HEARTBEAT = {"t": time.time()}
+_RUN_ACTIVE = {"on": False}
+STALL_IDLE_S = float(os.environ.get("ANIMA_STALL_IDLE_S", "180") or 180)
+
+
+def _stall_watchdog():
+    while True:
+        time.sleep(10.0)
+        idle = time.time() - _HEARTBEAT["t"]
+        if not _RUN_ACTIVE["on"] and idle > STALL_IDLE_S:
+            log(f"WATCHDOG: main loop stalled for {idle:.0f}s with no run in flight; "
+                f"dumping thread stacks and exiting for a clean restart")
+            try:
+                faulthandler.dump_traceback()
+            except Exception:
+                pass
+            os._exit(1)
+
+
+try:
+    _t = threading.Thread(target=_stall_watchdog, name="stall-watchdog", daemon=True)
+    _t.start()
+except Exception as _e:
+    log(f"stall watchdog unavailable ({type(_e).__name__}: {_e})")
+
 while True:
+    _HEARTBEAT["t"] = time.time()
     try:
         mt = os.path.getmtime(REQ_PATH)
     except FileNotFoundError:
@@ -1336,6 +1377,8 @@ while True:
     write_prog(stage="starting", step=0, steps=d.get("steps", 30), gen_id=gen_id,
                **_pv_state())
     last_mtime = os.path.getmtime(REQ_PATH)
+    # Tell the stall watchdog a run is in flight: a long denoise step is not a stall.
+    _RUN_ACTIVE["on"] = True
     try:
         # One prompt, one negative, N images. Older clients sent lists: use the first entry.
         _p = d.get("prompt", "")
@@ -1753,6 +1796,9 @@ while True:
             json.dump(_json_public({**d, "go": False, "status": "error"}), open(REQ_PATH, "w"))
         except Exception:
             pass
+    finally:
+        # Cleared on every exit path, including the interrupted `continue`.
+        _RUN_ACTIVE["on"] = False
     last_mtime = os.path.getmtime(REQ_PATH)
 '''
 if os.name == "nt" and len(code) > 24000:
