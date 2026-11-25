@@ -1522,6 +1522,13 @@ while True:
         # so nothing earlier in the loop changes. Pixel is the default decode path; the VAE
         # is the fallback when no head resolves.
         _want_pixel = (str(d.get("decode") or DECODE_MODE).strip().lower() == "pixel")
+        # Fraction of the schedule at which regional routing stops (1.0 = whole run).
+        try:
+            _reg_end = float(d.get("regional_end") or os.environ.get(
+                "ANIMA_REGIONAL_END_PERCENT") or 1.0)
+        except (TypeError, ValueError):
+            _reg_end = 1.0
+        _reg_end = min(1.0, max(0.0, _reg_end))
         if _want_pixel:
             # Resolve the head up front: a missing/!x1/RGBA head must degrade to the VAE
             # instead of failing the run 20 steps in, and failing early keeps the error text
@@ -1547,15 +1554,21 @@ while True:
                 break
             context = pos_ctxs[pos_map[i]]
             neg_context = neg_ctxs[neg_map[i]]
+            # Regional routing can stop early: structural composition is decided in the
+            # first fraction of the schedule, so running per-region prediction to the last
+            # step is mostly wasted compute. `regional_end` (0..1) closes the window; the
+            # remainder denoises with the base/global prompt alone.
+            _window_on = (i + 1) / max(1, STEPS) <= _reg_end
             # A regional set that fully tiles the canvas makes the base prediction
             # algebraically redundant: the blend below cancels `pred` on every covered
             # pixel, so running the base CFG pair is pure wasted compute. Decide before
             # paying for it -- but only when coverage is genuinely complete.
-            _skip_base = False
-            if regional_specs and REGIONAL_FAST:
-                _active_key = anima_regional.active_indices(regional_schedule, i, STEPS)
-                _skip_base = anima_regional.full_coverage(
-                    [regional_schedule[x] for x in _active_key], H // 8, W // 8)
+            _active_key = (anima_regional.active_indices(regional_schedule, i, STEPS)
+                           if (regional_specs and _window_on) else ())
+            _skip_base = bool(
+                regional_specs and REGIONAL_FAST and _active_key
+                and anima_regional.full_coverage(
+                    [regional_schedule[x] for x in _active_key], H // 8, W // 8))
             if _skip_base:
                 pred = None
             elif snap_info:
