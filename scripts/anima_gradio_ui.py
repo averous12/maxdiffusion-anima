@@ -443,7 +443,186 @@ Schedules can be nested. For example: `a [red:[blue::0.7]:0.5] cat`.
 ### LoRAs
 Add a LoRA from the LoRAs tab or use a prompt tag such as `<lora:style-name:0.8>`. LoRA strength stays fixed for the whole generation because the weights are merged before sampling. Changing the active LoRA or its strength requires a re-merge; per-step LoRA schedules are not supported.
 
-**Not supported:** regional prompting, `MASK`, `COUPLE`, `CUT`, per-encoder `TE()` prompts, `SDXL()`, `NOISE()`, macros, and Jinja templates.
+**Not supported:** `MASK`, `COUPLE`, `CUT`, per-encoder `TE()` prompts, `SDXL()`, `NOISE()`, macros, and Jinja templates. Regional prompting is supported — see the **Regional** tab and the regional section below.
+"""
+
+
+TABS_HELP = """\
+### The main panel
+- **Prompt** — what to draw. Tag order and style matter; see *Prompt syntax*.
+- **Negative prompt** — what to avoid. Weighting works here too.
+- **Steps** — denoising steps. 30–50 suits Base and Aesthetic; Turbo wants 8–12.
+- **CFG guidance** — 4–5 on Base/Aesthetic; **1.0** on Turbo.
+- **Seed** — `-1` picks a random seed and reports the value, so a good result is reproducible.
+- **Batch count** — up to **8** images in one run. They advance step by step together; image *k* uses `seed + k`.
+- **Aspect preset / Image size** — quick ratio and megapixel targets. Width and Height are derived and read-only unless size is **Custom**.
+- **VAE preview every N steps** — live preview; every preview decodes the whole batch, so it costs time.
+- **Generate / Interrupt** — Interrupt stops before the final decode, so no misleading half-image is written.
+- **Status** — the live stage line: denoise step, batch, seeds, preview counts.
+- **Result / Individual images** — the last image plus a gallery with each seed.
+
+### Settings tab
+- **Aspect W** and **Aspect H** — free-form ratio, plus **Swap W/H** for portrait/landscape.
+- **Width (px)** / **Height (px)** — editable only in Custom mode.
+- **Prompt style** — Comfy, A1111 or Safe (see *Prompt syntax*).
+- **Tags** — enables `[first:second:TAG]` selection inside a prompt.
+
+### LoRAs tab
+- **Search LoRAs** and **Installed LoRAs** — find and pick a LoRA.
+- **Strength for selected LoRA** — its weight; fixed for the whole run.
+- **Add from link** — HuggingFace or CivitAI; downloads and validates into the LoRA directory.
+- **Refresh library** / **Remove tags from prompt** — resync the list, or strip `<lora:...>` tags from the prompt.
+- **Restart server with base weights** — drops the merged LoRA so the next run is clean.
+LoRA strength is fixed for the whole run: weights are merged before sampling, so per-step LoRA schedules are not supported.
+
+### Decode tab
+- **Decode path** — `pixel` reads the DiT's final features through a small conv head and is the default; `vae` is the fallback and always works. A missing head degrades to VAE automatically instead of failing mid-run.
+- **Pixel head file** — place `.safetensors` heads in `anima_pixel_heads/`.
+
+### SnapRef tab — reference images
+- **Use SnapRef** — off by default; plain generation is unchanged when it is off.
+- **Reference images** — one to three, previewed in **Selected references**. **Adapter version** selects the release (v1a, v2a-pre2, v2s).
+- **Reference mode** — `cs` = character + style, `char` = character only, `style` = style only.
+- **Reference layout** — `separate` encodes each card on its own; `stitch` joins them side by side into one reference.
+- **Reference 1 weight**, **Reference 2 weight**, **Reference 3 weight** — per-reference strength.
+
+Inside **Advanced SnapRef settings**:
+- **Reference strength** and **Fidelity** — overall reference influence.
+- **Also apply reference to negative branch** — the reference shapes the negative too.
+- **Enable reference guidance** with **Reference guidance strength** — extra guidance toward the reference; costs an extra model call per step.
+- **Guidance correction** — `apg`, `rescale` or `none`.
+- **Reference caption (optional)** — a short text description of what to transfer.
+- **Reference pixel budget (MP, combined)** — total reference resolution; 3.0 = a full megapixel each. Lower is faster and lighter.
+
+### Regional tab — different prompts in different places
+Assign a prompt to a box, optionally with its own reference. See *Regional prompting* below for the rules that matter.
+"""
+
+REGIONAL_HELP = """\
+### How it works
+Each checked box is a rectangle on the canvas with its own prompt. The server blends the
+boxes together with masks:
+
+```
+pred = base + Σ mᵢ·(branchᵢ − base) / max(Σm, 1)
+```
+
+### The consequence you must design around
+**Inside a fully covered box the base prompt contributes nothing.** It is a hard
+replacement, not an addition. So a box does not inherit style words from the main
+prompt — if you want a look inside a box, it has to be in that box's text.
+
+Where boxes do *not* cover the canvas, the base prompt draws, weighted by `1 − Σm`.
+That is where style drift and seams come from, and it is exactly what the coverage
+preview warns about.
+
+### The common block
+**Common prompt — prepended to every checked box** and
+**Common negative — prepended to every checked box** are prepended to each checked box's
+text. Put the quality preamble and `@artist` tags there once. It is not prepended to the
+main Prompt box, which is authored as a complete prompt.
+
+### Boxes
+- **Include** — unchecked boxes cost nothing: they are never encoded and never counted.
+- **Box prompt** / **Box negative (optional)** — appended after the common block. A box with no negative inherits the common one, or the main negative if the common block is empty.
+- **x**, **y**, **w**, **h** — fractions of the canvas (`0.5, 0, 0.5, 1` is the right half).
+- **Start** / **End** — share of the schedule where this box is active.
+- **Ref 1**, **Ref 2**, **Ref 3** with **Ref weights** — optional per-box references, so box A can use character 1 and box B character 2. The budget scales with the count.
+- **Ref mode** — per-box `char`, `style` or `cs`, independent of the global SnapRef mode.
+
+### Preview
+**Refresh preview** draws the boxes and reports coverage: green when the canvas is fully
+covered, amber when there are gaps (base prompt leaks in) or overlaps (boxes dilute each
+other), plus the live model-call estimate.
+
+### Staged schedules via JSON
+The advanced **Advanced: raw regional JSON (overrides the editor)** box accepts `stages`,
+explicit `mask` files, per-box `feather` and `strength`:
+
+```json
+{"common": {"prompt": "masterpiece, best quality, @sw33t"},
+ "stages": [
+   {"id": "blocking", "start": 0.0, "end": 0.1, "regions": []},
+   {"id": "characters", "start": 0.1, "end": 0.6, "regions": [
+     {"prompt": "1girl, red raincoat", "box": [0, 0, 0.5, 1]},
+     {"prompt": "1boy, navy jacket", "box": [0.5, 0, 0.5, 1]}]},
+   {"id": "joint", "start": 0.6, "end": 1.0, "regions": [
+     {"prompt": "2girls, 1boy, wide shot", "box": [0, 0, 1, 1]}]}]}
+```
+
+An empty stage is a valid composition-only phase where the base prompt draws alone.
+Up to 16 regions are supported.
+"""
+
+PERF_HELP = """\
+### What a run costs
+Plain generation is **2 model calls per step** (one conditional, one unconditional).
+Each active regional box adds its own **2 calls**, so *N* boxes cost **2 + 2N**.
+
+| boxes | calls/step | relative |
+|---|---|---|
+| 0 | 2 | 1× |
+| 2 | 6 | 3× |
+| 3 | 8 | 4× |
+
+Measured at 1024², 8 steps: plain ≈ 0.6 s/step, three regional boxes ≈ 2.2 s/step.
+
+### Two built-in savings
+- **Full coverage skips the base pass.** When the active boxes tile the canvas, the blend cancels the base prediction exactly, so it is not computed. Verified equivalent to within float32 rounding (2.4e-07), and it cut three-box time from 17.7 s to 13.4 s.
+- **References are encoded once.** Prepared reference K/V is cached and reused across steps and across generations; a repeat request drops reference time from ~103 s to milliseconds.
+
+### Keeping it fast
+- Fewer boxes is the only lever that matters much; 2 boxes ≈ 3× plain.
+- Reference megapixel budget trades fidelity for speed and memory — 0.25 MP per box is usually enough.
+- Previews decode the whole batch every time they fire; `0` disables them.
+- Turbo wants far fewer steps, which is the largest saving available.
+"""
+
+API_HELP = """\
+### Endpoints
+`POST /api/gen`, `GET /api/status`, `GET /api/result`, `GET /api/health`,
+`POST /api/interrupt`. Authenticate with `Authorization: Bearer <token>`.
+
+### Request fields beyond the UI
+- `common: {"prompt": ..., "negative_prompt": ...}` — prepended to every region.
+- `regional` — a list of regions, or `{"stages": [...]}`.
+- `regional_end: 0.0–1.0` — stops regional routing after this share of the schedule (default 1.0). Composition is decided early, so a smaller window is much cheaper.
+- Per region: `enabled: false` drops it; `mask` uses a PNG instead of a box; `feather` softens box edges; `strength` scales the mask.
+- `decode: "vae" | "pixel"` and `pixel_head` choose the decode path.
+
+### CLI
+```bash
+python remote/atp gen --prompt "..." --steps 24 \
+    --regional-json schedule.json --decode pixel
+```
+`--ref-image` (repeatable, up to 3), `--ref-mode`, `--ref-mp`, `--ref-mp-budget`,
+`--decode` and `--pixel-head` mirror the UI controls.
+"""
+
+TROUBLE_HELP = """\
+### The halves look like different images
+Their style words differ. Because a covered box does not inherit the base prompt, every
+box needs its own look terms — or put them in the **common** block so all boxes share them.
+
+### Visible seam down the middle
+Either the boxes have a gap (base prompt draws in the seam — check the coverage preview),
+or the scene words disagree between boxes. Keep background and lighting identical across
+boxes and vary only the subject.
+
+### A box seems ignored
+Check **Include** is ticked and that its **Start/End** window overlaps the run. A box that
+starts after the schedule ends never activates.
+
+### Out of memory
+Reduce boxes, lower the reference megapixel budget, or use fewer/lower-resolution references.
+
+### Slow runs
+Every active box adds two model calls per step. Fewer boxes, a smaller `regional_end`, or
+Turbo with 8–12 steps are the effective levers.
+
+### References ignored
+SnapRef must be enabled and the adapter version must match the installed file. A reference
+on a *regional box* is independent of the global SnapRef toggle.
 """
 
 
@@ -1538,10 +1717,22 @@ def build():
 
             with gr.Tab("Help"):
                 gr.Markdown(
-                    "### SnapRef adapters\n"
-                    "Select the installed adapter release. Supported releases: v1a and v2a-pre2.\n\n"
+                    "### Anima on TPU\n"
+                    "Everything the app can do, grouped by tab. Open a section below.\n\n"
                     f"Seed `-1` picks a random seed and reports the value used. "
                     f"Finished images are archived to `{save_dir() or '(disabled)'}`.")
+                with gr.Accordion("What each tab does", open=True):
+                    gr.Markdown(TABS_HELP)
+                with gr.Accordion("Prompt syntax", open=False):
+                    gr.Markdown(SYNTAX_HELP)
+                with gr.Accordion("Regional prompting", open=False):
+                    gr.Markdown(REGIONAL_HELP)
+                with gr.Accordion("Performance and cost", open=False):
+                    gr.Markdown(PERF_HELP)
+                with gr.Accordion("API and CLI", open=False):
+                    gr.Markdown(API_HELP)
+                with gr.Accordion("Troubleshooting", open=False):
+                    gr.Markdown(TROUBLE_HELP)
 
         # ---- resolution wiring -------------------------------------------------------
         def apply_size(aw, ah, mp, w, h):
