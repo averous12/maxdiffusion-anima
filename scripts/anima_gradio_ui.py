@@ -1539,6 +1539,46 @@ def progress_bar_html(pct, text=""):
             f'<span class="anima-progress-text">{safe}</span></div>')
 
 
+# --- pure UI callbacks --------------------------------------------------------------
+# These capture no widgets, so they live at module scope: build() keeps only layout and
+# wiring. `gradio` is imported lazily to leave this module's import behaviour unchanged.
+SETTING_KEYS = ["prompt", "neg", "prompt_style", "tags", "steps", "guidance",
+                "seed", "preview_every", "batch_count", "aspect_w", "aspect_h",
+                "mp_target", "width", "height"]
+
+
+def apply_size(aw, ah, mp, w, h):
+    """Recompute pixels + preview. Locked: W/H are derived and read-only.
+    Custom: W/H are typed by the user, so their values are never rewritten here."""
+    import gradio as gr
+    html = preview_html(aw, ah, mp, w, h)
+    if mp in MP_TARGETS:
+        W, H = resolve_size(aw, ah, mp, w, h)
+        return (gr.update(value=W, interactive=False),
+                gr.update(value=H, interactive=False), html)
+    return gr.update(interactive=True), gr.update(interactive=True), html
+
+
+def pick_preset(name):
+    import gradio as gr
+    if name in ASPECT_PRESETS:
+        a, b = ASPECT_PRESETS[name]
+        return a, b
+    return gr.update(), gr.update()
+
+
+def save_settings(*vals):
+    return {k: v for k, v in zip(SETTING_KEYS, vals)}
+
+
+def restore_settings(saved):
+    import gradio as gr
+    if not isinstance(saved, dict):
+        return [gr.update() for _ in SETTING_KEYS]
+    return [gr.update() if saved.get(name) is None else gr.update(value=saved[name])
+            for name in SETTING_KEYS]
+
+
 def build():
     import gradio as gr
 
@@ -1768,27 +1808,11 @@ def build():
                     gr.Markdown(TROUBLE_HELP)
 
         # ---- resolution wiring -------------------------------------------------------
-        def apply_size(aw, ah, mp, w, h):
-            """Recompute pixels + preview. Locked: W/H are derived and read-only.
-            Custom: W/H are typed by the user, so their values are never rewritten here."""
-            html = preview_html(aw, ah, mp, w, h)
-            if mp in MP_TARGETS:
-                W, H = resolve_size(aw, ah, mp, w, h)
-                return (gr.update(value=W, interactive=False),
-                        gr.update(value=H, interactive=False), html)
-            return gr.update(interactive=True), gr.update(interactive=True), html
-
         size_inputs = [aspect_w, aspect_h, mp_target, width, height]
         size_outputs = [width, height, shape_preview]
         gr.on(triggers=[aspect_w.change, aspect_h.change, mp_target.change,
                         width.change, height.change],
               fn=apply_size, inputs=size_inputs, outputs=size_outputs, show_progress="hidden")
-
-        def pick_preset(name):
-            if name in ASPECT_PRESETS:
-                a, b = ASPECT_PRESETS[name]
-                return a, b
-            return gr.update(), gr.update()
 
         preset.change(pick_preset, inputs=preset, outputs=[aspect_w, aspect_h],
                       show_progress="hidden")
@@ -1799,21 +1823,9 @@ def build():
         # Gr.BrowserState keeps a JSON blob in localStorage, so the prompt and the
         # rest of the form survive a reload or a fresh browser session.
         settings = gr.BrowserState(default_value=None, storage_key="anima_settings_v1")
-        SETTING_KEYS = ["prompt", "neg", "prompt_style", "tags", "steps", "guidance",
-                        "seed", "preview_every", "batch_count", "aspect_w", "aspect_h",
-                        "mp_target", "width", "height"]
         setting_inputs = [prompt, neg, prompt_style, tags, steps, guidance, seed,
                           preview_every, batch_count, aspect_w, aspect_h, mp_target,
                           width, height]
-
-        def save_settings(*vals):
-            return {k: v for k, v in zip(SETTING_KEYS, vals)}
-
-        def restore_settings(saved):
-            if not isinstance(saved, dict):
-                return [gr.update() for _ in setting_inputs]
-            return [gr.update() if saved.get(name) is None else gr.update(value=saved[name])
-                    for name in SETTING_KEYS]
 
         gr.on(triggers=[c.change for c in setting_inputs],
               fn=save_settings, inputs=setting_inputs, outputs=[settings],

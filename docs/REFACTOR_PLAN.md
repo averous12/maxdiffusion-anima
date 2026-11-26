@@ -14,7 +14,7 @@ The goal is that a change costs one edit in one place, and that a test can prove
 | 1 — extract request path | **blocked** | 540-line loop holds **201 Name stores**, all module globals; classification needs a hash check that needs a TPU run |
 | 2 — one forward | **done** | jitted functions 7 → 4; `ops/test_forward_adapters.py` 7/7, no `None` leaks |
 | 3 — kill globals | **deferred** | P3 corrected below: not a concurrency bug, so this is hygiene, not a defect |
-| 4 — break up `build()` | **todo** | 356 lines |
+| 4 — break up `build()` | **partial** | 356 → 328 lines: four pure callbacks moved to module scope; the remaining mass is the 179-line Tabs widget-construction block, which needs a widget registry |
 | 5 — tame `ops/` | **half done** | `ops/README.md` indexes every file as check / tooling / probe; no deletions |
 | 6 — end-to-end test | **partial** | `test_forward_equivalence.py` proves adapter output is bitwise identical to direct apply incl. real LLLite weights; full request→image still needs the runtime importable (i.e. Phase 1) |
 
