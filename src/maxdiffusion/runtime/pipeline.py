@@ -577,24 +577,51 @@ def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
                              source_attention_mask=source_mask,
                              target_attention_mask=target_mask)
 
-# Only the transformer forward is jitted. CFG (two calls + combine) stays eager: a nested
-# jit over both calls duplicates a large HLO and was what previously blew up compile memory.
+# --- The one transformer forward -------------------------------------------------------
+# Four near-identical jitted bodies used to live here (plain, snapref, lllite, lllite+snapref),
+# differing only in which kwargs they forwarded. They are one compiled body plus thin
+# adapters now, so a new control combination is a call rather than another function.
+#
+# Why this stays cheap on a live Gradio server serving varied requests: jax.jit keys its
+# executables on the *pytree structure* of the arguments. Absent features are omitted instead
+# of passed as a sentinel, so each mode traces once and is cached thereafter -- switching
+# modes on a running server reuses the compiled graph rather than recompiling. The opposite
+# shape, one graph with every feature always present, would compile snapref and lllite into
+# every request and pay their cost even in plain mode.
+#
+# CFG (two calls + combine) stays eager: a nested jit over both calls duplicates a large HLO
+# and was what previously blew up compile memory.
 @jax.jit
+def _transformer_forward(tp, lat, t_vec, ctx, pad, lora=None, refkv=None, refbias=None,
+                         lllite_w=None, cond_emb=None, strength=0.0):
+    kwargs = {}
+    if lora is not None:
+        kwargs["lora"] = lora
+    if refkv is not None:
+        kwargs["ref_kv"] = refkv
+        kwargs["ref_bias"] = refbias
+    if lllite_w is not None and cond_emb is not None:
+        kwargs["lllite_w"] = lllite_w
+        kwargs["cond_emb"] = cond_emb
+        kwargs["lllite_strength"] = strength
+    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad, **kwargs)
+
+
 def transformer_forward(tp, lat, t_vec, ctx, pad):
-    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad)
+    """Plain forward: no LoRA, no reference, no control."""
+    return _transformer_forward(tp, lat, t_vec, ctx, pad)
 
 # --- SnapRef (reference adapter) -------------------------------------------------------
-# Every callable below is a *separate* jit with a different signature, so the plain path
-# above keeps its existing executable and behaviour exactly as before. Nothing here runs
-# unless a request carries "snapref".
+# Nothing here runs unless a request carries "snapref".
 # A second module instance whose scan emits every layer's self-attention (k, v): the
 # reference pass needs those, the target pass does not, so they cannot share one instance.
 _SNAPREF_RECORDER = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, record_kv=True)
 
-@jax.jit
+
 def snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
-    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
-                             lora=lora, ref_kv=refkv, ref_bias=refbias)
+    """LoRA and/or reference; refkv=None disables the reference half of the pair."""
+    return _transformer_forward(tp, lat, t_vec, ctx, pad, lora=lora, refkv=refkv,
+                                refbias=refbias)
 
 @jax.jit
 def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
@@ -604,25 +631,22 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
                                    jnp.zeros((lat.shape[0],), jnp.float32), ctx, None, pad,
                                    rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
 
-@jax.jit
 def lllite_forward(tp, lat, t_vec, ctx, pad, lllite_w, cond_emb, strength):
     """LLLite control only. The per-layer module weights ride as a scan input, exactly
     like SnapRef's LoRA, so the 28 blocks stay scanned and nothing is unrolled."""
-    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
-                             lllite_w=lllite_w, cond_emb=cond_emb,
-                             lllite_strength=strength)
+    return _transformer_forward(tp, lat, t_vec, ctx, pad, lllite_w=lllite_w,
+                                cond_emb=cond_emb, strength=strength)
 
-@jax.jit
+
 def lllite_snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias,
                                   lllite_w, cond_emb, strength):
     """Character reference (SnapRef) and pose control (LLLite) in the same pass.
 
     LLLite edits the q/k/v inputs pre-projection, then SnapRef prepends the cached
     reference keys/values — the same order the reference workflow installs the patches."""
-    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
-                             lora=lora, ref_kv=refkv, ref_bias=refbias,
-                             lllite_w=lllite_w, cond_emb=cond_emb,
-                             lllite_strength=strength)
+    return _transformer_forward(tp, lat, t_vec, ctx, pad, lora=lora, refkv=refkv,
+                                refbias=refbias, lllite_w=lllite_w,
+                                cond_emb=cond_emb, strength=strength)
 
 # --- LLLite control (ControlNet-LLLite: 3D pose / outline / regional) -------------------
 # Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
