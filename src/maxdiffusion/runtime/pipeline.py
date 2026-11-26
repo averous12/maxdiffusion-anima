@@ -301,6 +301,7 @@ def installed_lora_files():
     return sorted(set(out))
 
 
+@jax.jit
 def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
     return conditioner.apply({"params": c_params}, source_hidden_states=source_hidden,
                              target_input_ids=target_ids,
@@ -308,6 +309,7 @@ def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
                              target_attention_mask=target_mask)
 
 
+@jax.jit
 def _transformer_forward(tp, lat, t_vec, ctx, pad, lora=None, refkv=None, refbias=None,
                          lllite_w=None, cond_emb=None, strength=0.0):
     kwargs = {}
@@ -334,6 +336,7 @@ def snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
                                 refbias=refbias)
 
 
+@jax.jit
 def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
     # record_kv is a Module field, not a call argument: a separate instance is what makes the
     # scan emit every layer's self-attention (k, v) instead of the residual stream alone.
@@ -419,6 +422,7 @@ def lllite_cfg_prediction(latents, timestep, context, neg_context, pad, guidance
             + jnp.float32(guidance) * (nc.astype(jnp.float32) - nu.astype(jnp.float32)))
 
 
+@jax.jit
 def pixel_tap_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
     return _PIXEL_TAP.apply({"params": tp}, lat, t_vec, ctx, None, pad,
                             lora=lora, ref_kv=refkv, ref_bias=refbias)
