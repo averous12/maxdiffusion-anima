@@ -399,6 +399,30 @@ def get_lllite(name, layers=28):
     return _LLLITE_CACHE[key]
 
 
+def _as_control_image(image):
+    """Coerce a request value into something `preprocess_control` can read.
+
+    Requests carry a *path* (the UI uploads to a temp file and puts the name in the JSON), but
+    preprocess_control expects pixels and does `Image.fromarray(np.asarray(image))`. Handing it
+    a path turns into a (1,1) '<U21' string array -- exactly the width of the path it was given --
+    and PIL raises `TypeError: Cannot handle this data type: (1, 1), <U21>`. That is why every
+    LLLite request through the server failed while the CPU probes passed their arrays directly.
+    """
+    if image is None:
+        raise ValueError("lllite.image is required")
+    if isinstance(image, str):
+        from PIL import Image as _Image
+        if not os.path.exists(image):
+            raise FileNotFoundError(f"lllite.image does not exist: {image}")
+        with _Image.open(image) as im:
+            return im.convert("RGB").copy()
+    if isinstance(image, (bytes, bytearray)):
+        import io as _io
+        from PIL import Image as _Image
+        return _Image.open(_io.BytesIO(bytes(image))).convert("RGB")
+    return image            # already a PIL image or an array
+
+
 def lllite_cond_emb(lite, image, height, width, aspect="letterbox"):
     """Control image -> per-token conditioning embedding, sized to the pixel resolution.
 
@@ -406,7 +430,7 @@ def lllite_cond_emb(lite, image, height, width, aspect="letterbox"):
     proportions (a 0.67-aspect control squashed to 1:1 measured 1.149 against a true 1.720),
     which quietly degrades every pose the user asks for.
     """
-    arr = anima_lllite.preprocess_control(image, (height, width), aspect=aspect)
+    arr = anima_lllite.preprocess_control(_as_control_image(image), (height, width), aspect=aspect)
     return anima_lllite.encode_conditioning(lite, jnp.asarray(arr))
 
 
