@@ -5,24 +5,18 @@
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; color: var(--foreground); font-size: 13px; line-height: 1.45; }
-  h3 { margin: 14px 0 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  h3 { margin: 15px 0 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
        color: var(--muted-foreground); font-weight: 600; }
   h3:first-child { margin-top: 0; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; }
   .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
-          background: var(--card); flex: 1 1 260px; min-width: 240px; }
-  .card .name { font-weight: 650; font-size: 13px; }
-  .card .path { font-family: ui-monospace, monospace; font-size: 11px;
-                color: var(--muted-foreground); margin-bottom: 8px; word-break: break-all; }
-  .mode { display: flex; justify-content: space-between; align-items: baseline;
-          padding: 2px 0; font-size: 12px; }
-  .mode span:last-child { font-family: ui-monospace, monospace; font-size: 11px; }
-  .yes { color: #2ea043; font-weight: 700; }
-  .no  { color: #d1242f; font-weight: 700; }
-  .nul { color: var(--muted-foreground); opacity: .65; }
-  .flow { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+          background: var(--card); flex: 1 1 250px; min-width: 230px; }
+  .name { font-weight: 650; }
+  .path { font-family: ui-monospace, monospace; font-size: 11px;
+          color: var(--muted-foreground); margin-bottom: 7px; word-break: break-all; }
+  .flow { display: flex; align-items: stretch; overflow-x: auto; padding-bottom: 4px; }
   .step { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
-          background: var(--card); min-width: 118px; flex: 0 0 auto; }
+          background: var(--card); min-width: 112px; flex: 0 0 auto; }
   .step .t { font-weight: 620; font-size: 12px; }
   .step .s { font-size: 10.5px; color: var(--muted-foreground); margin-top: 3px; }
   .arw { display: flex; align-items: center; padding: 0 7px; color: var(--accent);
@@ -31,10 +25,8 @@
            margin: 8px 0; background: color-mix(in srgb, var(--accent) 7%, transparent); }
   .block .hd { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
                color: var(--accent); font-weight: 700; margin-bottom: 6px; }
-  .layers { display: flex; flex-direction: column; gap: 5px; }
-  .layer { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .layer .lbl { font-family: ui-monospace, monospace; font-size: 11px;
-                min-width: 92px; color: var(--foreground); }
+  .layer { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 5px; }
+  .layer .lbl { font-family: ui-monospace, monospace; font-size: 11px; min-width: 92px; }
   .hook { font-size: 10.5px; padding: 1.5px 6px; border-radius: 20px;
           border: 1px solid var(--border); white-space: nowrap; }
   .h-lora { border-color: #8250df; color: #8250df; }
@@ -46,37 +38,28 @@
            border-bottom: 1px solid var(--border); }
   th { color: var(--muted-foreground); font-weight: 600; font-size: 10.5px;
        text-transform: uppercase; letter-spacing: .05em; }
-  .num { font-family: ui-monospace, monospace; white-space: nowrap; }
-  .ok  { color: #2ea043; }
-  .amb { color: #bf6a02; }
+  .num { font-family: ui-monospace, monospace; }
+  .ok  { color: #2ea043; font-weight: 600; }
+  .amb { color: #bf6a02; font-weight: 600; }
+  .bad { color: #d1242f; font-weight: 600; }
   .note { font-size: 11px; color: var(--muted-foreground); margin-top: 8px; }
 </style>
 </head>
 <body>
 
-<h3>Two runtimes — different scope</h3>
+<h3>One runtime, two files</h3>
 <div class="row">
   <div class="card">
-    <div class="name">Server <span class="yes">← all six modes</span></div>
-    <div class="path">scripts/anima_aesthetic_server.py · 1994 L</div>
-    <div class="mode"><span>plain</span><span class="yes">yes</span></div>
-    <div class="mode"><span>regional</span><span class="yes">yes</span></div>
-    <div class="mode"><span>snapref</span><span class="yes">yes</span></div>
-    <div class="mode"><span>lllite</span><span class="yes">yes</span></div>
-    <div class="mode"><span>regional + snapref</span><span class="yes">yes</span></div>
-    <div class="mode"><span>lllite + snapref</span><span class="yes">yes</span></div>
-    <div class="mode"><span>regional + lllite</span><span class="no">refused</span></div>
+    <div class="name">Launcher</div>
+    <div class="path">scripts/anima_aesthetic_server.py · 27 L</div>
+    env + subprocess only. Same interface as before: no args, env only.
   </div>
   <div class="card">
-    <div class="name">TPU driver <span class="amb">← validation only</span></div>
-    <div class="path">scripts/anima_aesthetic_tpu.py · 312 L</div>
-    <div class="mode"><span>plain</span><span class="yes">yes</span></div>
-    <div class="mode"><span>regional</span><span class="no">no</span></div>
-    <div class="mode"><span>snapref</span><span class="no">no</span></div>
-    <div class="mode"><span>lllite</span><span class="yes">yes</span></div>
-    <div class="mode"><span>regional + snapref</span><span class="no">no</span></div>
-    <div class="mode"><span>lllite + snapref</span><span class="no">no</span></div>
-    <div class="mode"><span>regional + lllite</span><span class="nul">n/a</span></div>
+    <div class="name">Runtime</div>
+    <div class="path">src/maxdiffusion/runtime/pipeline.py · 2002 L</div>
+    <span class="num">boot()</span> 138 stmts · <span class="num">serve()</span> 85 L ·
+    <span class="num">handle_request()</span> 467 L<br>
+    Import is side-effect free — no weights load until <span class="num">boot()</span>.
   </div>
 </div>
 
@@ -86,58 +69,80 @@
   <div class="arw">→</div>
   <div class="step"><div class="t">text conditioner</div><div class="s">Qwen · 512×1024</div></div>
   <div class="arw">→</div>
-  <div class="step"><div class="t">LLLite conditioner</div><div class="s">letterbox → 4096 tok</div></div>
+  <div class="step"><div class="t">LLLite cond.</div><div class="s">letterbox → 4096 tok</div></div>
   <div class="arw">→</div>
-  <div class="step" style="min-width:auto"><div class="t">transformer</div><div class="s">28 blocks, nn.scan</div></div>
+  <div class="step" style="min-width:auto"><div class="t">transformer ×4 jits</div><div class="s">28 blocks, nn.scan</div></div>
   <div class="arw">→</div>
-  <div class="step"><div class="t">VAE decode</div><div class="s">1024×1024</div></div>
+  <div class="step"><div class="t">VAE / pixel head</div><div class="s">1024×1024</div></div>
 </div>
 
 <div class="block">
   <div class="hd">_Block — one compiled body, looped 28× (never unrolled)</div>
-  <div class="layers">
-    <div class="layer"><span class="lbl">norm1 → attn1</span>
-      <span class="hook h-lora">LoRA</span>
-      <span class="hook h-snap">SnapRef kv + bias</span>
-      <span class="hook h-lll">LLLite q/k/v inputs</span>
-    </div>
-    <div class="layer"><span class="lbl">norm2 → attn2</span>
-      <span class="hook h-lora">LoRA</span>
-      <span class="hook h-reg">regional masks</span>
-    </div>
-    <div class="layer"><span class="lbl">norm3 → MLP</span>
-      <span class="hook h-lora">LoRA</span>
-      <span class="hook h-lll">LLLite mlp_layer1</span>
-    </div>
+  <div class="layer"><span class="lbl">norm1 → attn1</span>
+    <span class="hook h-lora">LoRA</span>
+    <span class="hook h-snap">SnapRef kv + bias</span>
+    <span class="hook h-lll">LLLite q/k/v inputs</span>
+  </div>
+  <div class="layer"><span class="lbl">norm2 → attn2</span>
+    <span class="hook h-lora">LoRA</span>
+    <span class="hook h-reg">regional masks</span>
+  </div>
+  <div class="layer"><span class="lbl">norm3 → MLP</span>
+    <span class="hook h-lora">LoRA</span>
+    <span class="hook h-lll">LLLite mlp_layer1</span>
   </div>
 </div>
 <div class="note">
-  LLLite edits the <b>inputs</b> to q/k/v, not the projections' output — matching
-  <span class="num">predict2.py:160-179</span>. Its per-layer weights ride <b>nn.scan</b> as a
-  scan input with a leading layer axis, the same idiom as SnapRef's LoRA tree, so enabling
-  control costs <span class="num">+21%</span> per step instead of unrolling all 28 blocks.
+  One <span class="num">_transformer_forward</span> serves every mode; absent features are
+  <b>omitted</b>, not sentinel'd, so jax.jit caches one executable per mode and switching modes
+  reuses it.
 </div>
 
-<h3>Evidence</h3>
+<h3>What needs a TPU check — all of it, not just LLLite</h3>
 <table>
-  <tr><th>Claim</th><th>Measured</th><th>Status</th></tr>
-  <tr><td>LLLite vs ComfyUI reference</td><td class="num">2.742e-06 abs · 828 tensors, 0 missing</td><td class="ok">proven</td></tr>
-  <tr><td>scan ≡ per-layer loop</td><td class="num">1.144e-05</td><td class="ok">proven</td></tr>
+  <tr><th>Feature</th><th>Runtime refs</th><th>CPU proof</th><th>TPU run</th><th>Status</th></tr>
+  <tr><td><b>LLLite</b></td><td class="num">68</td><td class="num">parity 2.742e-06 · scan 1.1e-05 · strength-0 bit-exact</td><td class="num">yes (old driver)</td><td class="amb">partial</td></tr>
+  <tr><td><b>SnapRef</b></td><td class="num">145</td><td class="num">20 probes, 0 assertions</td><td class="num">never</td><td class="bad">unverified</td></tr>
+  <tr><td><b>LoRA</b></td><td class="num">112</td><td class="num">none — no tests exist</td><td class="num">never</td><td class="bad">unverified</td></tr>
+  <tr><td><b>regional</b></td><td class="num">49</td><td class="num">2 UI-contract tests</td><td class="num">never</td><td class="bad">unverified</td></tr>
+  <tr><td><b>WebUI</b></td><td class="num">—</td><td class="num">3 tests build() · 7/7, 4/4, 18/19</td><td class="num">never launched</td><td class="amb">structural only</td></tr>
+</table>
+<div class="note">
+  The refactor changed the <b>shared</b> inference path, so every feature above rides code that
+  moved. LoRA carries the most runtime code with zero tests.
+</div>
+
+<h3>Combinations</h3>
+<table>
+  <tr><th>Mode</th><th>Ever run on TPU</th><th>Note</th></tr>
+  <tr><td>plain</td><td class="ok">yes</td><td class="num">1896 ms/step, 30 steps</td></tr>
+  <tr><td>lllite</td><td class="amb">driver only</td><td>never through the server</td></tr>
+  <tr><td>regional</td><td class="bad">never</td><td></td></tr>
+  <tr><td>snapref</td><td class="bad">never</td><td></td></tr>
+  <tr><td>regional + snapref</td><td class="bad">never</td><td></td></tr>
+  <tr><td>lllite + snapref</td><td class="bad">never</td><td>jit tested, no pixel produced</td></tr>
+  <tr><td>regional + lllite</td><td class="num">n/a</td><td><b>refused</b> by design</td></tr>
+</table>
+
+<h3>Evidence collected so far</h3>
+<table>
+  <tr><th>Claim</th><th>Measured</th><th></th></tr>
+  <tr><td>adapter ≡ direct apply</td><td class="num">bitwise identical (real LLLite ckpt)</td><td class="ok">proven</td></tr>
   <tr><td>strength 0 inert</td><td class="num">0.000e+00</td><td class="ok">proven</td></tr>
-  <tr><td>full 28-layer forward</td><td class="num">3.41e-02 / 6.82e-02 / 1.36e-01</td><td class="ok">proven</td></tr>
-  <tr><td>LLLite step cost on TPU</td><td class="num">2303–2341 vs 1896 ms</td><td class="ok">proven</td></tr>
   <tr><td>control changes image</td><td class="num">643,837 px differ</td><td class="ok">proven</td></tr>
+  <tr><td>LLLite step cost</td><td class="num">2303–2341 vs 1896 ms</td><td class="ok">proven</td></tr>
   <tr><td>letterbox keeps aspect</td><td class="num">1.724 vs 1.720 true</td><td class="ok">proven</td></tr>
+  <tr><td>mode rules</td><td class="num">15/15 cases, 6/6 modes</td><td class="ok">proven</td></tr>
+  <tr><td>import boots nothing</td><td class="num">0 model attrs, 4 jits intact</td><td class="ok">proven</td></tr>
   <tr><td><b>pose adherence</b></td><td class="num">—</td><td class="amb">unproven</td></tr>
-  <tr><td>outline / regional checkpoints e2e</td><td class="num">parity only</td><td class="amb">unproven</td></tr>
-  <tr><td>lllite + snapref in one pass</td><td class="num">jit exists, untested</td><td class="amb">unproven</td></tr>
-  <tr><td>SnapRef / regional on TPU</td><td class="num">0 refs in driver</td><td class="amb">blocked</td></tr>
+  <tr><td>plain sha256 vs pre-refactor</td><td class="num">—</td><td class="amb">unproven</td></tr>
 </table>
 
 <div class="note">
-  <b>Known issue:</b> <span class="num">adapter_block_map</span> assumes an iterable and raises
-  <span class="num">TypeError</span> on a scalar layer count
-  (<span class="num">anima_snapref_flax.py:65</span>).
+  <b>Caution:</b> a refactor step silently dropped all four <span class="num">@jax.jit</span>
+  decorators and <b>every numeric test still passed</b> — jax fell back to eager execution,
+  correct but far slower. Only a decorator census caught it. Numerical equality is not enough;
+  step cost and structure need their own checks.
 </div>
 
 </body>

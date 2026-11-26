@@ -3,6 +3,12 @@
 Written after the LLLite work exposed how hard the current shape is to change safely.
 Everything below is measured, not felt; the command that produced each number is named.
 
+> **Scope warning.** This refactor changed the *shared* inference path — one
+> `_transformer_forward` now serves every mode, and the runtime was reorganised into
+> `boot()` / `serve()` / `handle_request()`. LoRA, SnapRef, regional, LLLite and the WebUI all
+> ride that code, so **all of them need re-validation on TPU, not just LLLite**. Per-feature
+> state and the ordered checklist are in `docs/VALIDATION_MATRIX.md`.
+
 The goal is **not** a rewrite. The generation behaviour is validated and must not move.
 The goal is that a change costs one edit in one place, and that a test can prove it.
 

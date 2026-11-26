@@ -25,9 +25,11 @@ Upstream: fork of `averous12/maxdiffusion-anima` (see `FORK_SUMMARY.md` for dive
 ```
 maxdiffusion/
 ├── src/maxdiffusion/
+│   ├── runtime/                                    the generation runtime (real module)
+│   │   └── pipeline.py               2002 L  boot() / serve() / handle_request()
 │   ├── models/
 │   │   ├── anima_cosmos_flax.py        697 L  transformer: _Attention / _Block / _ScannedBlock
-│   │   ├── anima_lora_flax.py          695 L  LoRA load, merge, apply
+│   │   ├── anima_lora_flax.py          695 L  LoRA load, merge, apply  ← no tests
 │   │   ├── anima_lllite_flax.py        588 L  ControlNet-LLLite (28 blocks × attn q/k/v + mlp)
 │   │   ├── anima_snapref_flax.py       462 L  SnapRef reference adapter
 │   │   ├── anima_regional.py           267 L  region schedules and masks
@@ -37,19 +39,25 @@ maxdiffusion/
 │   ├── schedulers/scheduling_flow_match_flax.py   flow-match sigma schedule
 │   └── utils/                                      shared helpers
 ├── scripts/
-│   ├── anima_aesthetic_server.py      1996 L  the only runtime: all six control modes
+│   ├── anima_aesthetic_server.py        27 L  launcher: env + subprocess, nothing else
 │   ├── anima_gradio_ui.py             1920 L  browser UI over the server
 │   ├── anima_regional_ui.py                   regional mask editor UI
 │   ├── anima_colab_setup.py                   Colab venv bootstrap
 │   ├── anima_cloudflared.py                   tunnel helper
 │   └── anima_scan_e2e.py                      scan equivalence harness
-└── ops/                                       34 probe/test scripts (see §6)
+├── docs/
+│   ├── MODEL_ARCHITECTURE.md                  this document
+│   ├── VALIDATION_MATRIX.md                   per-feature + per-combination validation state
+│   ├── REFACTOR_PLAN.md                       what changed, what is outstanding
+│   └── model-diagram.html                     rendered system diagram
+└── ops/                                       35 checks / probes / tooling (see ops/README.md)
 ```
 
 ## 2. One runtime
 
-**`scripts/anima_aesthetic_server.py` is the only runtime.** It supports all six control
-modes: plain, regional, snapref, lllite, regional+snapref, lllite+snapref.
+**One runtime, two files.** `scripts/anima_aesthetic_server.py` is a 27-line launcher (env +
+subprocess); the program itself is `src/maxdiffusion/runtime/pipeline.py`. Together they support
+all six control modes.
 
 The one-shot TPU driver (`anima_aesthetic_tpu.py`) existed only for validation and was
 **deleted**: it duplicated the server's generation logic behind a `code` string and had to be
@@ -61,9 +69,11 @@ implementation.
 Generation on a TPU VM therefore means starting the server and posting a request to it, not
 running a separate script.
 
-⚠️ **The server's code is 98% a `code = r'''…'''` string** (1964 of 1996 lines), executed via
-`subprocess.run`. That is why the mode rules had to be lifted into a separate importable
-module before they could be tested, and it is the top item in `docs/REFACTOR_PLAN.md`.
+The runtime used to be **98% a `code = r'''…'''` string** (1964 of 1996 lines) executed via
+`subprocess.run`. It is now a real module: `src/maxdiffusion/runtime/pipeline.py`, launched with
+`python -m maxdiffusion.runtime.pipeline`, with `boot()` / `serve()` / `handle_request()` as
+addressable units and side-effect-free import. See `docs/REFACTOR_PLAN.md` for what moved and
+what is still outstanding.
 
 ## 3. Control-mode matrix
 
@@ -166,6 +176,11 @@ against a PyTorch transcription of `comfy/ldm/anima/lllite.py`, not inferred fro
 
 ## 5. Validation status
 
+> **This section is LLLite in depth. The full feature × combination matrix — WebUI, LoRA,
+> SnapRef, regional, LLLite and their combinations — is in `docs/VALIDATION_MATRIX.md`.**
+> Short version: only `plain` and `lllite` have ever run on TPU, LoRA has **no tests at all**,
+> and `lllite + snapref` has a unit-tested jit but has never produced a pixel.
+
 Proven — reproduced by a command in this repo:
 
 | Claim | Number | Check |
@@ -208,31 +223,40 @@ Not proven — do not claim these:
 
 | Issue | Impact | Where |
 |---|---|---|
-| Runtime is 98% a `code` string | not importable, not lintable, tracebacks say `<string>` | `anima_aesthetic_server.py` |
-| Seven jits for one forward | every new combo costs another body to maintain | §P2 of `REFACTOR_PLAN.md` |
-| Mutable globals shared across requests | `_SNAPREF_STATE`, `_LLLITE_CACHE` — interleaved requests can corrupt each other | `REFACTOR_PLAN.md` §P3 |
-| Nesting depth 16 in the request path | rules buried where no test reaches them | `REFACTOR_PLAN.md` §P4 |
-| `build()` is 356 lines | UI layout, widgets, wiring and defaults in one scope | `anima_gradio_ui.py` |
-| `adapter_block_map` assumes an iterable | `TypeError: 'int' object is not iterable` if called with a scalar layer count | `anima_snapref_flax.py:65` |
-| Pose adherence unverified | LLLite effect proven, correctness not | §5 |
+| `adapter_block_map` assumes an iterable | `TypeError: 'int' object is not iterable` for a scalar layer count | `anima_snapref_flax.py:65` |
+| **LoRA has no tests** | 112 runtime refs, zero assertions — regressions invisible until a run looks wrong | `ops/`, `tests/` (empty) |
+| `lllite + snapref` untested | jit exists and kwargs are unit-tested, but it has never produced a pixel | — |
+| Pose adherence unverified | effect proven (643,837 px differ), correctness not | `VALIDATION_MATRIX.md` §4 |
+| `handle_request` still 467 lines, depth 16 | readable as a unit, but internally still deeply nested | `REFACTOR_PLAN.md` Phase 1 |
+| `build()` is 328 lines | UI layout, widgets, wiring and defaults in one scope | `anima_gradio_ui.py` |
 | Superseded `snapref_scan_probe{2,3,4}.py` | clutter in `ops/` | `ops/` |
 
-The refactor to address the first five is written up with measured baselines and per-phase
-acceptance criteria in `docs/REFACTOR_PLAN.md`.
+The refactor that produced the current shape — and what is still outstanding — is written up
+with measured baselines and per-phase acceptance criteria in `docs/REFACTOR_PLAN.md`. The
+per-feature validation state, including LoRA's complete lack of tests, is in
+`docs/VALIDATION_MATRIX.md`.
 
 ## 8. Running it
 
 ```bash
-# CPU checks — no GPU/TPU required
-PYTHONPATH=src python ops/lllite_parity.py        # vs the ComfyUI reference
-PYTHONPATH=src python ops/lllite_scan_test.py     # scan == loop, strength 0 inert
-PYTHONPATH=src python ops/lllite_full_forward.py  # real transformer, 2 layers
+# CPU checks — no GPU/TPU required. Run from the workspace root for the lllite_* ones.
+PYTHONPATH=src python ops/lllite_parity.py          # vs the ComfyUI reference
+PYTHONPATH=src python ops/lllite_scan_test.py       # scan == loop, strength 0 inert
+PYTHONPATH=src python ops/lllite_full_forward.py    # real transformer, 2 layers
 LL_LAYERS=28 PYTHONPATH=src python ops/lllite_full_forward.py
-PYTHONPATH=src python ops/test_control_modes.py   # the six modes + refusals
+PYTHONPATH=src python ops/test_control_modes.py     # the six modes + refusals
+PYTHONPATH=src python ops/test_forward_adapters.py  # per-mode kwargs, no None leaks
+PYTHONPATH=src python ops/test_forward_equivalence.py  # inference is bitwise unchanged
+PYTHONPATH=src python ops/test_runtime_import.py    # import boots nothing; decorator census
 
-# TPU: bootstrap the VM, then start the SERVER and post a request to it
-python ops/anima_tpu_bootstrap.py                 # clone, overlay, setup, import check
-# generation itself is the server's job — there is no separate one-shot driver
+# Launcher (unchanged interface — no args, env only)
+python scripts/anima_aesthetic_server.py
+#   equivalently:
+python -m maxdiffusion.runtime.pipeline
+
+# TPU: bootstrap the VM, then start the server and post a request to it
+python ops/anima_tpu_bootstrap.py                   # clone, overlay, setup, import check
+# generation is the server's job — there is no separate one-shot driver
 ```
 
 LLLite is configured **per request**, in the `lllite` object of the request JSON:
