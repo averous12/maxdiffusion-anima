@@ -1453,9 +1453,477 @@ except Exception as _e:
 # main loop be called a stall.
 _ARMED["on"] = True
 _HEARTBEAT["t"] = time.time()
+def handle_request(d, gen_id):
+    """Prepare, denoise, decode and record one request.
+
+    Returns False when an interruption already refreshed last_mtime, so the
+    caller must not refresh it again; True otherwise."""
+    global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, last_mtime
+    try:
+        # One prompt, one negative, N images. Older clients sent lists: use the first entry.
+        _p = d.get("prompt", "")
+        if isinstance(_p, (list, tuple)):
+            _p = _p[0] if _p else ""
+        _n = d.get("negative_prompt", "")
+        if isinstance(_n, (list, tuple)):
+            _n = _n[0] if _n else ""
+
+        # --- in-prompt LoRA control: <lora:name:0.8> -------------------------
+        # Semantics:
+        #   * only the POSITIVE prompt is authoritative for which LoRAs are
+        #     merged; a tag in the negative prompt is stripped and otherwise
+        #     ignored, so it can never wipe the stack by accident;
+        #   * a positive prompt with no tags leaves the weights alone, so the
+        #     Gradio panel's applied LoRAs survive an ordinary prompt;
+        #   * `<lora:none>` is the explicit way back to the bare base;
+        #   * if tags resolve to nothing at all (every name is a typo), the
+        #     current merge is KEPT and the names are reported -- clearing the
+        #     stack because of a typo would be destructive and silent.
+        # Tags are always stripped from both prompts: leaving them in would
+        # feed the encoder literal "<lora:...>" tokens.
+        _lora_note = {}
+        _tags_pos = "<lora:" in (_p or "").lower()
+        _tags_neg = "<lora:" in (_n or "").lower()
+        if _tags_neg:
+            _n = prompt_control.strip_lora_tags(_n)[0]
+        if _tags_pos:
+            _parsed = prompt_control.parse_lora_tags(_p, installed_lora_files())
+            _p = _parsed["clean"]
+            _want = _parsed["specs"]
+            _have = [(str(a), float(b)) for a, b in (globals().get("_LORA_SPECS") or [])]
+            _lora_note = {"lora_requested": [{"path": a, "scale": b} for a, b in _want],
+                          "lora_unresolved": _parsed["unresolved"],
+                          "lora_ignored_clip": _parsed["ignored_clip"],
+                          "lora_clamped": _parsed["clamped"],
+                          "lora_cleared": bool(_parsed.get("clear")),
+                          "lora_swapped": False}
+            if _parsed["unresolved"]:
+                log("WARNING: prompt names LoRA(s) that are not installed: "
+                    + ", ".join(_parsed["unresolved"])
+                    + f" (searched {', '.join(LORA_DIRS)})")
+            _skip = (not _want and not _parsed.get("clear") and _parsed["unresolved"])
+            if _skip:
+                log("prompt named only unknown LoRAs -> keeping the current merge")
+                _lora_note["lora_skipped_reason"] = "no named LoRA is installed"
+            elif prompt_control.lora_specs_key(_want) != prompt_control.lora_specs_key(_have):
+                log(f"prompt requests {len(_want)} LoRA(s), merged set differs -> hot swap")
+                try:
+                    _sw_stats, _sw_secs, _sw_merge, _sw_put = swap_loras(_want)
+                    _lora_note.update(lora_swapped=True,
+                                      auto_swap_seconds=round(_sw_secs, 3),
+                                      auto_swap_merged=_sw_stats.get("merged"),
+                                      auto_swap_skipped=_sw_stats.get("skipped"))
+                    log(f"in-prompt LoRA swap: {_sw_secs:.2f}s "
+                        f"(merge {_sw_merge:.2f}s + put {_sw_put:.2f}s) "
+                        f"merged={_sw_stats.get('merged')}")
+                    if not _sw_stats.get("merged") and _want:
+                        log("WARNING: swap reported 0 merged targets; the prompt's "
+                            "LoRAs had no effect")
+                except Exception:
+                    log("in-prompt LoRA swap failed:\n" + traceback.format_exc())
+                    _lora_note["auto_swap_error"] = "swap failed; using previous weights"
+            else:
+                log(f"prompt requests {len(_want)} LoRA(s), already merged -> no swap")
+        BATCH = max(1, min(8, int(d.get("batch_count", 1) or 1)))
+        H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
+        OUT = d["out"]
+        PREV_EVERY = int(d.get("preview_every", 5) or 0)
+        # Compute the expected preview count up front and log it, so "off" is explicit in the
+        # server log rather than a silent truthiness fall-through (preview_every=0 and a
+        # missing/None value both mean "no previews", which is invisible to the client).
+        _pv_expected = sum(1 for _i in range(int(STEPS))
+                           if PREV_EVERY and ((_i + 1) % PREV_EVERY == 0 or _i == STEPS - 1))
+        log(f"preview_every={PREV_EVERY} -> {_pv_expected} VAE previews "
+            f"{'(OFF: no live preview will be written)' if not PREV_EVERY else ''}")
+        _MULT = 16
+        H0, W0 = int(H), int(W)
+        H = max(_MULT, int(round(H0 / _MULT)) * _MULT)
+        W = max(_MULT, int(round(W0 / _MULT)) * _MULT)
+        if (H, W) != (H0, W0):
+            log(f"requested {H0}x{W0} is not a multiple of {_MULT}; using {H}x{W} "
+                f"(VAE stride 8, patchify stride 2)")
+        _seed_req = int(SEED)
+        if _seed_req < 0:
+            SEED = int(np.random.default_rng().integers(0, 2**31 - 1 - 8))
+            log(f"seed {_seed_req} requested; using random seed {SEED}")
+        # Image k uses seed SEED + k, so any image of a batch can be reproduced on its own.
+        seeds = [int(SEED) + k for k in range(BATCH)]
+        try:
+            os.remove(SNAP_PATH)  # never let a client show the previous run's preview
+        except FileNotFoundError:
+            pass
+        g0 = time.perf_counter()
+
+        write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                   gen_id=gen_id, batch_total=BATCH)
+        # Prompt-control scheduling: every distinct state the schedule passes through is
+        # encoded once up front, then the denoise loop indexes the right one per step.
+        # All states share the same (1,512,1024) shape, so switching costs no recompile.
+        tags = d.get("tags") or None
+        style = d.get("prompt_style") or PROMPT_STYLE
+        seed_i = int(SEED) if int(SEED) >= 0 else 0
+        (pos_ctxs, pos_map, pos_plan), (neg_ctxs, neg_map, neg_plan) = encode_texts(
+            _p, _n, steps=STEPS, style=style, tags=tags, seed=seed_i)
+        if BATCH > 1:
+            pos_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in pos_ctxs]
+            neg_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in neg_ctxs]
+        prompt_states = max(len(pos_ctxs), len(neg_ctxs))
+        prompt_switches = [round(b, 3) for b in
+                           sorted(set(pos_plan["breakpoints"]) |
+                                  set(neg_plan["breakpoints"])) if 0 < b < 1]
+        write_prog(stage="text-encoded", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                   gen_id=gen_id, batch_total=BATCH,
+                   prompt_states=prompt_states, prompt_switches=prompt_switches)
+
+        sched = FlaxFlowMatchScheduler()
+        st = FlowMatchSchedulerState.create()
+        sigmas_raw = np.linspace(1.0, 1.0 / STEPS, STEPS).astype(np.float32)
+        st = sched.set_timesteps(st, sigmas=jnp.asarray(sigmas_raw))
+        timesteps = np.asarray(st.timesteps)
+        sigmas = np.asarray(st.sigmas[:-1])
+
+        # Validate the control combination before any encoding work, using the shared rules.
+        # Raises ControlModeError for regional+lllite and any three-way request, so no TPU
+        # time is spent preparing a run that cannot be honoured.
+        modes = resolve_control_modes(d)
+        write_prog(stage="modes", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                   gen_id=gen_id, batch_total=BATCH, note=f"mode {modes['mode']}")
+        # SnapRef: opt-in reference adapter. Absent/off keeps the plain path untouched.
+        _snap = d.get("snapref") or {}
+        snap_info = {}
+        if _snap and _snap.get("enabled", True) and (_snap.get("images") or []):
+            write_prog(stage="snapref", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding reference")
+            snap_info = prepare_snapref(_snap, (H, W))
+            _snap["_sizes"] = snap_info["sizes"]
+            _snap["_weights"] = snap_info["weights"]
+            snap_info.update(adapter=snap_info.get("adapter"), mode=snap_info.get("mode"),
+                             strength=float(_snap.get("strength", 0.0)),
+                             fidelity=float(_snap.get("fidelity", 1.0)),
+                             ref_in_uncond=bool(_snap.get("ref_in_uncond", False)),
+                             ref_guidance_on=bool(_snap.get("ref_guidance_on", False)),
+                             ref_guidance=float(_snap.get("ref_guidance", 4.5)))
+        else:
+            _SNAPREF_STATE["kv"] = None
+        # LLLite: opt-in pose / outline / regional control. Absent/off keeps the plain path.
+        _lllite = d.get("lllite") or {}
+        lllite_info = {}
+        if _lllite and _lllite.get("enabled", True) and _lllite.get("image") is not None:
+            write_prog(stage="lllite", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding control image")
+            _ll = get_lllite(_lllite.get("model"))
+            lllite_info = {
+                "w": _ll["w"],
+                "cond_emb": lllite_cond_emb(_ll, _lllite["image"], H, W,
+                                            aspect=_lllite.get("aspect", "letterbox")),
+                "aspect": _lllite.get("aspect", "letterbox"),
+                "strength": float(_lllite.get("strength", 1.0)),
+                "_base": float(_lllite.get("strength", 1.0)),
+                "start_percent": float(_lllite.get("start_percent", 0.0)),
+                "end_percent": float(_lllite.get("end_percent", 1.0)),
+                "model": os.path.basename(_ll["path"]),
+                "blocks": int(_ll["config"].block_count),
+            }
+            # SnapRef's predictor reads its own cfg dict, so hang LLLite off it when both
+            # are requested — one forward then applies pose control and the reference.
+            _snap["_lllite"] = lllite_info
+        regional_specs = d.get("regional") or d.get("regions") or []
+        regional_info = []
+        regional_schedule = (anima_regional.normalize_schedule(
+            regional_specs, maximum=16, common=d.get("common")) if regional_specs else [])
+        regional_active_key = None
+        regional_active = {}
+        if regional_specs:
+            write_prog(stage="regional-text", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts")
+            regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags,
+                                             int(SEED), _n, common=d.get("common"))
+            for _r in regional_info:
+                if BATCH > 1:
+                    _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]
+                    _r["neg_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["neg_ctxs"]]
+        # (B,512,1024), pad (B,1,H,W). The padding mask is concatenated channel-wise inside the
+        # transformer, so its batch dim must equal the latents' batch dim.
+        latents = jnp.asarray(np.concatenate(
+            [np.random.default_rng(s).standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)
+             for s in seeds], axis=0))
+        pad = jnp.zeros((BATCH, 1, H, W), dtype=jnp.float32)
+        # prompt_states / prompt_switches belong in `common` so every later record
+        # (denoise, done, error) carries them. Writing them only on the intermediate
+        # "text-encoded" record left the FINAL record with None, which is exactly the
+        # record the UI and the archive sidecar read.
+        common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id,
+                      batch_total=BATCH, prompt_states=prompt_states,
+                      prompt_switches=prompt_switches, **_lora_note)
+        public_info = {k: v for k, v in snap_info.items() if not str(k).startswith("_")}
+        common["snapref"] = public_info
+        if (BATCH, H, W) not in _tf_compiled:
+            log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
+            write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
+                       **common, **_pv_state())
+        # An interrupt is a file the client creates; checked every step so a stop
+        # lands within ~1 step (~0.5 s) instead of finishing the whole run.
+        try:
+            if os.path.exists(INTERRUPT_PATH):
+                os.remove(INTERRUPT_PATH)
+        except OSError:
+            pass
+
+        d0 = time.perf_counter()
+        prev_total = 0.0
+        first_s = 0.0
+        _interrupted = False
+        # Pixel decode needs the final timestep's (x_t, features), captured on the last step
+        # so nothing earlier in the loop changes. Pixel is the default decode path; the VAE
+        # is the fallback when no head resolves.
+        _want_pixel = (str(d.get("decode") or DECODE_MODE).strip().lower() == "pixel")
+        # Fraction of the schedule at which regional routing stops (1.0 = whole run).
+        try:
+            _reg_end = float(d.get("regional_end") or os.environ.get(
+                "ANIMA_REGIONAL_END_PERCENT") or 1.0)
+        except (TypeError, ValueError):
+            _reg_end = 1.0
+        _reg_end = min(1.0, max(0.0, _reg_end))
+        if _want_pixel:
+            # Resolve the head up front: a missing/!x1/RGBA head must degrade to the VAE
+            # instead of failing the run 20 steps in, and failing early keeps the error text
+            # in the log next to the request rather than inside the decode handler.
+            try:
+                get_pixel_head(d.get("pixel_head"))
+            except Exception as _pe:
+                log(f"pixel decode unavailable ({type(_pe).__name__}: {_pe}); "
+                    f"falling back to VAE")
+                _want_pixel = False
+        x_last = None
+        f_last = None
+        for i in range(STEPS):
+            if os.path.exists(INTERRUPT_PATH):
+                try:
+                    os.remove(INTERRUPT_PATH)
+                except OSError:
+                    pass
+                _interrupted = True
+                log(f"INTERRUPT at step {i}/{STEPS}; aborting before decode")
+                write_prog(stage="interrupted", step=i, steps=STEPS,
+                           **common, **_pv_state())
+                break
+            context = pos_ctxs[pos_map[i]]
+            neg_context = neg_ctxs[neg_map[i]]
+            # Regional routing can stop early: structural composition is decided in the
+            # first fraction of the schedule, so running per-region prediction to the last
+            # step is mostly wasted compute. `regional_end` (0..1) closes the window for
+            # regions that carry no schedule of their own; a region with an explicit
+            # start/end keeps it and is never shortened by this value.
+            # A regional set that fully tiles the canvas makes the base prediction
+            # algebraically redundant: the blend below cancels `pred` on every covered
+            # pixel, so running the base CFG pair is pure wasted compute. Decide before
+            # paying for it -- but only when coverage is genuinely complete.
+            _active_key = (anima_regional.active_indices(regional_schedule, i, STEPS, _reg_end)
+                           if regional_specs else ())
+            _skip_base = bool(
+                regional_specs and REGIONAL_FAST and _active_key
+                and anima_regional.full_coverage(
+                    [regional_schedule[x] for x in _active_key], H // 8, W // 8))
+            if lllite_info:
+                # Workflow semantics: the control is active only inside
+                # [start_percent, end_percent] of the schedule, expressed via sigma.
+                lllite_info["strength"] = (lllite_info["_base"]
+                                           if anima_lllite.active_at(
+                                               float(sigmas[i]), lllite_info["_base"],
+                                               lllite_info["start_percent"],
+                                               lllite_info["end_percent"])
+                                           else 0.0)
+            if _skip_base:
+                pred = None
+            elif snap_info:
+                pred = snapref_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                              context, neg_context, pad, GUIDANCE, _snap)
+            elif lllite_info:
+                pred = lllite_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                             context, neg_context, pad, GUIDANCE, lllite_info)
+            else:
+                pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                      context, neg_context, pad, GUIDANCE)
+            if regional_specs:
+                if _active_key != regional_active_key:
+                    _new_set = set(_active_key)
+                    _old_set = set(regional_active_key or ())
+                    _leaving = _old_set - _new_set
+                    _entering = _new_set - _old_set
+                    # Release only regions that just ended. Banks that remain active
+                    # across a transition keep their K/V and are not re-encoded.
+                    for _ri in _leaving:
+                        _old = regional_info[_ri]
+                        _old_snap = _old.get("snapcfg") or {}
+                        _old_snap.pop("_kv", None)
+                        _old_snap.pop("_sizes", None)
+                        _old_snap.pop("_weights", None)
+                        regional_active.pop(_ri, None)
+                    if _leaving:
+                        _SNAPREF_STATE["kv"] = None
+                        gc.collect()
+                    for _ri in sorted(_entering):
+                        _entry = regional_info[_ri]
+                        _snapcfg = _entry.get("snapcfg")
+                        if _snapcfg and _snapcfg.get("images"):
+                            _info = prepare_snapref(_snapcfg, (H, W))
+                            _snapcfg["_sizes"] = _info["sizes"]
+                            _snapcfg["_weights"] = _info["weights"]
+                        regional_active[_ri] = _entry
+                    regional_active_key = _active_key
+                    if _active_key:
+                        _tokens = sum(sum(x.get("snapcfg", {}).get("_sizes", []))
+                                      for x in regional_active.values())
+                        log(f"regional active at step {i+1}: regions {_active_key}; "
+                            f"{_tokens} ref tokens ({len(_entering)} entered, {len(_leaving)} released)")
+                _SNAPREF_STATE["kv"] = _snap.get("_kv")
+            if regional_active:
+                _reg_t = jnp.asarray(np.float32(timesteps[i]))
+                _has_base = pred is not None
+                _reg_delta = jnp.zeros(
+                    (latents.shape[0], latents.shape[1], latents.shape[2],
+                     H // 8, W // 8), dtype=jnp.float32)
+                _reg_mass = jnp.zeros((1, 1, 1, H // 8, W // 8), dtype=jnp.float32)
+                for _ri, _region in regional_active.items():
+                    _region["_step"] = i
+                    _mask_np = (anima_regional.mask_file_mask(_region, H // 8, W // 8, (H, W))
+                               if _region.get("mask") else
+                               anima_regional.box_mask(_region, H // 8, W // 8))
+                    _mask = jnp.asarray(_mask_np, dtype=jnp.float32)
+                    # With a base global SnapRef plus regional references, each region's cfg
+                    # uses its own cache. No reference state is retained after stage changes.
+                    _branch = regional_prediction(latents, _reg_t, pad, GUIDANCE, _region).astype(jnp.float32)
+                    # With a skipped base there is nothing to subtract from: sum the masked
+                    # branches and normalize, which is exactly what the base-containing
+                    # expression collapses to wherever coverage is complete.
+                    _reg_delta = _reg_delta + _mask * (
+                        _branch if not _has_base else (_branch - pred.astype(jnp.float32)))
+                    _reg_mass = _reg_mass + _mask
+                _blend = _reg_delta / jnp.maximum(_reg_mass, 1.0)
+                pred = _blend if not _has_base else pred.astype(jnp.float32) + _blend
+            sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
+            if _want_pixel and i == STEPS - 1:
+                x_last = latents
+                f_last = pixel_features(latents, jnp.asarray(np.float32(timesteps[i])),
+                                        context, neg_context, pad, GUIDANCE,
+                                        _snap if snap_info else None)
+            latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
+            latents.block_until_ready()
+            step_s = time.perf_counter() - d0 - prev_total
+            if i == 0:
+                first_s = step_s
+                _tf_compiled.add((BATCH, H, W))
+            # ms/step excludes step 1 (which carries any XLA compile) and preview decodes.
+            ms = round((step_s - first_s) / i * 1000.0, 1) if i > 0 else round(step_s * 1000.0, 1)
+            if i % 2 == 0 or i == STEPS - 1:
+                write_prog(stage="denoise", step=i + 1, ms_per_step=ms, guidance=GUIDANCE,
+                           **common, **_pv_state())
+            if PREV_EVERY and not prev_giveup and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
+                # A failed preview must never be silent: the old handler logged one line and
+                # carried on, so the UI showed snap=None forever behind a healthy status line
+                # and a normal "done". Every outcome is now counted and published to the
+                # progress JSON (preview_ok / preview_fails / preview_error / preview_gaveup).
+                # _pv_stage records which half failed, so a full disk or a PIL/grid error is
+                # not reported to the client as a VAE decode failure. Guessing it from the
+                # traceback text would mislabel it the moment a frame mentions "decode".
+                _pv_t0 = time.perf_counter()
+                _pv_stage = "decode"
+                try:
+                    if (H, W) not in _vae_compiled and (H, W) not in _vae_failed:
+                        write_prog(stage="compiling", step=i + 1, note=f"VAE decode {W}x{H}",
+                                   **common, **_pv_state())
+                    _imgs = decode_latents(latents)
+                    _pv_stage = "preview write"
+                    save_u8(make_grid_u8(_imgs), SNAP_PATH)
+                    _vae_compiled.add((H, W))
+                    # ALL preview wall time, success or failure, is charged to prev_total.
+                    # Otherwise a failed attempt's ~50s XLA compile lands in denoise_s and
+                    # inflates ms_per_step, the figure the perf docs quote.
+                    prev_total += time.perf_counter() - _pv_t0
+                    prev_ok += 1
+                    prev_fail = 0
+                    prev_err = ""      # a recovered preview must not keep reporting failure
+                    write_prog(stage="denoise", step=i + 1, preview_step=i + 1,
+                               preview_s=round(prev_total, 2), ms_per_step=ms,
+                               guidance=GUIDANCE, **common, **_pv_state())
+                except Exception as _e:
+                    prev_total += time.perf_counter() - _pv_t0
+                    prev_fail += 1
+                    prev_fails_total += 1
+                    prev_err = f"{type(_e).__name__}: {str(_e)[:200]}"
+                    _vae_failed.add((H, W))
+                    log(f"preview failed at step {i+1} during {_pv_stage} "
+                        f"({type(_e).__name__}): {_e}\n" + traceback.format_exc())
+                    if prev_fail >= 2:
+                        prev_giveup = True
+                        log(f"previews disabled after {prev_fail} consecutive failures; "
+                            f"denoise continues to completion")
+                    write_prog(stage="denoise", step=i + 1, ms_per_step=ms,
+                               guidance=GUIDANCE, **common, **_pv_state())
+        latents.block_until_ready()
+        if _interrupted:
+            # Skip the VAE decode entirely: the run was cancelled, so producing
+            # (and writing) an image would be misleading.
+            clear_snapref_runtime()
+            json.dump(_json_public({**d, "go": False, "status": "interrupted"}), open(REQ_PATH, "w"))
+            last_mtime = os.path.getmtime(REQ_PATH)
+            return False
+        denoise_s = time.perf_counter() - d0 - prev_total
+        write_prog(stage="decode", step=STEPS, **common, **_pv_state())
+        v0 = time.perf_counter()
+        if _want_pixel and x_last is not None and f_last is not None:
+            u8s = pixel_decode_images(f_last, x_last, d.get("pixel_head"))
+            decode_kind = "pixel"
+            log(f"pixel decode: {len(u8s)} image(s) via {os.path.basename(get_pixel_head(d.get('pixel_head'))[2]['path'])}")
+        else:
+            if _want_pixel:
+                log("pixel decode requested but no final-step capture; falling back to VAE")
+            u8s = decode_latents(latents)
+            _vae_compiled.add((H, W))
+            decode_kind = "vae"
+        stem, ext = os.path.splitext(OUT)
+        ext = ext or ".png"
+        if BATCH == 1:
+            images = [OUT]
+            save_u8(u8s[0], OUT)
+        else:
+            images = []
+            for k, u in enumerate(u8s, start=1):
+                per = f"{stem}_batch{k}{ext}"
+                save_u8(u, per)
+                images.append(per)
+            save_u8(make_grid_u8(u8s), OUT)
+            log(f"batch grid saved to {OUT}")
+        decode_s = time.perf_counter() - v0
+        total_s = time.perf_counter() - g0
+        log(f"GEN DONE {OUT} {H}x{W} batch {BATCH} seeds {seeds[0]}..{seeds[-1]} "
+            f"denoise {denoise_s:.1f}s decode {decode_s:.1f}s total {total_s:.1f}s")
+        write_prog(stage="done", step=STEPS, out=OUT, grid=OUT, images=images,
+                   elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
+                   decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(),
+                   decode_kind=decode_kind, **common, **_pv_state())
+        json.dump(_json_public({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}),
+                  open(REQ_PATH, "w"))
+        clear_snapref_runtime()
+    except Exception as _err:
+        clear_snapref_runtime()
+        log("gen raised:\n" + traceback.format_exc())
+        # The preview state must survive into the error record too: a run that OOMs during
+        # the final decode used to lose the fact that previews had already failed.
+        write_prog(stage="error", gen_id=gen_id, error=f"{type(_err).__name__}: {str(_err)[:300]}",
+                   **_pv_state())
+        try:
+            json.dump(_json_public({**d, "go": False, "status": "error"}), open(REQ_PATH, "w"))
+        except Exception:
+            pass
+    finally:
+        # Cleared on every exit path, including the interrupted `continue`.
+        _RUN_ACTIVE["on"] = False
+    return True
+
 def serve():
     """Watch for requests and handle them, one at a time, until the process dies."""
-    global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok
+    global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, last_mtime
     while True:
         _HEARTBEAT["t"] = time.time()
         try:
@@ -1536,467 +2004,8 @@ def serve():
         last_mtime = os.path.getmtime(REQ_PATH)
         # Tell the stall watchdog a run is in flight: a long denoise step is not a stall.
         _RUN_ACTIVE["on"] = True
-        try:
-            # One prompt, one negative, N images. Older clients sent lists: use the first entry.
-            _p = d.get("prompt", "")
-            if isinstance(_p, (list, tuple)):
-                _p = _p[0] if _p else ""
-            _n = d.get("negative_prompt", "")
-            if isinstance(_n, (list, tuple)):
-                _n = _n[0] if _n else ""
-
-            # --- in-prompt LoRA control: <lora:name:0.8> -------------------------
-            # Semantics:
-            #   * only the POSITIVE prompt is authoritative for which LoRAs are
-            #     merged; a tag in the negative prompt is stripped and otherwise
-            #     ignored, so it can never wipe the stack by accident;
-            #   * a positive prompt with no tags leaves the weights alone, so the
-            #     Gradio panel's applied LoRAs survive an ordinary prompt;
-            #   * `<lora:none>` is the explicit way back to the bare base;
-            #   * if tags resolve to nothing at all (every name is a typo), the
-            #     current merge is KEPT and the names are reported -- clearing the
-            #     stack because of a typo would be destructive and silent.
-            # Tags are always stripped from both prompts: leaving them in would
-            # feed the encoder literal "<lora:...>" tokens.
-            _lora_note = {}
-            _tags_pos = "<lora:" in (_p or "").lower()
-            _tags_neg = "<lora:" in (_n or "").lower()
-            if _tags_neg:
-                _n = prompt_control.strip_lora_tags(_n)[0]
-            if _tags_pos:
-                _parsed = prompt_control.parse_lora_tags(_p, installed_lora_files())
-                _p = _parsed["clean"]
-                _want = _parsed["specs"]
-                _have = [(str(a), float(b)) for a, b in (globals().get("_LORA_SPECS") or [])]
-                _lora_note = {"lora_requested": [{"path": a, "scale": b} for a, b in _want],
-                              "lora_unresolved": _parsed["unresolved"],
-                              "lora_ignored_clip": _parsed["ignored_clip"],
-                              "lora_clamped": _parsed["clamped"],
-                              "lora_cleared": bool(_parsed.get("clear")),
-                              "lora_swapped": False}
-                if _parsed["unresolved"]:
-                    log("WARNING: prompt names LoRA(s) that are not installed: "
-                        + ", ".join(_parsed["unresolved"])
-                        + f" (searched {', '.join(LORA_DIRS)})")
-                _skip = (not _want and not _parsed.get("clear") and _parsed["unresolved"])
-                if _skip:
-                    log("prompt named only unknown LoRAs -> keeping the current merge")
-                    _lora_note["lora_skipped_reason"] = "no named LoRA is installed"
-                elif prompt_control.lora_specs_key(_want) != prompt_control.lora_specs_key(_have):
-                    log(f"prompt requests {len(_want)} LoRA(s), merged set differs -> hot swap")
-                    try:
-                        _sw_stats, _sw_secs, _sw_merge, _sw_put = swap_loras(_want)
-                        _lora_note.update(lora_swapped=True,
-                                          auto_swap_seconds=round(_sw_secs, 3),
-                                          auto_swap_merged=_sw_stats.get("merged"),
-                                          auto_swap_skipped=_sw_stats.get("skipped"))
-                        log(f"in-prompt LoRA swap: {_sw_secs:.2f}s "
-                            f"(merge {_sw_merge:.2f}s + put {_sw_put:.2f}s) "
-                            f"merged={_sw_stats.get('merged')}")
-                        if not _sw_stats.get("merged") and _want:
-                            log("WARNING: swap reported 0 merged targets; the prompt's "
-                                "LoRAs had no effect")
-                    except Exception:
-                        log("in-prompt LoRA swap failed:\n" + traceback.format_exc())
-                        _lora_note["auto_swap_error"] = "swap failed; using previous weights"
-                else:
-                    log(f"prompt requests {len(_want)} LoRA(s), already merged -> no swap")
-            BATCH = max(1, min(8, int(d.get("batch_count", 1) or 1)))
-            H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
-            OUT = d["out"]
-            PREV_EVERY = int(d.get("preview_every", 5) or 0)
-            # Compute the expected preview count up front and log it, so "off" is explicit in the
-            # server log rather than a silent truthiness fall-through (preview_every=0 and a
-            # missing/None value both mean "no previews", which is invisible to the client).
-            _pv_expected = sum(1 for _i in range(int(STEPS))
-                               if PREV_EVERY and ((_i + 1) % PREV_EVERY == 0 or _i == STEPS - 1))
-            log(f"preview_every={PREV_EVERY} -> {_pv_expected} VAE previews "
-                f"{'(OFF: no live preview will be written)' if not PREV_EVERY else ''}")
-            _MULT = 16
-            H0, W0 = int(H), int(W)
-            H = max(_MULT, int(round(H0 / _MULT)) * _MULT)
-            W = max(_MULT, int(round(W0 / _MULT)) * _MULT)
-            if (H, W) != (H0, W0):
-                log(f"requested {H0}x{W0} is not a multiple of {_MULT}; using {H}x{W} "
-                    f"(VAE stride 8, patchify stride 2)")
-            _seed_req = int(SEED)
-            if _seed_req < 0:
-                SEED = int(np.random.default_rng().integers(0, 2**31 - 1 - 8))
-                log(f"seed {_seed_req} requested; using random seed {SEED}")
-            # Image k uses seed SEED + k, so any image of a batch can be reproduced on its own.
-            seeds = [int(SEED) + k for k in range(BATCH)]
-            try:
-                os.remove(SNAP_PATH)  # never let a client show the previous run's preview
-            except FileNotFoundError:
-                pass
-            g0 = time.perf_counter()
-
-            write_prog(stage="text-encoding", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                       gen_id=gen_id, batch_total=BATCH)
-            # Prompt-control scheduling: every distinct state the schedule passes through is
-            # encoded once up front, then the denoise loop indexes the right one per step.
-            # All states share the same (1,512,1024) shape, so switching costs no recompile.
-            tags = d.get("tags") or None
-            style = d.get("prompt_style") or PROMPT_STYLE
-            seed_i = int(SEED) if int(SEED) >= 0 else 0
-            (pos_ctxs, pos_map, pos_plan), (neg_ctxs, neg_map, neg_plan) = encode_texts(
-                _p, _n, steps=STEPS, style=style, tags=tags, seed=seed_i)
-            if BATCH > 1:
-                pos_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in pos_ctxs]
-                neg_ctxs = [jnp.repeat(c, BATCH, axis=0) for c in neg_ctxs]
-            prompt_states = max(len(pos_ctxs), len(neg_ctxs))
-            prompt_switches = [round(b, 3) for b in
-                               sorted(set(pos_plan["breakpoints"]) |
-                                      set(neg_plan["breakpoints"])) if 0 < b < 1]
-            write_prog(stage="text-encoded", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                       gen_id=gen_id, batch_total=BATCH,
-                       prompt_states=prompt_states, prompt_switches=prompt_switches)
-
-            sched = FlaxFlowMatchScheduler()
-            st = FlowMatchSchedulerState.create()
-            sigmas_raw = np.linspace(1.0, 1.0 / STEPS, STEPS).astype(np.float32)
-            st = sched.set_timesteps(st, sigmas=jnp.asarray(sigmas_raw))
-            timesteps = np.asarray(st.timesteps)
-            sigmas = np.asarray(st.sigmas[:-1])
-
-            # Validate the control combination before any encoding work, using the shared rules.
-            # Raises ControlModeError for regional+lllite and any three-way request, so no TPU
-            # time is spent preparing a run that cannot be honoured.
-            modes = resolve_control_modes(d)
-            write_prog(stage="modes", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                       gen_id=gen_id, batch_total=BATCH, note=f"mode {modes['mode']}")
-            # SnapRef: opt-in reference adapter. Absent/off keeps the plain path untouched.
-            _snap = d.get("snapref") or {}
-            snap_info = {}
-            if _snap and _snap.get("enabled", True) and (_snap.get("images") or []):
-                write_prog(stage="snapref", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                           gen_id=gen_id, batch_total=BATCH, note="encoding reference")
-                snap_info = prepare_snapref(_snap, (H, W))
-                _snap["_sizes"] = snap_info["sizes"]
-                _snap["_weights"] = snap_info["weights"]
-                snap_info.update(adapter=snap_info.get("adapter"), mode=snap_info.get("mode"),
-                                 strength=float(_snap.get("strength", 0.0)),
-                                 fidelity=float(_snap.get("fidelity", 1.0)),
-                                 ref_in_uncond=bool(_snap.get("ref_in_uncond", False)),
-                                 ref_guidance_on=bool(_snap.get("ref_guidance_on", False)),
-                                 ref_guidance=float(_snap.get("ref_guidance", 4.5)))
-            else:
-                _SNAPREF_STATE["kv"] = None
-            # LLLite: opt-in pose / outline / regional control. Absent/off keeps the plain path.
-            _lllite = d.get("lllite") or {}
-            lllite_info = {}
-            if _lllite and _lllite.get("enabled", True) and _lllite.get("image") is not None:
-                write_prog(stage="lllite", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                           gen_id=gen_id, batch_total=BATCH, note="encoding control image")
-                _ll = get_lllite(_lllite.get("model"))
-                lllite_info = {
-                    "w": _ll["w"],
-                    "cond_emb": lllite_cond_emb(_ll, _lllite["image"], H, W,
-                                                aspect=_lllite.get("aspect", "letterbox")),
-                    "aspect": _lllite.get("aspect", "letterbox"),
-                    "strength": float(_lllite.get("strength", 1.0)),
-                    "_base": float(_lllite.get("strength", 1.0)),
-                    "start_percent": float(_lllite.get("start_percent", 0.0)),
-                    "end_percent": float(_lllite.get("end_percent", 1.0)),
-                    "model": os.path.basename(_ll["path"]),
-                    "blocks": int(_ll["config"].block_count),
-                }
-                # SnapRef's predictor reads its own cfg dict, so hang LLLite off it when both
-                # are requested — one forward then applies pose control and the reference.
-                _snap["_lllite"] = lllite_info
-            regional_specs = d.get("regional") or d.get("regions") or []
-            regional_info = []
-            regional_schedule = (anima_regional.normalize_schedule(
-                regional_specs, maximum=16, common=d.get("common")) if regional_specs else [])
-            regional_active_key = None
-            regional_active = {}
-            if regional_specs:
-                write_prog(stage="regional-text", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
-                           gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts")
-                regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags,
-                                                 int(SEED), _n, common=d.get("common"))
-                for _r in regional_info:
-                    if BATCH > 1:
-                        _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]
-                        _r["neg_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["neg_ctxs"]]
-            # (B,512,1024), pad (B,1,H,W). The padding mask is concatenated channel-wise inside the
-            # transformer, so its batch dim must equal the latents' batch dim.
-            latents = jnp.asarray(np.concatenate(
-                [np.random.default_rng(s).standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32)
-                 for s in seeds], axis=0))
-            pad = jnp.zeros((BATCH, 1, H, W), dtype=jnp.float32)
-            # prompt_states / prompt_switches belong in `common` so every later record
-            # (denoise, done, error) carries them. Writing them only on the intermediate
-            # "text-encoded" record left the FINAL record with None, which is exactly the
-            # record the UI and the archive sidecar read.
-            common = dict(steps=STEPS, seed=int(SEED), seeds=seeds, gen_id=gen_id,
-                          batch_total=BATCH, prompt_states=prompt_states,
-                          prompt_switches=prompt_switches, **_lora_note)
-            public_info = {k: v for k, v in snap_info.items() if not str(k).startswith("_")}
-            common["snapref"] = public_info
-            if (BATCH, H, W) not in _tf_compiled:
-                log(f"new transformer shape batch={BATCH} {H}x{W}: XLA compile on first step")
-                write_prog(stage="compiling", step=0, note=f"transformer {BATCH}x{W}x{H}",
-                           **common, **_pv_state())
-            # An interrupt is a file the client creates; checked every step so a stop
-            # lands within ~1 step (~0.5 s) instead of finishing the whole run.
-            try:
-                if os.path.exists(INTERRUPT_PATH):
-                    os.remove(INTERRUPT_PATH)
-            except OSError:
-                pass
-
-            d0 = time.perf_counter()
-            prev_total = 0.0
-            first_s = 0.0
-            _interrupted = False
-            # Pixel decode needs the final timestep's (x_t, features), captured on the last step
-            # so nothing earlier in the loop changes. Pixel is the default decode path; the VAE
-            # is the fallback when no head resolves.
-            _want_pixel = (str(d.get("decode") or DECODE_MODE).strip().lower() == "pixel")
-            # Fraction of the schedule at which regional routing stops (1.0 = whole run).
-            try:
-                _reg_end = float(d.get("regional_end") or os.environ.get(
-                    "ANIMA_REGIONAL_END_PERCENT") or 1.0)
-            except (TypeError, ValueError):
-                _reg_end = 1.0
-            _reg_end = min(1.0, max(0.0, _reg_end))
-            if _want_pixel:
-                # Resolve the head up front: a missing/!x1/RGBA head must degrade to the VAE
-                # instead of failing the run 20 steps in, and failing early keeps the error text
-                # in the log next to the request rather than inside the decode handler.
-                try:
-                    get_pixel_head(d.get("pixel_head"))
-                except Exception as _pe:
-                    log(f"pixel decode unavailable ({type(_pe).__name__}: {_pe}); "
-                        f"falling back to VAE")
-                    _want_pixel = False
-            x_last = None
-            f_last = None
-            for i in range(STEPS):
-                if os.path.exists(INTERRUPT_PATH):
-                    try:
-                        os.remove(INTERRUPT_PATH)
-                    except OSError:
-                        pass
-                    _interrupted = True
-                    log(f"INTERRUPT at step {i}/{STEPS}; aborting before decode")
-                    write_prog(stage="interrupted", step=i, steps=STEPS,
-                               **common, **_pv_state())
-                    break
-                context = pos_ctxs[pos_map[i]]
-                neg_context = neg_ctxs[neg_map[i]]
-                # Regional routing can stop early: structural composition is decided in the
-                # first fraction of the schedule, so running per-region prediction to the last
-                # step is mostly wasted compute. `regional_end` (0..1) closes the window for
-                # regions that carry no schedule of their own; a region with an explicit
-                # start/end keeps it and is never shortened by this value.
-                # A regional set that fully tiles the canvas makes the base prediction
-                # algebraically redundant: the blend below cancels `pred` on every covered
-                # pixel, so running the base CFG pair is pure wasted compute. Decide before
-                # paying for it -- but only when coverage is genuinely complete.
-                _active_key = (anima_regional.active_indices(regional_schedule, i, STEPS, _reg_end)
-                               if regional_specs else ())
-                _skip_base = bool(
-                    regional_specs and REGIONAL_FAST and _active_key
-                    and anima_regional.full_coverage(
-                        [regional_schedule[x] for x in _active_key], H // 8, W // 8))
-                if lllite_info:
-                    # Workflow semantics: the control is active only inside
-                    # [start_percent, end_percent] of the schedule, expressed via sigma.
-                    lllite_info["strength"] = (lllite_info["_base"]
-                                               if anima_lllite.active_at(
-                                                   float(sigmas[i]), lllite_info["_base"],
-                                                   lllite_info["start_percent"],
-                                                   lllite_info["end_percent"])
-                                               else 0.0)
-                if _skip_base:
-                    pred = None
-                elif snap_info:
-                    pred = snapref_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
-                                                  context, neg_context, pad, GUIDANCE, _snap)
-                elif lllite_info:
-                    pred = lllite_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
-                                                 context, neg_context, pad, GUIDANCE, lllite_info)
-                else:
-                    pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
-                                          context, neg_context, pad, GUIDANCE)
-                if regional_specs:
-                    if _active_key != regional_active_key:
-                        _new_set = set(_active_key)
-                        _old_set = set(regional_active_key or ())
-                        _leaving = _old_set - _new_set
-                        _entering = _new_set - _old_set
-                        # Release only regions that just ended. Banks that remain active
-                        # across a transition keep their K/V and are not re-encoded.
-                        for _ri in _leaving:
-                            _old = regional_info[_ri]
-                            _old_snap = _old.get("snapcfg") or {}
-                            _old_snap.pop("_kv", None)
-                            _old_snap.pop("_sizes", None)
-                            _old_snap.pop("_weights", None)
-                            regional_active.pop(_ri, None)
-                        if _leaving:
-                            _SNAPREF_STATE["kv"] = None
-                            gc.collect()
-                        for _ri in sorted(_entering):
-                            _entry = regional_info[_ri]
-                            _snapcfg = _entry.get("snapcfg")
-                            if _snapcfg and _snapcfg.get("images"):
-                                _info = prepare_snapref(_snapcfg, (H, W))
-                                _snapcfg["_sizes"] = _info["sizes"]
-                                _snapcfg["_weights"] = _info["weights"]
-                            regional_active[_ri] = _entry
-                        regional_active_key = _active_key
-                        if _active_key:
-                            _tokens = sum(sum(x.get("snapcfg", {}).get("_sizes", []))
-                                          for x in regional_active.values())
-                            log(f"regional active at step {i+1}: regions {_active_key}; "
-                                f"{_tokens} ref tokens ({len(_entering)} entered, {len(_leaving)} released)")
-                    _SNAPREF_STATE["kv"] = _snap.get("_kv")
-                if regional_active:
-                    _reg_t = jnp.asarray(np.float32(timesteps[i]))
-                    _has_base = pred is not None
-                    _reg_delta = jnp.zeros(
-                        (latents.shape[0], latents.shape[1], latents.shape[2],
-                         H // 8, W // 8), dtype=jnp.float32)
-                    _reg_mass = jnp.zeros((1, 1, 1, H // 8, W // 8), dtype=jnp.float32)
-                    for _ri, _region in regional_active.items():
-                        _region["_step"] = i
-                        _mask_np = (anima_regional.mask_file_mask(_region, H // 8, W // 8, (H, W))
-                                   if _region.get("mask") else
-                                   anima_regional.box_mask(_region, H // 8, W // 8))
-                        _mask = jnp.asarray(_mask_np, dtype=jnp.float32)
-                        # With a base global SnapRef plus regional references, each region's cfg
-                        # uses its own cache. No reference state is retained after stage changes.
-                        _branch = regional_prediction(latents, _reg_t, pad, GUIDANCE, _region).astype(jnp.float32)
-                        # With a skipped base there is nothing to subtract from: sum the masked
-                        # branches and normalize, which is exactly what the base-containing
-                        # expression collapses to wherever coverage is complete.
-                        _reg_delta = _reg_delta + _mask * (
-                            _branch if not _has_base else (_branch - pred.astype(jnp.float32)))
-                        _reg_mass = _reg_mass + _mask
-                    _blend = _reg_delta / jnp.maximum(_reg_mass, 1.0)
-                    pred = _blend if not _has_base else pred.astype(jnp.float32) + _blend
-                sigma_next = sigmas[i + 1] if i + 1 < STEPS else 0.0
-                if _want_pixel and i == STEPS - 1:
-                    x_last = latents
-                    f_last = pixel_features(latents, jnp.asarray(np.float32(timesteps[i])),
-                                            context, neg_context, pad, GUIDANCE,
-                                            _snap if snap_info else None)
-                latents = latents + (jnp.asarray(np.float32(sigma_next - sigmas[i]))) * pred
-                latents.block_until_ready()
-                step_s = time.perf_counter() - d0 - prev_total
-                if i == 0:
-                    first_s = step_s
-                    _tf_compiled.add((BATCH, H, W))
-                # ms/step excludes step 1 (which carries any XLA compile) and preview decodes.
-                ms = round((step_s - first_s) / i * 1000.0, 1) if i > 0 else round(step_s * 1000.0, 1)
-                if i % 2 == 0 or i == STEPS - 1:
-                    write_prog(stage="denoise", step=i + 1, ms_per_step=ms, guidance=GUIDANCE,
-                               **common, **_pv_state())
-                if PREV_EVERY and not prev_giveup and ((i + 1) % PREV_EVERY == 0 or i == STEPS - 1):
-                    # A failed preview must never be silent: the old handler logged one line and
-                    # carried on, so the UI showed snap=None forever behind a healthy status line
-                    # and a normal "done". Every outcome is now counted and published to the
-                    # progress JSON (preview_ok / preview_fails / preview_error / preview_gaveup).
-                    # _pv_stage records which half failed, so a full disk or a PIL/grid error is
-                    # not reported to the client as a VAE decode failure. Guessing it from the
-                    # traceback text would mislabel it the moment a frame mentions "decode".
-                    _pv_t0 = time.perf_counter()
-                    _pv_stage = "decode"
-                    try:
-                        if (H, W) not in _vae_compiled and (H, W) not in _vae_failed:
-                            write_prog(stage="compiling", step=i + 1, note=f"VAE decode {W}x{H}",
-                                       **common, **_pv_state())
-                        _imgs = decode_latents(latents)
-                        _pv_stage = "preview write"
-                        save_u8(make_grid_u8(_imgs), SNAP_PATH)
-                        _vae_compiled.add((H, W))
-                        # ALL preview wall time, success or failure, is charged to prev_total.
-                        # Otherwise a failed attempt's ~50s XLA compile lands in denoise_s and
-                        # inflates ms_per_step, the figure the perf docs quote.
-                        prev_total += time.perf_counter() - _pv_t0
-                        prev_ok += 1
-                        prev_fail = 0
-                        prev_err = ""      # a recovered preview must not keep reporting failure
-                        write_prog(stage="denoise", step=i + 1, preview_step=i + 1,
-                                   preview_s=round(prev_total, 2), ms_per_step=ms,
-                                   guidance=GUIDANCE, **common, **_pv_state())
-                    except Exception as _e:
-                        prev_total += time.perf_counter() - _pv_t0
-                        prev_fail += 1
-                        prev_fails_total += 1
-                        prev_err = f"{type(_e).__name__}: {str(_e)[:200]}"
-                        _vae_failed.add((H, W))
-                        log(f"preview failed at step {i+1} during {_pv_stage} "
-                            f"({type(_e).__name__}): {_e}\n" + traceback.format_exc())
-                        if prev_fail >= 2:
-                            prev_giveup = True
-                            log(f"previews disabled after {prev_fail} consecutive failures; "
-                                f"denoise continues to completion")
-                        write_prog(stage="denoise", step=i + 1, ms_per_step=ms,
-                                   guidance=GUIDANCE, **common, **_pv_state())
-            latents.block_until_ready()
-            if _interrupted:
-                # Skip the VAE decode entirely: the run was cancelled, so producing
-                # (and writing) an image would be misleading.
-                clear_snapref_runtime()
-                json.dump(_json_public({**d, "go": False, "status": "interrupted"}), open(REQ_PATH, "w"))
-                last_mtime = os.path.getmtime(REQ_PATH)
-                continue
-            denoise_s = time.perf_counter() - d0 - prev_total
-            write_prog(stage="decode", step=STEPS, **common, **_pv_state())
-            v0 = time.perf_counter()
-            if _want_pixel and x_last is not None and f_last is not None:
-                u8s = pixel_decode_images(f_last, x_last, d.get("pixel_head"))
-                decode_kind = "pixel"
-                log(f"pixel decode: {len(u8s)} image(s) via {os.path.basename(get_pixel_head(d.get('pixel_head'))[2]['path'])}")
-            else:
-                if _want_pixel:
-                    log("pixel decode requested but no final-step capture; falling back to VAE")
-                u8s = decode_latents(latents)
-                _vae_compiled.add((H, W))
-                decode_kind = "vae"
-            stem, ext = os.path.splitext(OUT)
-            ext = ext or ".png"
-            if BATCH == 1:
-                images = [OUT]
-                save_u8(u8s[0], OUT)
-            else:
-                images = []
-                for k, u in enumerate(u8s, start=1):
-                    per = f"{stem}_batch{k}{ext}"
-                    save_u8(u, per)
-                    images.append(per)
-                save_u8(make_grid_u8(u8s), OUT)
-                log(f"batch grid saved to {OUT}")
-            decode_s = time.perf_counter() - v0
-            total_s = time.perf_counter() - g0
-            log(f"GEN DONE {OUT} {H}x{W} batch {BATCH} seeds {seeds[0]}..{seeds[-1]} "
-                f"denoise {denoise_s:.1f}s decode {decode_s:.1f}s total {total_s:.1f}s")
-            write_prog(stage="done", step=STEPS, out=OUT, grid=OUT, images=images,
-                       elapsed_s=round(total_s, 1), denoise_s=round(denoise_s, 1),
-                       decode_s=round(decode_s, 1), height=H, width=W, hbm=hbm_stats(),
-                       decode_kind=decode_kind, **common, **_pv_state())
-            json.dump(_json_public({**d, "go": False, "status": "done", "elapsed_s": round(total_s, 1)}),
-                      open(REQ_PATH, "w"))
-            clear_snapref_runtime()
-        except Exception as _err:
-            clear_snapref_runtime()
-            log("gen raised:\n" + traceback.format_exc())
-            # The preview state must survive into the error record too: a run that OOMs during
-            # the final decode used to lose the fact that previews had already failed.
-            write_prog(stage="error", gen_id=gen_id, error=f"{type(_err).__name__}: {str(_err)[:300]}",
-                       **_pv_state())
-            try:
-                json.dump(_json_public({**d, "go": False, "status": "error"}), open(REQ_PATH, "w"))
-            except Exception:
-                pass
-        finally:
-            # Cleared on every exit path, including the interrupted `continue`.
-            _RUN_ACTIVE["on"] = False
-        last_mtime = os.path.getmtime(REQ_PATH)
+        if handle_request(d, gen_id):
+            last_mtime = os.path.getmtime(REQ_PATH)
 
 
 serve()
