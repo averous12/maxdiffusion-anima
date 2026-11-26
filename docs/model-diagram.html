@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; color: var(--foreground); font-size: 13px; line-height: 1.45; }
+  h3 { margin: 14px 0 8px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+       color: var(--muted-foreground); font-weight: 600; }
+  h3:first-child { margin-top: 0; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+          background: var(--card); flex: 1 1 260px; min-width: 240px; }
+  .card .name { font-weight: 650; font-size: 13px; }
+  .card .path { font-family: ui-monospace, monospace; font-size: 11px;
+                color: var(--muted-foreground); margin-bottom: 8px; word-break: break-all; }
+  .mode { display: flex; justify-content: space-between; align-items: baseline;
+          padding: 2px 0; font-size: 12px; }
+  .mode span:last-child { font-family: ui-monospace, monospace; font-size: 11px; }
+  .yes { color: #2ea043; font-weight: 700; }
+  .no  { color: #d1242f; font-weight: 700; }
+  .nul { color: var(--muted-foreground); opacity: .65; }
+  .flow { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+  .step { border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px;
+          background: var(--card); min-width: 118px; flex: 0 0 auto; }
+  .step .t { font-weight: 620; font-size: 12px; }
+  .step .s { font-size: 10.5px; color: var(--muted-foreground); margin-top: 3px; }
+  .arw { display: flex; align-items: center; padding: 0 7px; color: var(--accent);
+         font-size: 15px; font-weight: 700; flex: 0 0 auto; }
+  .block { border: 1.5px dashed var(--accent); border-radius: 9px; padding: 9px 10px;
+           margin: 8px 0; background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .block .hd { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em;
+               color: var(--accent); font-weight: 700; margin-bottom: 6px; }
+  .layers { display: flex; flex-direction: column; gap: 5px; }
+  .layer { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .layer .lbl { font-family: ui-monospace, monospace; font-size: 11px;
+                min-width: 92px; color: var(--foreground); }
+  .hook { font-size: 10.5px; padding: 1.5px 6px; border-radius: 20px;
+          border: 1px solid var(--border); white-space: nowrap; }
+  .h-lora { border-color: #8250df; color: #8250df; }
+  .h-snap { border-color: #0969da; color: #0969da; }
+  .h-lll  { border-color: #bf6a02; color: #bf6a02; }
+  .h-reg  { border-color: #1a7f37; color: #1a7f37; }
+  table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+  td, th { text-align: left; padding: 3px 8px 3px 0; vertical-align: top;
+           border-bottom: 1px solid var(--border); }
+  th { color: var(--muted-foreground); font-weight: 600; font-size: 10.5px;
+       text-transform: uppercase; letter-spacing: .05em; }
+  .num { font-family: ui-monospace, monospace; white-space: nowrap; }
+  .ok  { color: #2ea043; }
+  .amb { color: #bf6a02; }
+  .note { font-size: 11px; color: var(--muted-foreground); margin-top: 8px; }
+</style>
+</head>
+<body>
+
+<h3>Two runtimes — different scope</h3>
+<div class="row">
+  <div class="card">
+    <div class="name">Server <span class="yes">← all six modes</span></div>
+    <div class="path">scripts/anima_aesthetic_server.py · 1994 L</div>
+    <div class="mode"><span>plain</span><span class="yes">yes</span></div>
+    <div class="mode"><span>regional</span><span class="yes">yes</span></div>
+    <div class="mode"><span>snapref</span><span class="yes">yes</span></div>
+    <div class="mode"><span>lllite</span><span class="yes">yes</span></div>
+    <div class="mode"><span>regional + snapref</span><span class="yes">yes</span></div>
+    <div class="mode"><span>lllite + snapref</span><span class="yes">yes</span></div>
+    <div class="mode"><span>regional + lllite</span><span class="no">refused</span></div>
+  </div>
+  <div class="card">
+    <div class="name">TPU driver <span class="amb">← validation only</span></div>
+    <div class="path">scripts/anima_aesthetic_tpu.py · 312 L</div>
+    <div class="mode"><span>plain</span><span class="yes">yes</span></div>
+    <div class="mode"><span>regional</span><span class="no">no</span></div>
+    <div class="mode"><span>snapref</span><span class="no">no</span></div>
+    <div class="mode"><span>lllite</span><span class="yes">yes</span></div>
+    <div class="mode"><span>regional + snapref</span><span class="no">no</span></div>
+    <div class="mode"><span>lllite + snapref</span><span class="no">no</span></div>
+    <div class="mode"><span>regional + lllite</span><span class="nul">n/a</span></div>
+  </div>
+</div>
+
+<h3>Pipeline — where each feature hooks in</h3>
+<div class="flow">
+  <div class="step"><div class="t">prompt</div><div class="s">+ negative, CFG 4.0</div></div>
+  <div class="arw">→</div>
+  <div class="step"><div class="t">text conditioner</div><div class="s">Qwen · 512×1024</div></div>
+  <div class="arw">→</div>
+  <div class="step"><div class="t">LLLite conditioner</div><div class="s">letterbox → 4096 tok</div></div>
+  <div class="arw">→</div>
+  <div class="step" style="min-width:auto"><div class="t">transformer</div><div class="s">28 blocks, nn.scan</div></div>
+  <div class="arw">→</div>
+  <div class="step"><div class="t">VAE decode</div><div class="s">1024×1024</div></div>
+</div>
+
+<div class="block">
+  <div class="hd">_Block — one compiled body, looped 28× (never unrolled)</div>
+  <div class="layers">
+    <div class="layer"><span class="lbl">norm1 → attn1</span>
+      <span class="hook h-lora">LoRA</span>
+      <span class="hook h-snap">SnapRef kv + bias</span>
+      <span class="hook h-lll">LLLite q/k/v inputs</span>
+    </div>
+    <div class="layer"><span class="lbl">norm2 → attn2</span>
+      <span class="hook h-lora">LoRA</span>
+      <span class="hook h-reg">regional masks</span>
+    </div>
+    <div class="layer"><span class="lbl">norm3 → MLP</span>
+      <span class="hook h-lora">LoRA</span>
+      <span class="hook h-lll">LLLite mlp_layer1</span>
+    </div>
+  </div>
+</div>
+<div class="note">
+  LLLite edits the <b>inputs</b> to q/k/v, not the projections' output — matching
+  <span class="num">predict2.py:160-179</span>. Its per-layer weights ride <b>nn.scan</b> as a
+  scan input with a leading layer axis, the same idiom as SnapRef's LoRA tree, so enabling
+  control costs <span class="num">+21%</span> per step instead of unrolling all 28 blocks.
+</div>
+
+<h3>Evidence</h3>
+<table>
+  <tr><th>Claim</th><th>Measured</th><th>Status</th></tr>
+  <tr><td>LLLite vs ComfyUI reference</td><td class="num">2.742e-06 abs · 828 tensors, 0 missing</td><td class="ok">proven</td></tr>
+  <tr><td>scan ≡ per-layer loop</td><td class="num">1.144e-05</td><td class="ok">proven</td></tr>
+  <tr><td>strength 0 inert</td><td class="num">0.000e+00</td><td class="ok">proven</td></tr>
+  <tr><td>full 28-layer forward</td><td class="num">3.41e-02 / 6.82e-02 / 1.36e-01</td><td class="ok">proven</td></tr>
+  <tr><td>LLLite step cost on TPU</td><td class="num">2303–2341 vs 1896 ms</td><td class="ok">proven</td></tr>
+  <tr><td>control changes image</td><td class="num">643,837 px differ</td><td class="ok">proven</td></tr>
+  <tr><td>letterbox keeps aspect</td><td class="num">1.724 vs 1.720 true</td><td class="ok">proven</td></tr>
+  <tr><td><b>pose adherence</b></td><td class="num">—</td><td class="amb">unproven</td></tr>
+  <tr><td>outline / regional checkpoints e2e</td><td class="num">parity only</td><td class="amb">unproven</td></tr>
+  <tr><td>lllite + snapref in one pass</td><td class="num">jit exists, untested</td><td class="amb">unproven</td></tr>
+  <tr><td>SnapRef / regional on TPU</td><td class="num">0 refs in driver</td><td class="amb">blocked</td></tr>
+</table>
+
+<div class="note">
+  <b>Known issue:</b> <span class="num">adapter_block_map</span> assumes an iterable and raises
+  <span class="num">TypeError</span> on a scalar layer count
+  (<span class="num">anima_snapref_flax.py:65</span>).
+</div>
+
+</body>
+</html>
