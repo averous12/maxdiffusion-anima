@@ -48,9 +48,10 @@ from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
 PROMPT = "masterpiece, best quality, 1girl, fern (sousou no frieren), sousou no frieren, @izei1337, purple hair, black robe, lips, sidelocks, feet out of frame, very long hair, puffy sleeves, white dress, butterfly on hand, eyelashes, simple background, closed mouth, mage staff, arm at side, straight hair, blush, solo, purple eyes, chromatic aberration, purple pupils, looking at viewer, hand up, standing, bug, robe, black background, signature, bright pupils, black coat, coat, long sleeves, blue butterfly, upturned eyes, wide sleeves, blunt bangs, from above, dress, blunt ends, long hair, purple butterfly, butterfly, tsurime, half updo"
+PROMPT = os.environ.get("ANIMA_PROMPT") or PROMPT  # env override; avoids a forked copy
 NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts"
 H = W = 1024
-STEPS = 30
+STEPS = int(os.environ.get("ANIMA_STEPS", "30"))
 GUIDANCE = 4.0
 SEED = 0
 
@@ -186,14 +187,54 @@ sigmas = np.asarray(st.sigmas[:-1])
 np.save('/content/dump_sigmas.npy', sigmas); np.save('/content/dump_timesteps.npy', timesteps)
 log(f"sigmas head {sigmas[:3]} tail {sigmas[-3:]}")
 
-@jax.jit
-def tf_step(t_params, latents, timestep, ctx, nctx, pad):
-    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
-    nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad)
-    nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad)
-    # Preserve the guidance delta before bf16 rounding amplifies small differences.
-    pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
-    return nc, nu, pred.astype(jnp.float32)
+# ---- optional ControlNet-LLLite pose control -------------------------------------------
+# Env-gated: with LLLITE_CKPT unset nothing below imports, loads or divides, and tf_step
+# keeps its original body. Keeping the conditioning embedding as a closure constant is
+# correct because it does not depend on t, which leaves every call site untouched.
+LLLITE_STRENGTH = float(os.environ.get("LLLITE_STRENGTH", "1.0"))
+lllite_w = None
+if os.environ.get("LLLITE_CKPT"):
+    from PIL import Image
+    from maxdiffusion.models import anima_lllite_flax as _LL
+    lllite = _LL.load_lllite(os.environ["LLLITE_CKPT"], dtype=jnp.float32)
+    log(f"lllite loaded: blocks={lllite.config.block_count} in_dim={lllite.config.model_dim} "
+        f"targets={list(lllite.config.blocks[min(lllite.config.blocks)])}")
+    _ctl_path = os.environ["LLLITE_CONTROL"]
+    _ctl_img = Image.open(_ctl_path).convert("RGB")
+    _ctl = _LL.preprocess_control(_ctl_img, (H, W),
+                                  aspect=os.environ.get("LLLITE_ASPECT", "letterbox"))
+    cond_emb = _LL.encode_conditioning(lllite, jnp.asarray(_ctl))
+    cond_emb.block_until_ready()
+    _expected = (H // 16) * (W // 16)
+    log(f"lllite cond_emb {cond_emb.shape} expected_tokens={_expected} "
+        f"match={cond_emb.shape[1] == _expected} aspect={os.environ.get('LLLITE_ASPECT', 'letterbox')} "
+        f"control={_ctl_path}")
+    lllite_w = _LL.stack_lllite_weights(lllite, 28)
+    log(f"lllite stacked targets {sorted(lllite_w)} "
+        f"layers {tuple(lllite_w['self_attn_q']['down.kernel'].shape)[0]} "
+        f"strength {LLLITE_STRENGTH}")
+
+if lllite_w is None:
+    @jax.jit
+    def tf_step(t_params, latents, timestep, ctx, nctx, pad):
+        t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
+        nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad)
+        nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad)
+        # Preserve the guidance delta before bf16 rounding amplifies small differences.
+        pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
+        return nc, nu, pred.astype(jnp.float32)
+else:
+    @jax.jit
+    def tf_step(t_params, latents, timestep, ctx, nctx, pad):
+        t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
+        nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad,
+                               lllite_w=lllite_w, cond_emb=cond_emb,
+                               lllite_strength=LLLITE_STRENGTH)
+        nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad,
+                               lllite_w=lllite_w, cond_emb=cond_emb,
+                               lllite_strength=LLLITE_STRENGTH)
+        pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
+        return nc, nu, pred.astype(jnp.float32)
 
 rng = np.random.default_rng(SEED)
 latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
@@ -244,8 +285,9 @@ if img.shape[-1] not in (1, 3):
     img = np.moveaxis(img, 1, -1)
 img_u8 = (img[0] * 255.0).round().astype(np.uint8)
 from PIL import Image
-Image.fromarray(img_u8).save("/content/anima_perstep.png")
-log(f"IMAGE saved /content/anima_perstep.png in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
+_OUT = "/content/" + os.environ.get("ANIMA_OUT", "anima_perstep") + ".png"
+Image.fromarray(img_u8).save(_OUT)
+log(f"IMAGE saved {_OUT} in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
 
 log("=== STAGE 6: timed warm reps ===")
 times = []
