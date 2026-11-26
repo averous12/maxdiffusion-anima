@@ -639,6 +639,18 @@ def lllite_snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias
 # Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
 _LLLITE_CACHE = {}
 
+# Exactly the control combinations the generate path supports. "regional+lllite" is
+# excluded on purpose: regional prediction replaces the base prediction per region, so a
+# whole-image control would be silently dropped rather than applied.
+SUPPORTED_CONTROL_COMBOS = (
+    "plain",
+    "regional",
+    "snapref",
+    "lllite",
+    "regional+snapref",
+    "lllite+snapref",
+)
+
 
 def resolve_lllite(name):
     """Resolve an LLLite checkpoint by exact path, else by filename under the model dirs."""
@@ -1670,6 +1682,13 @@ while True:
             # are requested — one forward then applies pose control and the reference.
             _snap["_lllite"] = lllite_info
         regional_specs = d.get("regional") or d.get("regions") or []
+        # LLLite control is whole-image, but regional mode predicts per region and replaces
+        # the base prediction, so a global control would be silently dropped. Refuse the
+        # combination instead of producing something that looks controlled but is not.
+        if regional_specs and lllite_info:
+            raise ValueError(
+                "regional and lllite cannot be combined. Supported combinations: "
+                + ", ".join(SUPPORTED_CONTROL_COMBOS))
         regional_info = []
         regional_schedule = (anima_regional.normalize_schedule(
             regional_specs, maximum=16, common=d.get("common")) if regional_specs else [])
