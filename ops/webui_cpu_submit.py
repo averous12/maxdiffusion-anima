@@ -66,12 +66,14 @@ def main():
 
     d = json.load(open(REQ))
     log(f"request keys: {sorted(d.keys())}")
-    need = ("prompt", "negative", "height", "width", "steps", "guidance", "seed")
+    # the UI and the runtime both use "negative_prompt"; an earlier version of this
+    # check asserted "negative" and reported a false failure against a correct request
+    need = ("prompt", "negative_prompt", "height", "width", "steps", "guidance", "seed")
     missing = [k for k in need if k not in d]
     log(f"height={d.get('height')} width={d.get('width')} steps={d.get('steps')} "
         f"guidance={d.get('guidance')} seed={d.get('seed')}")
     log(f"prompt={str(d.get('prompt'))[:60]!r}")
-    log(f"negative={str(d.get('negative'))[:50]!r}")
+    log(f"negative={str(d.get('negative_prompt'))[:50]!r}")
     if missing:
         log(f"CONTRACT FAILED: missing {missing}")
         return 1
