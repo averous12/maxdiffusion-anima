@@ -10,6 +10,7 @@ reproducibility) from **scratch** (superseded, safe to delete).
 |---|---|
 | `test_control_modes.py` | the six legal control combinations resolve; `regional+lllite` and 3-way refused. Pure CPU, no model |
 | `test_forward_adapters.py` | the one forward forwards the right kwargs per mode, and no `None` leaks into the trace. Pure CPU |
+| `test_forward_equivalence.py` | **inference is unchanged**: adapters are bitwise identical to a direct `apply`, with the real LLLite checkpoint. Pure CPU |
 | `lllite_parity.py` | LLLite matches the ComfyUI reference (conditioning ~2.7e-06, 828 tensors, 0 missing) |
 | `lllite_scan_test.py` | LLLite rides `nn.scan`; scan ≡ loop (1.1e-05); strength 0 is bit-exact |
 | `lllite_full_forward.py` | the real transformer forward with LLLite; effect linear in strength (set `LL_LAYERS=28` for production depth) |

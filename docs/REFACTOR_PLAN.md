@@ -16,7 +16,7 @@ The goal is that a change costs one edit in one place, and that a test can prove
 | 3 — kill globals | **deferred** | P3 corrected below: not a concurrency bug, so this is hygiene, not a defect |
 | 4 — break up `build()` | **todo** | 356 lines |
 | 5 — tame `ops/` | **half done** | `ops/README.md` indexes every file as check / tooling / probe; no deletions |
-| 6 — end-to-end test | **todo** | still no test over request → image |
+| 6 — end-to-end test | **partial** | `test_forward_equivalence.py` proves adapter output is bitwise identical to direct apply incl. real LLLite weights; full request→image still needs the runtime importable (i.e. Phase 1) |
 
 ---
 
