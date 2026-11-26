@@ -129,3 +129,45 @@ Cloudflare rate limit, not a defect in this code.
 Two mistakes worth keeping: `networkidle` never fires because Gradio holds a websocket open
 (wait for `gradio-app` instead), and Playwright's sync API refuses to start inside the Jupyter
 asyncio loop that `colab exec` uses (run it in a child process).
+
+---
+
+## 7. Measured: the six-mode matrix on TPU v5e1
+
+First run of every mode through the real server. 256x256, 1 step, seed 1234, identical prompt;
+`sha256` of each output, first 16 hex characters. Timing is dominated by first-shape compile,
+so only the hashes carry meaning.
+
+| Mode | Result | sha256[:16] | Notes |
+|---|---|---|---|
+| plain | OK | `c187baa067855d48` | pays the first decode compile (10.8 s) |
+| regional | OK | `1ff8ec05a9d617de` | |
+| snapref | OK | `0eafb4feb24d97f5` | |
+| lllite | OK | `0fb3cad2299205fc` | |
+| regional + snapref | OK | `1ff8ec05a9d617de` | **identical to regional alone — SnapRef contributed nothing** |
+| lllite + snapref | OK | `55c2888d904822d1` | distinct from both parents: composition works |
+| regional + lllite | refused | — | `ControlModeError`, as designed |
+
+6/7 produced an image, 5 distinct images. Boot 45 s warm / 195 s cold; the whole matrix 155 s.
+
+### Two bugs this run found, both now fixed
+
+1. **LLLite never worked through a request.** `lllite.image` arrives as a path, and
+   `preprocess_control` did `Image.fromarray(np.asarray(image))` — a path becomes a `(1,1)` string
+   array, so PIL raised `TypeError: Cannot handle this data type: (1, 1), <U21`. The width in
+   that message (21) was literally the length of `/content/ctl_pose.png`. Every CPU probe passed
+   decoded arrays, which is why parity and scan passed while the server path never once ran.
+2. **The encoder needed the object, not the cache dict.** Once (1) cleared, the next error was
+   `AttributeError: 'dict' object has no attribute 'config'`: `encode_conditioning` reads
+   `.config`/`.cond`, but `get_lllite()` cached only derived fields.
+
+### Outstanding
+
+- **`regional + snapref` silently ignores the reference.** The image is bit-identical to
+  `regional` alone, so SnapRef is either not applied or applied with zero effect on that path.
+  Not root-caused. Every other combination behaves.
+- Suite regressions found on the way: `serve()` crashed on the first request
+  (`last_gen_id` never declared global — see `test_global_completeness.py`).
+- **LoRA is still untested** — it needs `ANIMA_LORAS` and a LoRA file; neither was available.
+- These are 256x256 one-step images: they prove routing and effect, not quality. Pose
+  adherence for LLLite remains unjudged.
