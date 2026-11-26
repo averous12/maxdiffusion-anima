@@ -194,6 +194,59 @@ def test_region_may_rely_on_common_prompt():
     raise AssertionError("empty prompt with no common block should fail")
 
 
+def test_unscheduled_region_is_capped_by_regional_end():
+    """regional_end shortens only regions that carry no schedule of their own."""
+    regions = r.normalize_schedule([{"prompt": "x", "box": [0, 0, 0.5, 1]}])
+    assert regions[0]["scheduled"] is False
+    # 20 steps: step 2 -> 0.15 (inside a 0.35 window), step 10 -> 0.55 (past it).
+    assert r.active(regions[0], 2, 20, 0.35)
+    assert not r.active(regions[0], 10, 20, 0.35)
+    # No cap requested: the region runs to the end as before.
+    assert r.active(regions[0], 10, 20, 1.0)
+
+
+def test_scheduled_region_ignores_regional_end():
+    """An explicit start/end wins outright; regional_end must not clip it."""
+    regions = r.normalize_schedule(
+        [{"prompt": "x", "box": [0, 0, 0.5, 1], "start": 0.50, "end": 0.90}])
+    assert regions[0]["scheduled"] is True
+    assert r.effective_end(regions[0], 0.35) == 0.90
+    # step 13 -> 0.70: past regional_end but inside the region's own window.
+    assert r.active(regions[0], 13, 20, 0.35)
+    assert r.effective_end(regions[0], 1.0) == 0.90
+
+
+def test_stage_window_counts_as_scheduling():
+    """A stage-level window is injected per region, so it is explicit too."""
+    schedule = r.normalize_schedule({"stages": [
+        {"id": "chars", "start": 0.20, "end": 0.60,
+         "regions": [{"prompt": "x", "box": [0, 0, 0.5, 1]}]},
+    ]})
+    assert schedule[0]["scheduled"] is True
+    assert r.effective_end(schedule[0], 0.10) == 0.60
+
+
+def test_full_range_window_counts_as_unscheduled():
+    """The editor always sends start/end; an untouched 0.0-1.0 must not disable the cap."""
+    regions = r.normalize_schedule(
+        [{"prompt": "x", "box": [0, 0, 0.5, 1], "start": 0.0, "end": 1.0}])
+    assert regions[0]["scheduled"] is False
+    assert r.effective_end(regions[0], 0.35) == 0.35
+    assert not r.active(regions[0], 10, 20, 0.35)
+
+
+def test_active_indices_honours_per_region_windows():
+    """Mixed set: the scheduled region survives a window that kills the other."""
+    regions = r.normalize_schedule([
+        {"prompt": "a", "box": [0, 0, 0.5, 1]},
+        {"prompt": "b", "box": [0.5, 0, 0.5, 1], "start": 0.50, "end": 0.90},
+    ])
+    late = r.active_indices(regions, 13, 20, 0.35)   # 0.70
+    assert late == (1,), late
+    early = r.active_indices(regions, 2, 20, 0.35)   # 0.15
+    assert early == (0,), early
+
+
 if __name__ == "__main__":
     tests = [v for k, v in globals().items() if k.startswith("test_")]
     for test in tests:

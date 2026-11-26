@@ -86,6 +86,13 @@ def normalize_region(spec: Any, index: int = 0, common: dict = None) -> dict:
     canonical_box = [x, y, w, h]
   start = _finite(spec.get("start", 0.0), f"region {index} start")
   end = _finite(spec.get("end", 1.0), f"region {index} end")
+  # A region that carries a real window owns it; only unscheduled regions are bounded by
+  # the request's global regional_end. "Scheduled" means a window narrower than the whole
+  # run: the editor always emits start/end (defaults 0.0/1.0), so keying on mere presence
+  # would make every UI region scheduled and silently disable regional_end. Stage-level
+  # windows are injected into each region before this call, so an inherited stage window
+  # counts as scheduling too -- the user asked for it explicitly.
+  scheduled = (start > 0.0) or (end < 1.0)
   feather = _finite(spec.get("feather", 0.0), f"region {index} feather")
   strength = _finite(spec.get("strength", 1.0), f"region {index} strength")
   if not (0.0 <= start < end <= 1.0):
@@ -104,6 +111,7 @@ def normalize_region(spec: Any, index: int = 0, common: dict = None) -> dict:
     "mask": str(mask) if mask else None,
     "start": start,
     "end": end,
+    "scheduled": scheduled,
     "feather": feather,
     "strength": strength,
     "snapref": spec.get("snapref") if isinstance(spec.get("snapref"), dict) else None,
@@ -174,15 +182,29 @@ def normalize_regions(regions: Any, maximum: int = 4) -> list[dict]:
   return normalize_schedule(regions, maximum=maximum)
 
 
-def active_indices(regions: list[dict], step: int, steps: int) -> tuple[int, ...]:
+def active_indices(regions: list[dict], step: int, steps: int,
+                   default_end: float = 1.0) -> tuple[int, ...]:
   """Return the stable active-region key used for lazy stage activation."""
-  return tuple(i for i, region in enumerate(regions) if active(region, step, steps))
+  return tuple(i for i, region in enumerate(regions)
+               if active(region, step, steps, default_end))
 
 
-def active(region: dict, step: int, steps: int) -> bool:
+def effective_end(region: dict, default_end: float = 1.0) -> float:
+  """The end a region actually uses.
+
+  An explicitly scheduled region owns its window; ``default_end`` (the request's
+  ``regional_end``) only shortens regions that carry no schedule of their own.
+  """
+  if region.get("scheduled"):
+    return region["end"]
+  return min(region["end"], float(default_end))
+
+
+def active(region: dict, step: int, steps: int, default_end: float = 1.0) -> bool:
   fraction = (int(step) + 1) / max(1, int(steps))
-  return region["start"] <= fraction < region["end"] or (
-      step == int(steps) - 1 and fraction <= region["end"]
+  end = effective_end(region, default_end)
+  return region["start"] <= fraction < end or (
+      step == int(steps) - 1 and fraction <= end
   )
 
 

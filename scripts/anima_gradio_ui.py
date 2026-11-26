@@ -586,7 +586,7 @@ API_HELP = """\
 ### Request fields beyond the UI
 - `common: {"prompt": ..., "negative_prompt": ...}` — prepended to every region.
 - `regional` — a list of regions, or `{"stages": [...]}`.
-- `regional_end: 0.0–1.0` — stops regional routing after this share of the schedule (default 1.0). Composition is decided early, so a smaller window is much cheaper.
+- `regional_end: 0.0–1.0` — closes regional routing after this share of the schedule, for regions that carry **no schedule of their own** (default 1.0; the UI sends 0.35). A region with an explicit `start`/`end` keeps its own window and is never shortened by this value. Composition is decided early, so a smaller window is much cheaper.
 - Per region: `enabled: false` drops it; `mask` uses a PNG instead of a box; `feather` softens box edges; `strength` scales the mask.
 - `decode: "vae" | "pixel"` and `pixel_head` choose the decode path.
 
@@ -1714,8 +1714,10 @@ def build():
                 regional_end = gr.Slider(
                     0.10, 1.00, value=0.35, step=0.05,
                     label="Regional routing window",
-                    info="Share of steps that use the boxes. Composition settles early: "
-                         "0.35 is faster and stops the boxes fighting into one split figure.")
+                    info="Share of steps that use the boxes, for boxes with no schedule of "
+                         "their own. A box with an explicit start/end keeps its own window. "
+                         "Composition settles early: 0.35 is faster and avoids the boxes "
+                         "fighting into one split figure.")
                 _regional_slots = regional_ui.build_slots(4)
                 _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
 
