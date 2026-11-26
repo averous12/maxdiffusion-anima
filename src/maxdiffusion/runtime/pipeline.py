@@ -46,10 +46,18 @@ from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
 from tokenizers import Tokenizer as _RawTokenizer
 import maxdiffusion.anima_prompt_control as prompt_control
 
+# Lazy caches normally created by boot(). Defaulting them at module level keeps the helper
+# functions (get_lllite, get_pixel_head, get_snapref_adapter) usable and testable without
+# loading 6.6 GB of weights -- and removes another ordering dependency on boot() having run.
+_LLLITE_CACHE = {}
+
+
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, flush=True)
-    LOG.write(line + "\n")
+    _sink = globals().get("LOG")     # created by boot(); absent when a helper is used alone
+    if _sink is not None:
+        _sink.write(line + "\n")
 
 
 def rss_gb():
@@ -374,6 +382,11 @@ def resolve_lllite(name):
             p = os.path.join(d, name or "")
             if os.path.isfile(p):
                 return p
+            # a stem is a natural thing to pass, so try the extension before giving up
+            if name and not name.endswith(".safetensors"):
+                p2 = p + ".safetensors"
+                if os.path.isfile(p2):
+                    return p2
             if not name:
                 files = sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
                 if files:
@@ -394,6 +407,10 @@ def get_lllite(name, layers=28):
         _LLLITE_CACHE[key] = {
             "path": path,
             "config": lite.config,
+            # encode_conditioning operates on the loaded object (it reads .config and .cond),
+            # not on this dict. Keeping only derived scalars here is what made the server path
+            # raise `'dict' object has no attribute 'config'` the first time it ever ran.
+            "lite": lite,
             "w": anima_lllite.stack_lllite_weights(lite, layers),
         }
     return _LLLITE_CACHE[key]
@@ -431,7 +448,12 @@ def lllite_cond_emb(lite, image, height, width, aspect="letterbox"):
     which quietly degrades every pose the user asks for.
     """
     arr = anima_lllite.preprocess_control(_as_control_image(image), (height, width), aspect=aspect)
-    return anima_lllite.encode_conditioning(lite, jnp.asarray(arr))
+    # get_lllite() returns a dict of derived fields; the encoder needs the loaded LLLite
+    # object itself, so accept either and unwrap.
+    lite_obj = lite.get("lite") if isinstance(lite, dict) else lite
+    if lite_obj is None:
+        raise ValueError("LLLite object missing from cache entry (expected key 'lite')")
+    return anima_lllite.encode_conditioning(lite_obj, jnp.asarray(arr))
 
 
 def lllite_cfg_prediction(latents, timestep, context, neg_context, pad, guidance, cfg):
