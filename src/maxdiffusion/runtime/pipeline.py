@@ -16,6 +16,7 @@ import json
 import math
 import numpy as np
 import gc
+import io
 import traceback
 import faulthandler
 import jax
@@ -1587,7 +1588,16 @@ def boot():
     log("=== SERVER boot: imports ===")
     # Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
     # It dumps the live stack of every thread once, which is what localizes a stall.
-    faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
+    #
+    # faulthandler writes to a *file descriptor*, so it needs stderr to have fileno(). Inside a
+    # Jupyter kernel (ipykernel's OutStream) it does not, and the call raises UnsupportedOperation
+    # -- which used to take the whole boot down, making the runtime unrunnable from a notebook
+    # cell even though Colab is the documented environment. Absence of the watchdog is acceptable;
+    # failing to start is not.
+    try:
+        faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
+    except (io.UnsupportedOperation, AttributeError, ValueError, OSError) as _fh_err:
+        log(f"stall watchdog unavailable ({type(_fh_err).__name__}: {_fh_err}); continuing without it")
     # A dump on SIGUSR1 lets a stall be inspected without killing the process:
     #   kill -USR1 <pid>   -> every thread's stack goes to the log.
     try:
