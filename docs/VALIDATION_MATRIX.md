@@ -179,3 +179,47 @@ region with its own reference still wins.
 - **LoRA is still untested** — it needs `ANIMA_LORAS` and a LoRA file; neither was available.
 - These are 256x256 one-step images: they prove routing and effect, not quality. Pose
   adherence for LLLite remains unjudged.
+
+---
+
+## 8. Quality and speed at production settings (1024x1024, 20 steps)
+
+Seed 1234, CFG 4.0, `preview_every=0`, VAE decode. LoRA: `anima_blue_archive_style.safetensors`
+@ 0.8, pulled from CivitAI. Denoise time is 20 steps, so ms/step is a straight division but
+still includes any first-step compile.
+
+| Run | Result | sha256[:16] | denoise | ms/step | decode | wall |
+|---|---|---|---|---|---|---|
+| snapref | OK | `6c96a2f81be31913` | 18.1 s | 905 | 14.4 s | 63.0 s |
+| pose3d (LLLite) | OK | `d5d4f282687e64ff` | 12.0 s | 600 | 0.5 s | 24.0 s |
+| lora | OK | `27f2e9df5d7cbada` | 24.4 s | 1220 | 0.4 s | 36.1 s |
+| lora + snapref | OK | `f6bcb41b426295d0` | 17.3 s | 865 | 0.4 s | 27.0 s |
+
+All four hashes differ. `snapref` reproduced byte-identically across two full runs
+(`6c96a2f8` both times), so the pipeline is deterministic at a fixed seed.
+
+LoRA hot-swap, measured by the server: **280 tensors merged, 0 skipped, 6.93 s** (merge 6.08 s +
+device_put 0.85 s), HBM peak 14.25 of 16.91 GB; a second swap took 3.53 s.
+
+### Visual judgement
+
+- **SnapRef works.** The reference image was a 3D mannequin render; the output reproduced that
+  figure's material and bald head while the prompt supplied the clothing and standing pose. The
+  reference's appearance transferred, which is the behaviour being tested. (The file is named
+  `ref_girl.png`, which is misleading -- it is a mannequin, not an anime character.)
+- **3D pose control works, but adherence is approximate.** The control holds four mannequins; the
+  output reproduced three, matched the hand-behind-head gesture, and dropped the seated figure.
+  Effect is real, fidelity is not exact at 20 steps.
+- **Caution for pose tests.** A bare pose control on this anime checkpoint renders nudity
+  unprompted. Suppressing it requires explicit negatives (`nude, naked, nsfw, ...`) *and* a
+  clothing prompt; the first attempt at this produced an explicit image.
+
+### LoRA API shape (easy to get wrong)
+
+`lora_swap` is a **control request, not a generation request**. The server swaps, writes
+`stage=lora-swapped`, and `continue`s back to watching. Sending `lora_swap` alongside a prompt
+looks exactly like a hang -- the swap succeeds, the progress record stays at `lora-swapped`, and
+no image ever appears. Swap first, then send the generation request separately.
+
+Diagnosed with the runtime's own SIGUSR1 stack dump: the thread was parked in `serve()`'s idle
+wait with **0 CPU ticks over 5 s**, which proved it was idle rather than stuck.
