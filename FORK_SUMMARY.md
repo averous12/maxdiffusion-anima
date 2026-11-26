@@ -17,7 +17,6 @@ This repository is a fork of [`google/maxdiffusion`](https://github.com/google/m
 | `scripts/anima_aesthetic_server.py` | Persistent server: loads models, warms up executables, watches `anima_request.json`, writes progress and images |
 | `scripts/anima_gradio_ui.py` | Gradio UI: writes request JSON, polls progress + previews, archives finished images |
 | `scripts/anima_cloudflared.py` | Publishes the Gradio port via a Cloudflare quick tunnel |
-| `scripts/anima_aesthetic_tpu.py` | One-shot end-to-end generation script (pre-server) |
 | `scripts/anima_scan_e2e.py` | End-to-end scan/block runner and CPU parity helper |
 | `src/maxdiffusion/models/anima_cosmos_flax.py` | Flax AnimaCosmos transformer, attention blocks, weight conversion |
 | `src/maxdiffusion/models/anima_text_conditioner_flax.py` | Text conditioner + adapter conversion |

@@ -41,8 +41,9 @@ def main():
          "https://github.com/averous12/maxdiffusion-anima.git", REPO], timeout=900)
   run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO, tail=2)
 
-  # ---- 2. overlay the local LLLite files (the driver is NOT overlaid: LLLite lives in
-  # the repo's own anima_aesthetic_tpu.py now, so there is no fork to substitute)
+  # ---- 2. overlay the locally-edited model files
+  # Only the two model modules are overlaid: LLLite lives inside them, and the one-shot
+  # TPU driver that used to need overlaying has been deleted (server is the only runtime).
   for name, sub in (("anima_lllite_flax.py", "src/maxdiffusion/models"),
                     ("anima_cosmos_flax.py", "src/maxdiffusion/models")):
     src = os.path.join(OVERLAY, name)
@@ -85,28 +86,16 @@ def main():
   if rc != 0:
     log("WARN: overlay import check failed (continuing to generation)")
 
-  # ---- 5. validation run: the repo's own driver, LLLite switched on by env
-  # No LLLite-specific driver exists. The sweep runner drives anima_aesthetic_tpu.py with
-  # LLLITE_CKPT set, so exactly one runtime is under test.
-  script = f"{REPO}/ops/run_lllite_sweep.py"
-  if os.path.exists(script):
-    log("running the LLLite strength sweep (repo driver + env)")
+  # ---- 5. generation is the server's job now
+  # The one-shot TPU driver was deleted: it duplicated the server's generation logic and
+  # had to be kept in step with it by hand. Setup + import verification is where this
+  # script stops; invoking generation means starting the server and posting a request to it.
+  if os.path.exists(f"{REPO}/scripts/anima_aesthetic_server.py"):
+    log("server present; generation runs through it, not from this bootstrap")
   else:
-    script = f"{REPO}/scripts/anima_aesthetic_tpu.py"
-    log("sweep runner absent; running the plain aesthetic driver")
-  rc, out = run([VENV_PY, script],
-                env={**env, "PYTHONPATH": f"{REPO}/src", "HF_HOME": "/content/hf_cache",
-                     "PYTHONUNBUFFERED": "1"}, timeout=5400, tail=45)
-  found = False
-  for img in ("/content/anima_lllite_s0.png", "/content/anima_lllite_s20.png",
-              "/content/anima_lllite_s40.png", "/content/anima_perstep.png"):
-    if os.path.exists(img):
-      found = True
-      log(f"IMAGE OK {img} {os.path.getsize(img)} B")
-  if not found:
-    log("IMAGE MISSING (no output produced)")
-  log("BOOTSTRAP DONE")
-  return rc
+    log("WARN: anima_aesthetic_server.py missing")
+  log("BOOTSTRAP DONE (setup only)")
+  return 0
 
 
 if __name__ == "__main__":

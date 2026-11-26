@@ -37,9 +37,8 @@ maxdiffusion/
 │   ├── schedulers/scheduling_flow_match_flax.py   flow-match sigma schedule
 │   └── utils/                                      shared helpers
 ├── scripts/
-│   ├── anima_aesthetic_server.py      1994 L  the real runtime: all six control modes
+│   ├── anima_aesthetic_server.py      1996 L  the only runtime: all six control modes
 │   ├── anima_gradio_ui.py             1920 L  browser UI over the server
-│   ├── anima_aesthetic_tpu.py          312 L  TPU smoke/validation driver
 │   ├── anima_regional_ui.py                   regional mask editor UI
 │   ├── anima_colab_setup.py                   Colab venv bootstrap
 │   ├── anima_cloudflared.py                   tunnel helper
@@ -47,42 +46,36 @@ maxdiffusion/
 └── ops/                                       34 probe/test scripts (see §6)
 ```
 
-## 2. Two runtimes, deliberately different scope
+## 2. One runtime
 
-This is the single most important structural fact, and the most common source of surprise.
+**`scripts/anima_aesthetic_server.py` is the only runtime.** It supports all six control
+modes: plain, regional, snapref, lllite, regional+snapref, lllite+snapref.
 
-| Runtime | File | Supports |
-|---|---|---|
-| **Server** (production) | `scripts/anima_aesthetic_server.py` | all six modes: plain, regional, snapref, lllite, regional+snapref, lllite+snapref |
-| **TPU driver** (validation) | `scripts/anima_aesthetic_tpu.py` | plain, lllite only |
+The one-shot TPU driver (`anima_aesthetic_tpu.py`) existed only for validation and was
+**deleted**: it duplicated the server's generation logic behind a `code` string and had to be
+kept in step with the server by hand. It reached "plain + lllite" and could never exercise
+SnapRef or regional — measured 0 references to either — so it was also structurally unable
+to validate most of the surface. Its LLLite block is gone with it; the server is the single
+implementation.
 
-Measured by counting feature references in each file:
+Generation on a TPU VM therefore means starting the server and posting a request to it, not
+running a separate script.
 
-```
-snapref    tpu 0    server 147
-regional   tpu 0    server  53
-lllite     tpu 23   server  67
-```
-
-So the TPU driver cannot exercise SnapRef or regional at all. Any claim about those two is
-server-only. LLLite is the one feature that exists in both, because it was needed on TPU.
-
-**LLLite is a feature of the driver, not a fork of it.** It is env-gated: with `LLLITE_CKPT`
-unset the driver imports nothing extra, loads nothing, and the plain `tf_step` body is
-character-identical to the pre-LLLite version. The conditioning embedding is a closure
-constant because it does not vary with `t`, which leaves every denoise call site untouched.
+⚠️ **The server's code is 98% a `code = r'''…'''` string** (1964 of 1996 lines), executed via
+`subprocess.run`. That is why the mode rules had to be lifted into a separate importable
+module before they could be tested, and it is the top item in `docs/REFACTOR_PLAN.md`.
 
 ## 3. Control-mode matrix
 
-| Mode | Server | TPU driver | Notes |
-|---|---|---|---|
-| plain | yes | yes | baseline |
-| regional | yes | **no** | server only |
-| snapref | yes | **no** | server only |
-| lllite | yes | yes | |
-| regional + snapref | yes | **no** | |
-| lllite + snapref | yes | **no** | separate jit on the server |
-| regional + lllite | **refused** | n/a | rejected by design |
+| Mode | Server | Notes |
+|---|---|---|
+| plain | yes | baseline |
+| regional | yes | |
+| snapref | yes | |
+| lllite | yes | |
+| regional + snapref | yes | |
+| lllite + snapref | yes | separate jit |
+| regional + lllite | **refused** | rejected by design |
 
 `regional + lllite` is refused in the server with `SUPPORTED_CONTROL_COMBOS` as the error
 payload. The rule itself lives in `models/anima_control_modes.py`, not in the server's
@@ -183,7 +176,7 @@ Proven — reproduced by a command in this repo:
 | strength 0 is inert | **0.000e+00** vs no LLLite, bit-exact | `ops/lllite_scan_test.py`, `ops/lllite_full_forward.py` |
 | full transformer forward, 28 layers | delta linear in strength: **3.41e-02 / 6.82e-02 / 1.36e-01** at 0.5 / 1.0 / 2.0 | `ops/lllite_full_forward.py` |
 | token grid law | `(H/16)*(W/16)`; 1024² → **4096** | driver log, `match=True` |
-| LLLite cost on TPU | **2303–2341 ms/step** vs **1896 ms/step** baseline (+21–24%) | TPU run, 20 steps |
+| LLLite cost on TPU | **2303–2341 ms/step** vs **1896 ms/step** baseline (+21–24%) | TPU run, 20 steps — measured with the pre-refactor driver, since deleted; re-measure through the server |
 | control changes the image | strength 1.0 vs 0.0 differ on **643,837 px** (mean 39.7, max 255) | TPU sweep, sha256 + pixel diff |
 | letterbox preserves proportions | figure bbox aspect **1.724** vs true **1.720**; stretch gave **1.149** | `preprocess_control(aspect=...)` |
 | control modes resolve correctly | **15/15** cases, 6/6 modes exercised, `regional+lllite` and 3-way refused | `ops/test_control_modes.py` |
@@ -209,37 +202,49 @@ Not proven — do not claim these:
 * `snapref_*` (20 files) — SnapRef probes and browser-driving scripts, including older
   `snapref_scan_probe{,2,3,4}.py` iterations that are superseded
 * `test_*.py` (6) — API-contract, UI-contract and watchdog tests
-* `run_lllite_sweep.py` — drives the repo driver at several strengths (default 0.0/2.0/4.0)
-* `anima_tpu_bootstrap.py` — Colab VM bootstrap: clone, overlay, setup, then the sweep
+* `anima_tpu_bootstrap.py` — Colab VM bootstrap: clone, overlay, setup, import check (setup only; generation is the server's job)
 
 ## 7. Known issues
 
 | Issue | Impact | Where |
 |---|---|---|
+| Runtime is 98% a `code` string | not importable, not lintable, tracebacks say `<string>` | `anima_aesthetic_server.py` |
+| Seven jits for one forward | every new combo costs another body to maintain | §P2 of `REFACTOR_PLAN.md` |
+| Mutable globals shared across requests | `_SNAPREF_STATE`, `_LLLITE_CACHE` — interleaved requests can corrupt each other | `REFACTOR_PLAN.md` §P3 |
+| Nesting depth 16 in the request path | rules buried where no test reaches them | `REFACTOR_PLAN.md` §P4 |
+| `build()` is 356 lines | UI layout, widgets, wiring and defaults in one scope | `anima_gradio_ui.py` |
 | `adapter_block_map` assumes an iterable | `TypeError: 'int' object is not iterable` if called with a scalar layer count | `anima_snapref_flax.py:65` |
-| TPU driver lacks SnapRef + regional | modes untestable off-server | `anima_aesthetic_tpu.py` |
 | Pose adherence unverified | LLLite effect proven, correctness not | §5 |
 | Superseded `snapref_scan_probe{2,3,4}.py` | clutter in `ops/` | `ops/` |
+
+The refactor to address the first five is written up with measured baselines and per-phase
+acceptance criteria in `docs/REFACTOR_PLAN.md`.
 
 ## 8. Running it
 
 ```bash
-# CPU: the four LLLite checks (no GPU/TPU needed)
-PYTHONPATH=src python ops/lllite_parity.py
-PYTHONPATH=src python ops/lllite_scan_test.py
-PYTHONPATH=src python ops/lllite_full_forward.py
+# CPU checks — no GPU/TPU required
+PYTHONPATH=src python ops/lllite_parity.py        # vs the ComfyUI reference
+PYTHONPATH=src python ops/lllite_scan_test.py     # scan == loop, strength 0 inert
+PYTHONPATH=src python ops/lllite_full_forward.py  # real transformer, 2 layers
 LL_LAYERS=28 PYTHONPATH=src python ops/lllite_full_forward.py
+PYTHONPATH=src python ops/test_control_modes.py   # the six modes + refusals
 
-# TPU: bootstrap then sweep strengths 0.0 / 2.0 / 4.0
-python ops/anima_tpu_bootstrap.py
+# TPU: bootstrap the VM, then start the SERVER and post a request to it
+python ops/anima_tpu_bootstrap.py                 # clone, overlay, setup, import check
+# generation itself is the server's job — there is no separate one-shot driver
 ```
 
-The driver takes its configuration from the environment, so no forked copy is needed:
+LLLite is configured **per request**, in the `lllite` object of the request JSON:
 
-| Variable | Meaning |
+| Field | Meaning |
 |---|---|
-| `LLLITE_CKPT` | LLLite checkpoint; **unset leaves the run as the plain baseline** |
-| `LLLITE_CONTROL` | control map (3D pose / outline) |
-| `LLLITE_STRENGTH` | control strength |
-| `LLLITE_ASPECT` | `letterbox` (default) or `stretch` |
-| `ANIMA_PROMPT` / `ANIMA_STEPS` / `ANIMA_OUT` | prompt, step count, output name |
+| `image` | control map (3D pose / outline). **Required** — strength alone steers nothing |
+| `model` | checkpoint name or path |
+| `strength` | control strength |
+| `aspect` | `letterbox` (default) or `stretch` |
+| `start_percent` / `end_percent` | the sigma window the control is active in |
+| `enabled` | `false` keeps the request plain |
+
+The whole request is classified first by `resolve_control_modes`, so an unsupported
+combination is refused before any encoding work begins.
