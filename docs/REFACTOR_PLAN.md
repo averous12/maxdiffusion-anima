@@ -6,6 +6,18 @@ Everything below is measured, not felt; the command that produced each number is
 The goal is **not** a rewrite. The generation behaviour is validated and must not move.
 The goal is that a change costs one edit in one place, and that a test can prove it.
 
+## Status
+
+| Phase | State | Evidence |
+|---|---|---|
+| 0 — lift the string | **done** | launcher 1996 → 27 lines; runtime at `src/maxdiffusion/runtime/pipeline.py`, extracted verbatim (asserted byte-identical); 11/11 imports resolve; compiles |
+| 1 — extract request path | **todo** | depth 16 stands |
+| 2 — one forward | **done** | jitted functions 7 → 4; `ops/test_forward_adapters.py` 7/7, no `None` leaks |
+| 3 — kill globals | **deferred** | P3 corrected below: not a concurrency bug, so this is hygiene, not a defect |
+| 4 — break up `build()` | **todo** | 356 lines |
+| 5 — tame `ops/` | **half done** | `ops/README.md` indexes every file as check / tooling / probe; no deletions |
+| 6 — end-to-end test | **todo** | still no test over request → image |
+
 ---
 
 ## 1. What is actually wrong
@@ -47,8 +59,15 @@ bodies where one parameterised call would do. Every new combination now costs an
 ### P3 — Mutable module-level state shared across requests
 
 `_SNAPREF_STATE` (9 refs) and `_LLLITE_CACHE` (4 refs) are globals mutated during a
-generation. Two concurrent or interleaved requests would corrupt each other, and no test can
-reset them cleanly.
+generation.
+
+**Corrected after checking:** this is *not* a concurrency bug. The request path is serial —
+one `while True` loop taking one request at a time — and the only other thread is the stall
+watchdog, which touches `_ARMED` / `_HEARTBEAT` / `_RUN_ACTIVE` and never these two dicts.
+The real cost is that a request's state cannot be reset or constructed independently, so the
+generation path stays untestable and two requests cannot be compared in one process. That
+makes it a maintainability problem, not a correctness one — and it drops the priority of the
+phase that removes it.
 
 ### P4 — Nesting depth 16
 
@@ -117,17 +136,25 @@ Kill the depth-16 nesting: target max depth 4.
 *Acceptance:* max indentation ≤ 4 in the served code (measure with the AST walker already
 used above); same sha256 as Phase 0.
 
-### Phase 2 — One forward, not seven
+### Phase 2 — One forward, not seven — **done**
 
-Replace the seven jits with a single `forward(params, latents, t, ctx, control)` where
-`control` is a pytree carrying `lora`, `ref_kv`, `ref_bias`, `lllite_w`, `cond_emb`,
-`strength`. Absent features are `None`.
+Four near-identical jitted bodies are one `_transformer_forward(tp, lat, t_vec, ctx, pad,
+lora, refkv, refbias, lllite_w, cond_emb, strength)` plus thin adapters that keep the old
+call signatures, so no call site changed.
 
-*Acceptance:* same sha256 per mode; and the count of compiled executables does not increase
-(JAX caches per pytree structure, so each mode still gets its own trace — that is fine and
-expected, the win is one body to maintain).
+**The Gradio constraint decided the shape.** The runtime serves a live server taking varied
+requests, so a single graph with every feature always wired in was the wrong answer: it would
+compile snapref and lllite into every request and make plain mode pay for branches it never
+uses. Instead absent features are **omitted**, not passed as a sentinel. `jax.jit` keys its
+executables on argument pytree structure, so each mode traces once and is cached — switching
+modes on a running server reuses the compiled graph.
 
-*Note:* verify with a mode matrix run, one image per mode, all six hashes recorded.
+*Acceptance met:* jitted functions 7 → 4 (`cond_forward`, `_transformer_forward`,
+`snapref_reference_forward`, `pixel_tap_forward`); `ops/test_forward_adapters.py` 7/7,
+asserting per-mode kwargs and that no `None` leaks into the trace.
+
+*Still outstanding:* the mode-matrix sha256 comparison, which needs a TPU run through the
+server.
 
 ### Phase 3 — Kill the globals
 
