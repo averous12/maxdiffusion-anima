@@ -16,7 +16,7 @@ import time
 REPO = "/content/maxdiffusion"
 DRIVER = f"{REPO}/scripts/anima_lllite_gen_tpu.py"
 LOG = "/content/anima_run.log"
-STRENGTHS = [s.strip() for s in os.environ.get("LLLITE_STRENGTHS", "2.0,4.0").split(",")]
+STRENGTHS = [s.strip() for s in os.environ.get("LLLITE_STRENGTHS", "0.0,2.0,4.0").split(",")]
 
 
 def log(msg):
