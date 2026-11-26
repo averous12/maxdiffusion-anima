@@ -144,11 +144,13 @@ so only the hashes carry meaning.
 | regional | OK | `1ff8ec05a9d617de` | |
 | snapref | OK | `0eafb4feb24d97f5` | |
 | lllite | OK | `0fb3cad2299205fc` | |
-| regional + snapref | OK | `1ff8ec05a9d617de` | **identical to regional alone — SnapRef contributed nothing** |
+| regional + snapref | OK | `2cb9918e00e811a9` | was bit-identical to regional; fixed, see below |
 | lllite + snapref | OK | `55c2888d904822d1` | distinct from both parents: composition works |
 | regional + lllite | refused | — | `ControlModeError`, as designed |
 
-6/7 produced an image, 5 distinct images. Boot 45 s warm / 195 s cold; the whole matrix 155 s.
+6/7 produced an image, **6 distinct images** — every mode that runs is now unique. `regional`
+alone is still `1ff8ec05`, unchanged, which is what proves the regional+snapref fix did not
+disturb the existing path. Boot 45 s warm / 195 s cold; the whole matrix 145 s.
 
 ### Two bugs this run found, both now fixed
 
@@ -161,11 +163,17 @@ so only the hashes carry meaning.
    `AttributeError: 'dict' object has no attribute 'config'`: `encode_conditioning` reads
    `.config`/`.cond`, but `get_lllite()` cached only derived fields.
 
-### Outstanding
+### Third bug found and fixed: regional swallowed the global SnapRef
 
-- **`regional + snapref` silently ignores the reference.** The image is bit-identical to
-  `regional` alone, so SnapRef is either not applied or applied with zero effect on that path.
-  Not root-caused. Every other combination behaves.
+`regional + snapref` was bit-identical to `regional` alone. `prepare_regional` built each
+region's `snapcfg` from the region's own `snapref` key only, so a request-level SnapRef never
+reached any region -- yet `resolve_control_modes` still reported the combination as supported.
+An accepted request that silently does nothing is the worst of the three outcomes.
+
+Regions now fall back to the request's global SnapRef when they carry none of their own; a
+region with its own reference still wins.
+
+### Outstanding
 - Suite regressions found on the way: `serve()` crashed on the first request
   (`last_gen_id` never declared global — see `test_global_completeness.py`).
 - **LoRA is still untested** — it needs `ANIMA_LORAS` and a LoRA file; neither was available.
