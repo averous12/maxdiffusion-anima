@@ -857,7 +857,7 @@ def prepare_snapref(cfg, target_hw):
 
 
 def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative="",
-                     common=None):
+                     common=None, global_snapref=None):
     """Prepare regional text; SnapRef K/V is deliberately lazy per active interval."""
     prepared = []
     for index, raw in enumerate(anima_regional.normalize_schedule(
@@ -868,7 +868,11 @@ def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negat
                                 style=style, tags=tags, seed=seed + index)
         item = dict(raw, pos_ctxs=pos[0], pos_map=pos[1], pos_plan=pos[2],
                     neg_ctxs=neg[0], neg_map=neg[1], neg_plan=neg[2])
-        snap = raw.get("snapref")
+        # A region may carry its own reference. Falling back to the request's global SnapRef is
+        # what makes the advertised "regional + snapref" mode mean anything: without it the
+        # global payload was accepted, reported as a mode by resolve_control_modes, and then
+        # dropped -- the output was bit-identical to regional alone.
+        snap = raw.get("snapref") or global_snapref
         if snap and "adapter" not in snap and snap.get("ref_adapter"):
             snap = dict(snap, adapter=snap["ref_adapter"])
             item["snapref"] = snap
@@ -1235,7 +1239,8 @@ def handle_request(d, gen_id):
             write_prog(stage="regional-text", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
                        gen_id=gen_id, batch_total=BATCH, note="encoding regional prompts")
             regional_info = prepare_regional(regional_specs, (H, W), STEPS, style, tags,
-                                             int(SEED), _n, common=d.get("common"))
+                                             int(SEED), _n, common=d.get("common"),
+                                             global_snapref=(_snap or None))
             for _r in regional_info:
                 if BATCH > 1:
                     _r["pos_ctxs"] = [jnp.repeat(c, BATCH, axis=0) for c in _r["pos_ctxs"]]
