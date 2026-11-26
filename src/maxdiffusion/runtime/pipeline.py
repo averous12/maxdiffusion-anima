@@ -1476,7 +1476,7 @@ def handle_request(d, gen_id):
 
 def serve():
     """Watch for requests and handle them, one at a time, until the process dies."""
-    global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, last_mtime
+    global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, last_mtime, last_gen_id
     while True:
         _HEARTBEAT["t"] = time.time()
         try:
@@ -1566,7 +1566,7 @@ def boot():
 
     Nothing above this line runs on import, so the module can be imported by tests
     without pulling 6.6 GB of weights."""
-    global CROOT, DECODE_MODE, INTERRUPT_PATH, LOG, LORA_DIRS, PIXEL_DIRS, PIXEL_HEAD_DEFAULT, PROG_PATH, PROMPT_STYLE, REGIONAL_FAST, REQ_PATH, SNAPREF_DIRS, SNAP_PATH, STALL_IDLE_S, _ARMED, _HEARTBEAT, _LLLITE_CACHE, _LORA_SPECS, _PIXEL_HEADS, _PIXEL_TAP, _RUN_ACTIVE, _SNAPREF_ACTIVE_ADAPTER, _SNAPREF_ADAPTERS, _SNAPREF_ENC, _SNAPREF_ENC_CACHE, _SNAPREF_ENC_KEY, _SNAPREF_HOST_CACHE, _SNAPREF_HOST_CACHE_MAX, _SNAPREF_RECORDER, _SNAPREF_STATE, _T_PARAMS_PRISTINE, _pv_expected, _t5, _tf_compiled, _vae_compiled, _vae_failed, cond_params, conditioner, last_mtime, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, qwen3_jit, qwen3_model, qwen3_params, t_params, tok, transformer, vae
+    global CROOT, DECODE_MODE, INTERRUPT_PATH, LOG, LORA_DIRS, PIXEL_DIRS, PIXEL_HEAD_DEFAULT, PROG_PATH, PROMPT_STYLE, REGIONAL_FAST, REQ_PATH, SNAPREF_DIRS, SNAP_PATH, STALL_IDLE_S, _ARMED, _HEARTBEAT, _LLLITE_CACHE, _LORA_SPECS, _PIXEL_HEADS, _PIXEL_TAP, _RUN_ACTIVE, _SNAPREF_ACTIVE_ADAPTER, _SNAPREF_ADAPTERS, _SNAPREF_ENC, _SNAPREF_ENC_CACHE, _SNAPREF_ENC_KEY, _SNAPREF_HOST_CACHE, _SNAPREF_HOST_CACHE_MAX, _SNAPREF_RECORDER, _SNAPREF_STATE, _T_PARAMS_PRISTINE, _pv_expected, _t5, _tf_compiled, _vae_compiled, _vae_failed, cond_params, conditioner, last_gen_id, last_mtime, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, qwen3_jit, qwen3_model, qwen3_params, t_params, tok, transformer, vae
 
     """The Anima generation runtime: model boot, request handling and the IPC serve loop.
 
