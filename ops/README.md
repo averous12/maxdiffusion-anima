@@ -11,6 +11,10 @@ reproducibility) from **scratch** (superseded, safe to delete).
 | `test_control_modes.py` | the six legal control combinations resolve; `regional+lllite` and 3-way refused. Pure CPU, no model |
 | `test_forward_adapters.py` | the one forward forwards the right kwargs per mode, and no `None` leaks into the trace. Pure CPU |
 | `test_forward_equivalence.py` | **inference is unchanged**: adapters are bitwise identical to a direct `apply`, with the real LLLite checkpoint. Pure CPU |
+| `webui_cpu_verify.py` | Colab CPU: assemble the Gradio graph and report component/wiring counts. No model needed |
+| `webui_launch.py` | launch the UI on `0.0.0.0:7860`, blocking — started detached by the serve helper |
+| `webui_cpu_shot.py` | Colab CPU: render the running UI in headless Chromium and screenshot it. Runs Playwright in a child process because the sync API cannot start inside Jupyter's loop |
+| `webui_cpu_submit.py` | Colab CPU: click Generate and validate the `anima_request.json` the UI produced |
 | `test_runtime_import.py` | importing the runtime boots nothing, and the jitted-function census is intact (this caught 4 dropped `@jax.jit` decorators). Pure CPU |
 | `lllite_parity.py` | LLLite matches the ComfyUI reference (conditioning ~2.7e-06, 828 tensors, 0 missing) |
 | `lllite_scan_test.py` | LLLite rides `nn.scan`; scan ≡ loop (1.1e-05); strength 0 is bit-exact |

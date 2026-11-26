@@ -25,7 +25,7 @@ exist today.
 | **SnapRef** | 145 | none — 20 `snapref_*` files in `ops/` are probes, not assertions | none | **unverified** |
 | **LoRA** | 112 | **none — zero tests anywhere** | none | **unverified, untested** |
 | **regional** | 49 | 2 UI-contract tests (mask editor → request JSON) | none | **unverified** |
-| **WebUI** | — | 3 tests construct `build()`: DECODE_UI 7/7, REGIONAL_END_UI 4/4, HELP_CONTENT 18/19 (1 pre-existing doc gap) | never launched against a live server | **structurally checked only** |
+| **WebUI** | — | `build()` → 203 components, 23 wirings, 0.6 s; 3 contract tests (7/7, 4/4, 18/19) | **Colab CPU: HTTP 200, renders 6 tabs in Chromium, Generate writes a valid request** | **verified — UI layer only, no generation** |
 
 Two facts worth stating plainly:
 
@@ -88,7 +88,7 @@ just an action.
 | 8 | `regional + snapref` | both effects visible, no crash | never run |
 | 9 | `lllite + snapref` | both effects visible; no crash from the combined forward | jit exists, unit-tested, never executed |
 | 10 | `regional + lllite` | **rejected** with the supported-combinations message | proves the guard runs in the real request path, not just in a unit test |
-| 11 | WebUI end-to-end | submit from the browser, get an image back, progress + preview behave | never launched against a live server |
+| 11 | WebUI **with the server** | submit from the browser, get an image back, progress + preview advance | the UI alone is verified on CPU (§6); the server half is not |
 
 Items 1–2 are the regression gate and should run before anything else. Items 3–4 answer the
 LLLite question that is actually open. Items 5–8 are first-ever runs for features that carry a
@@ -101,3 +101,31 @@ lot of runtime code and no tests.
 | `adapter_block_map` assumes an iterable | `TypeError: 'int' object is not iterable` for a scalar layer count | `anima_snapref_flax.py:65` |
 | LoRA has no test | regressions are invisible until a run looks wrong | `ops/`, `tests/` (empty) |
 | `lllite + snapref` untested | the one combination most likely to be silently broken | — |
+
+---
+
+## 6. WebUI verified on a Colab CPU instance
+
+The UI is deliberately independent of the model — it writes `/content/anima_request.json` and
+polls `/content/anima_progress.json` — so it can be verified without booting 6.6 GB of weights.
+Done on a plain CPU Colab VM with `ops/webui_cpu_*.py`:
+
+| Step | Result |
+|---|---|
+| `gradio` installed | 6.31.0 |
+| `build()` | **203 components, 23 event wirings, 0.6 s** |
+| serve on `:7860` | **HTTP 200** |
+| render in headless Chromium | title `Anima Aesthetic TPU`; **4 textareas, 21 inputs, 22 buttons, 6 tabs**; no page errors; screenshot 120,319 B |
+| click Generate | `/content/anima_request.json` written |
+| request contract | `prompt` carried verbatim; `negative_prompt` real; `height/width` 1024; `steps` 30; `guidance` 4.0; `seed` -1; `prompt_style` comfy; `preview_every` 5; one default regional box |
+
+Tabs present: Settings, LoRAs, Decode, SnapRef, Regional, Help.
+
+Not covered by this: an actual generation, since that needs the server and the weights. Also
+blocked: the `cloudflared` quick tunnel returns **HTTP 429** from that host, so the screenshot
+was taken inside the VM against `127.0.0.1:7860` rather than through a public URL. That is a
+Cloudflare rate limit, not a defect in this code.
+
+Two mistakes worth keeping: `networkidle` never fires because Gradio holds a websocket open
+(wait for `gradio-app` instead), and Playwright's sync API refuses to start inside the Jupyter
+asyncio loop that `colab exec` uses (run it in a child process).
