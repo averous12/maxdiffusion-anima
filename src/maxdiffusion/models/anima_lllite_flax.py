@@ -541,13 +541,26 @@ class WorkflowChain:
 
 
 def preprocess_control(image, target_hw: Tuple[int, int], mask=None, inpaint: bool = False,
-                       zero_masked: bool = False):
+                       zero_masked: bool = False, aspect: str = "stretch"):
   """Control image -> (1,H,W,C) float32 in [-1,1].
 
   Matches AnimaLLLitePatch.__call__: bicubic resize to latent x 8, clamp [0,1], map to [-1,1].
+
+  `aspect="letterbox"` scales to fit and pads with black instead of squashing. Stretching a
+  768x1152 control into 1:1 distorts the figure by ~25% (bbox aspect 1.72 -> 1.29), which is
+  enough to make pose adherence impossible to judge.
   """
   from PIL import Image
   h, w = int(target_hw[0]), int(target_hw[1])
+  if aspect == "letterbox":
+    src = image if isinstance(image, Image.Image) else Image.fromarray(np.asarray(image))
+    if src.mode != "RGB":
+      src = src.convert("RGB")
+    scale = min(w / src.width, h / src.height)
+    nw, nh = max(1, int(round(src.width * scale))), max(1, int(round(src.height * scale)))
+    canvas = Image.new("RGB", (w, h), (0, 0, 0))
+    canvas.paste(src.resize((nw, nh), Image.BICUBIC), ((w - nw) // 2, (h - nh) // 2))
+    image = canvas
   arr = np.asarray(image, dtype=np.float32)
   if arr.ndim == 2:
     arr = arr[..., None]

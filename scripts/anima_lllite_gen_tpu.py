@@ -48,7 +48,7 @@ from flax import nnx
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
 
-PROMPT = "masterpiece, best quality, 1girl, fern (sousou no frieren), sousou no frieren, @izei1337, purple hair, black robe, lips, sidelocks, feet out of frame, very long hair, puffy sleeves, white dress, butterfly on hand, eyelashes, simple background, closed mouth, mage staff, arm at side, straight hair, blush, solo, purple eyes, chromatic aberration, purple pupils, looking at viewer, hand up, standing, bug, robe, black background, signature, bright pupils, black coat, coat, long sleeves, blue butterfly, upturned eyes, wide sleeves, blunt bangs, from above, dress, blunt ends, long hair, purple butterfly, butterfly, tsurime, half updo"
+PROMPT = "masterpiece, best quality, 4girls, multiple girls, bikini, swimsuit, beach, ocean, blue sky, clouds, summer, sunlight, day, outdoors, looking at viewer"
 NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts"
 H = W = 1024
 STEPS = 20
@@ -214,14 +214,14 @@ from maxdiffusion.models import anima_lllite_flax as _LL
 lllite = _LL.load_lllite(_LL_CKPT, dtype=jnp.float32)
 log(f"lllite loaded: blocks={lllite.config.block_count} in_dim={lllite.config.model_dim} "
     f"targets={list(lllite.config.blocks[min(lllite.config.blocks)])}")
-_CTL = "/content/3dpose_example.png"
+_CTL = "/content/pose4_control.png"
 if not _os.path.exists(_CTL):
     from huggingface_hub import hf_hub_download
     _CTL = hf_hub_download("toyxyz/Anima_ControlNet-LLLite",
                            "example_workflow/3dpose_example.png",
                            cache_dir="/content/hf_cache")
 _ctl_img = Image.open(_CTL).convert("RGB")
-_ctl = _LL.preprocess_control(_ctl_img, (H, W))
+_ctl = _LL.preprocess_control(_ctl_img, (H, W), aspect="letterbox")
 cond_emb = _LL.encode_conditioning(lllite, jnp.asarray(_ctl))
 cond_emb.block_until_ready()
 _expected = (H // 16) * (W // 16)
@@ -287,8 +287,8 @@ if img.shape[-1] not in (1, 3):
     img = np.moveaxis(img, 1, -1)
 img_u8 = (img[0] * 255.0).round().astype(np.uint8)
 from PIL import Image
-Image.fromarray(img_u8).save(f"/content/{OUT_NAME}.png")
-log(f"IMAGE saved /content/{OUT_NAME}.png in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
+Image.fromarray(img_u8).save("/content/anima_lllite.png")
+log(f"IMAGE saved /content/anima_lllite.png in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
 
 log("=== STAGE 6 skipped (LLLite run) ===")
 raise SystemExit(0)
