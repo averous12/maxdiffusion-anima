@@ -9,9 +9,11 @@ Run:  PYTHONPATH=src python ops/test_control_modes.py
 """
 from __future__ import annotations
 
+import os
 import sys
 
-sys.path.insert(0, "src")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # .../maxdiffusion
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from maxdiffusion.models.anima_control_modes import (  # noqa: E402
     SUPPORTED_CONTROL_COMBOS, ControlModeError, resolve_control_modes)

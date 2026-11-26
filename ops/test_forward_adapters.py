@@ -15,12 +15,15 @@ Run:  PYTHONPATH=src python ops/test_forward_adapters.py
 from __future__ import annotations
 
 import ast
+import os
 import sys
 
 WANTED = ("_transformer_forward", "transformer_forward", "snapref_target_forward",
           "lllite_forward", "lllite_snapref_target_forward")
 
-PIPELINE = "src/maxdiffusion/runtime/pipeline.py"
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)          # .../maxdiffusion
+PIPELINE = os.path.join(ROOT, "src", "maxdiffusion", "runtime", "pipeline.py")
 
 
 class _StubTransformer:

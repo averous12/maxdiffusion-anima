@@ -43,9 +43,9 @@ from the workspace root (one level above this repo):
 PYTHONPATH=maxdiffusion/src python maxdiffusion/ops/lllite_scan_test.py
 ```
 
-`test_control_modes.py` and `test_forward_adapters.py` take no checkpoint and run from
-anywhere. Making the checkpoint paths absolute instead of cwd-relative is tracked in
-`docs/REFACTOR_PLAN.md`.
+`test_control_modes.py`, `test_forward_adapters.py` and `test_forward_equivalence.py` resolve
+paths from `__file__` and run from any directory. The `lllite_*` checks still expect the
+workspace root; making their checkpoint paths absolute is tracked in `docs/REFACTOR_PLAN.md`.
 
 ## Deleting
 
