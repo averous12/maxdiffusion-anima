@@ -130,6 +130,7 @@ from maxdiffusion.models.anima_lora_flax import load_and_merge_anima_loras
 from maxdiffusion.models import anima_snapref_flax as anima_snapref
 from maxdiffusion.models import anima_regional
 from maxdiffusion.models import anima_pixel_head_flax as anima_pixel_head
+from maxdiffusion.models import anima_lllite_flax as anima_lllite
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -614,6 +615,85 @@ def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
                                    jnp.zeros((lat.shape[0],), jnp.float32), ctx, None, pad,
                                    rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
 
+@jax.jit
+def lllite_forward(tp, lat, t_vec, ctx, pad, lllite_w, cond_emb, strength):
+    """LLLite control only. The per-layer module weights ride as a scan input, exactly
+    like SnapRef's LoRA, so the 28 blocks stay scanned and nothing is unrolled."""
+    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
+                             lllite_w=lllite_w, cond_emb=cond_emb,
+                             lllite_strength=strength)
+
+@jax.jit
+def lllite_snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias,
+                                  lllite_w, cond_emb, strength):
+    """Character reference (SnapRef) and pose control (LLLite) in the same pass.
+
+    LLLite edits the q/k/v inputs pre-projection, then SnapRef prepends the cached
+    reference keys/values — the same order the reference workflow installs the patches."""
+    return transformer.apply({"params": tp}, lat, t_vec, ctx, None, pad,
+                             lora=lora, ref_kv=refkv, ref_bias=refbias,
+                             lllite_w=lllite_w, cond_emb=cond_emb,
+                             lllite_strength=strength)
+
+# --- LLLite control (ControlNet-LLLite: 3D pose / outline / regional) -------------------
+# Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
+_LLLITE_CACHE = {}
+
+
+def resolve_lllite(name):
+    """Resolve an LLLite checkpoint by exact path, else by filename under the model dirs."""
+    if name and os.path.isfile(name):
+        return name
+    for d in (os.environ.get("ANIMA_LLLITE_DIR", "").strip(),
+              os.path.join(CROOT, "anima_lllite")):
+        if d and os.path.isdir(d):
+            p = os.path.join(d, name or "")
+            if os.path.isfile(p):
+                return p
+            if not name:
+                files = sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
+                if files:
+                    return os.path.join(d, files[0])
+    raise anima_lllite.LLLiteError(f"LLLite checkpoint not found: {name!r}")
+
+
+def get_lllite(name, layers=28):
+    """Load and cache an LLLite checkpoint plus its per-layer stacked weights.
+
+    The stacked tree is the layout the scan body consumes (leading layer axis), built with
+    the same idiom as the SnapRef LoRA tree — one copy, no unrolled blocks.
+    """
+    key = (name, int(layers))
+    if key not in _LLLITE_CACHE:
+        path = resolve_lllite(name)
+        lite = anima_lllite.load_lllite(path, dtype=jnp.float32)
+        _LLLITE_CACHE[key] = {
+            "path": path,
+            "config": lite.config,
+            "w": anima_lllite.stack_lllite_weights(lite, layers),
+        }
+    return _LLLITE_CACHE[key]
+
+
+def lllite_cond_emb(lite, image, height, width):
+    """Control image -> per-token conditioning embedding, sized to the pixel resolution."""
+    arr = anima_lllite.preprocess_control(image, (height, width))
+    return anima_lllite.encode_conditioning(lite, jnp.asarray(arr))
+
+
+def lllite_cfg_prediction(latents, timestep, context, neg_context, pad, guidance, cfg):
+    """CFG with LLLite control and no SnapRef attached."""
+    w, emb = cfg["w"], cfg["cond_emb"]
+    strength = cfg.get("strength", 1.0)
+    t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0),
+                             (latents.shape[0],)).astype(jnp.float32)
+    nc = lllite_forward(t_params, latents, t_vec, context, pad, w, emb, strength)
+    nu = lllite_forward(t_params, latents, t_vec, neg_context, pad, w, emb, strength)
+    # keep the guidance delta in fp32 before bf16 rounding amplifies it
+    return (nu.astype(jnp.float32)
+            + jnp.float32(guidance) * (nc.astype(jnp.float32) - nu.astype(jnp.float32)))
+
+
 # --- pixel head decoder (optional) ------------------------------------------------------
 # A 25M-parameter ConvNeXt readout over the input of the DiT's final_layer.linear. It
 # replaces the VAE decode, whose decoder activations are the single largest transient in a
@@ -1079,9 +1159,19 @@ def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidanc
     ubias = anima_snapref.uncond_bias_for_fidelity(fid, in_uncond, rg_on)
 
     def run(ctx, extra_bias=0.0, with_ref=True):
+        lw = cfg.get("_lllite")
         if not with_ref:
+            if lw:
+                return lllite_forward(t_params, latents, t_vec, ctx, pad,
+                                      lw["w"], lw["cond_emb"], lw.get("strength", 1.0))
             return snapref_target_forward(t_params, latents, t_vec, ctx, pad, lora, None, None)
         b = jnp.asarray(anima_snapref.key_biases(sizes, biases, tgt_tokens, extra_bias))
+        if lw:
+            # pose control and character reference in one pass: LLLite edits q/k/v inputs
+            # pre-projection, SnapRef then prepends the cached reference keys/values
+            return lllite_snapref_target_forward(
+                t_params, latents, t_vec, ctx, pad, lora, cache, b,
+                lw["w"], lw["cond_emb"], lw.get("strength", 1.0))
         return snapref_target_forward(t_params, latents, t_vec, ctx, pad, lora, cache, b)
 
     cond_ref = run(context)
@@ -1559,6 +1649,26 @@ while True:
                              ref_guidance=float(_snap.get("ref_guidance", 4.5)))
         else:
             _SNAPREF_STATE["kv"] = None
+        # LLLite: opt-in pose / outline / regional control. Absent/off keeps the plain path.
+        _lllite = d.get("lllite") or {}
+        lllite_info = {}
+        if _lllite and _lllite.get("enabled", True) and _lllite.get("image") is not None:
+            write_prog(stage="lllite", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                       gen_id=gen_id, batch_total=BATCH, note="encoding control image")
+            _ll = get_lllite(_lllite.get("model"))
+            lllite_info = {
+                "w": _ll["w"],
+                "cond_emb": lllite_cond_emb(_ll, _lllite["image"], H, W),
+                "strength": float(_lllite.get("strength", 1.0)),
+                "_base": float(_lllite.get("strength", 1.0)),
+                "start_percent": float(_lllite.get("start_percent", 0.0)),
+                "end_percent": float(_lllite.get("end_percent", 1.0)),
+                "model": os.path.basename(_ll["path"]),
+                "blocks": int(_ll["config"].block_count),
+            }
+            # SnapRef's predictor reads its own cfg dict, so hang LLLite off it when both
+            # are requested — one forward then applies pose control and the reference.
+            _snap["_lllite"] = lllite_info
         regional_specs = d.get("regional") or d.get("regions") or []
         regional_info = []
         regional_schedule = (anima_regional.normalize_schedule(
@@ -1643,24 +1753,36 @@ while True:
             neg_context = neg_ctxs[neg_map[i]]
             # Regional routing can stop early: structural composition is decided in the
             # first fraction of the schedule, so running per-region prediction to the last
-            # step is mostly wasted compute. `regional_end` (0..1) closes the window; the
-            # remainder denoises with the base/global prompt alone.
-            _window_on = (i + 1) / max(1, STEPS) <= _reg_end
+            # step is mostly wasted compute. `regional_end` (0..1) closes the window for
+            # regions that carry no schedule of their own; a region with an explicit
+            # start/end keeps it and is never shortened by this value.
             # A regional set that fully tiles the canvas makes the base prediction
             # algebraically redundant: the blend below cancels `pred` on every covered
             # pixel, so running the base CFG pair is pure wasted compute. Decide before
             # paying for it -- but only when coverage is genuinely complete.
-            _active_key = (anima_regional.active_indices(regional_schedule, i, STEPS)
-                           if (regional_specs and _window_on) else ())
+            _active_key = (anima_regional.active_indices(regional_schedule, i, STEPS, _reg_end)
+                           if regional_specs else ())
             _skip_base = bool(
                 regional_specs and REGIONAL_FAST and _active_key
                 and anima_regional.full_coverage(
                     [regional_schedule[x] for x in _active_key], H // 8, W // 8))
+            if lllite_info:
+                # Workflow semantics: the control is active only inside
+                # [start_percent, end_percent] of the schedule, expressed via sigma.
+                lllite_info["strength"] = (lllite_info["_base"]
+                                           if anima_lllite.active_at(
+                                               float(sigmas[i]), lllite_info["_base"],
+                                               lllite_info["start_percent"],
+                                               lllite_info["end_percent"])
+                                           else 0.0)
             if _skip_base:
                 pred = None
             elif snap_info:
                 pred = snapref_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                               context, neg_context, pad, GUIDANCE, _snap)
+            elif lllite_info:
+                pred = lllite_cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
+                                             context, neg_context, pad, GUIDANCE, lllite_info)
             else:
                 pred = cfg_prediction(latents, jnp.asarray(np.float32(timesteps[i])),
                                       context, neg_context, pad, GUIDANCE)

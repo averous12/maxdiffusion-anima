@@ -116,20 +116,32 @@ class _Attention(nn.Module):
   cross: bool = False
   @nn.compact
   def __call__(self, x, context=None, cos=None, sin=None, mask=None, lora=None,
-               ref_kv=None, ref_bias=None, record=False):
+               ref_kv=None, ref_bias=None, record=False,
+               lllite_w=None, cond_emb=None, lllite_strength=0.0):
     """Self/cross attention. `lora`, `ref_kv`, `ref_bias`, `record` are SnapRef-only and
     default to the plain path, which stays bit-identical (no extra op is emitted).
 
     ref_kv: (k, v) [1, S_ref, heads, head_dim] cached reference keys/values, already RoPE'd;
     they are prepended to this call's own keys. ref_bias: [S_ref + S] additive log-scale bias
     on the attention scores, the SnapRef `strength` / per-reference weights.
+
+    `lllite_w` is THIS layer's slice of the stacked LLLite modules (target -> weights),
+    handed in exactly like `lora`. When present, the *inputs* to the q/k/v projections are
+    edited first — that is where the reference hooks (predict2.py:160-179), so q/k/v are
+    projected from the conditioned hidden states rather than the raw ones.
     """
     ctx = x if context is None else context
     d = self.hidden // self.heads
     qd = self.hidden // self.heads
-    q = self._proj(x, "to_q", lora, self.hidden).reshape(x.shape[0], x.shape[1], self.heads, qd)
-    k = self._proj(ctx, "to_k", lora, self.hidden).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
-    v = self._proj(ctx, "to_v", lora, self.hidden).reshape(ctx.shape[0], ctx.shape[1], self.heads, qd)
+    if lllite_w is not None and cond_emb is not None:
+      from maxdiffusion.models import anima_lllite_flax as _lllite
+      q_in, k_in, v_in = _lllite.attention_inputs_w(
+          lllite_w, x, cond_emb, lllite_strength, is_self=not self.cross, context=context)
+    else:
+      q_in, k_in, v_in = x, ctx, ctx
+    q = self._proj(q_in, "to_q", lora, self.hidden).reshape(q_in.shape[0], q_in.shape[1], self.heads, qd)
+    k = self._proj(k_in, "to_k", lora, self.hidden).reshape(k_in.shape[0], k_in.shape[1], self.heads, qd)
+    v = self._proj(v_in, "to_v", lora, self.hidden).reshape(v_in.shape[0], v_in.shape[1], self.heads, qd)
     q = _rms(q, self.param("norm_q", nn.initializers.ones, (qd,)))
     k = _rms(k, self.param("norm_k", nn.initializers.ones, (qd,)))
     if not self.cross and cos is not None:
@@ -183,20 +195,30 @@ class _Block(nn.Module):
   adaln_dim: int
   @nn.compact
   def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask=None,
-               lora=None, ref_kv=None, ref_bias=None, record=False):
+               lora=None, ref_kv=None, ref_bias=None, record=False,
+               lllite_w=None, cond_emb=None, lllite_strength=0.0):
+    lk = {} if lllite_w is None or cond_emb is None else {
+        "lllite_w": lllite_w, "cond_emb": cond_emb,
+        "lllite_strength": lllite_strength}
     h, gate1 = _AdaLN(self.hidden, self.adaln_dim, name="norm1")(x.astype(jnp.float32), embedded_timestep, temb)
     # fp32 residual accumulation: bf16 activations in, fp32 adds out.
     attn1 = _Attention(self.hidden, self.heads, name="attn1")
     if record:
       y, kv = attn1(h, cos=cos, sin=sin, lora=_sub(lora, "attn1"), ref_kv=ref_kv,
-                    ref_bias=ref_bias, record=True)
+                    ref_bias=ref_bias, record=True, **lk)
     else:
-      y = attn1(h, cos=cos, sin=sin, lora=_sub(lora, "attn1"), ref_kv=ref_kv, ref_bias=ref_bias)
+      y = attn1(h, cos=cos, sin=sin, lora=_sub(lora, "attn1"), ref_kv=ref_kv, ref_bias=ref_bias,
+                **lk)
     x = x.astype(jnp.float32) + gate1 * y.astype(jnp.float32)
     h, gate2 = _AdaLN(self.hidden, self.adaln_dim, name="norm2")(x, embedded_timestep, temb)
     x = x + gate2 * _Attention(self.hidden, self.heads, self.context_dim, cross=True, name="attn2")(
-        h, context=context, mask=mask, lora=_sub(lora, "attn2")).astype(jnp.float32)
+        h, context=context, mask=mask, lora=_sub(lora, "attn2"), **lk).astype(jnp.float32)
     h, gate3 = _AdaLN(self.hidden, self.adaln_dim, name="norm3")(x, embedded_timestep, temb)
+    if lk:
+      # mlp_layer1 hooks the MLP input, the same way the reference's MLP patch does
+      from maxdiffusion.models import anima_lllite_flax as _lllite
+      h = _lllite.apply_module_params(lllite_w.get("mlp_layer1"), h, cond_emb,
+                                      lllite_strength)
     h = _lora_dense(nn.Dense(self.hidden * 4, use_bias=False, name="ff_in"), h, _sub(lora, "ff_in"))
     h = nn.gelu(h, approximate=False)
     ff = _lora_dense(nn.Dense(self.hidden, use_bias=False, name="ff_out"), h, _sub(lora, "ff_out"))
@@ -234,10 +256,12 @@ class _ScannedBlock(nn.Module):
   record: bool = False
   @nn.compact
   def __call__(self, x, embedded_timestep, temb, context, cos, sin, mask, lora=None,
-               ref_kv=None, ref_bias=None):
+               ref_kv=None, ref_bias=None, lllite_w=None, cond_emb=None,
+               lllite_strength=0.0):
     out = _Block(self.hidden, self.heads, self.context_dim, self.adaln_dim, name="b")(
         x, embedded_timestep, temb, context, cos, sin, mask,
-        lora=lora, ref_kv=ref_kv, ref_bias=ref_bias, record=self.record)
+        lora=lora, ref_kv=ref_kv, ref_bias=ref_bias, record=self.record,
+        lllite_w=lllite_w, cond_emb=cond_emb, lllite_strength=lllite_strength)
     if self.record:
       out, kv = out
       return out, kv
@@ -319,7 +343,8 @@ class FlaxAnimaCosmosTransformer(nn.Module):
   @nn.compact
   def __call__(self, hidden_states, timestep, encoder_hidden_states, attention_mask=None,
                padding_mask=None, rope_override=None, t_embed_add=None, lora=None,
-               ref_kv=None, ref_bias=None):
+               ref_kv=None, ref_bias=None,
+               lllite_w=None, cond_emb=None, lllite_strength=0.0):
     b, c, t, h, w = hidden_states.shape
     if padding_mask is None:
       padding_mask = jnp.zeros((b, 1, h, w), dtype=hidden_states.dtype)
@@ -360,6 +385,9 @@ class FlaxAnimaCosmosTransformer(nn.Module):
     if self.scan_blocks:
       # One block body compiled once and looped, instead of 28 unrolled
       # subgraphs. This is what keeps host compile memory bounded.
+      # LLLite rides this loop the same way SnapRef's LoRA does: its per-layer module
+      # weights ride as a scan input with a leading layer axis, so no block is unrolled
+      # and only one copy of the weights exists.
       n = self.layers if self.active_layers is None else self.active_layers
       ScanBlock = nn.scan(
           _ScannedBlock,
@@ -367,12 +395,15 @@ class FlaxAnimaCosmosTransformer(nn.Module):
           split_rngs={"params": False},
           length=n,
           in_axes=(_scan_broadcast,) * 6 + (snapref_in_axes(lora), snapref_in_axes(ref_kv),
+                                            _scan_broadcast,
+                                            snapref_in_axes(lllite_w), _scan_broadcast,
                                             _scan_broadcast),
       )
       x, kv = ScanBlock(hidden, self.heads, self.context_dim, self.adaln_dim,
                         record=self.record_kv, name="scan")(
           x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask,
-          lora, ref_kv, ref_bias)
+          lora, ref_kv, ref_bias,
+          lllite_w, cond_emb, lllite_strength)
       x = x.astype(jnp.float32)
     else:
       kv = None
@@ -382,7 +413,9 @@ class FlaxAnimaCosmosTransformer(nn.Module):
         x = _Block(hidden, self.heads, self.context_dim, self.adaln_dim, name=f"transformer_blocks_{i}")(
             x, embedded_timestep, temb, encoder_hidden_states, cos, sin, attention_mask,
             lora=layer_slice(lora, i), ref_kv=layer_slice(ref_kv, i), ref_bias=ref_bias,
-            record=self.record_kv)
+            record=self.record_kv,
+            lllite_w=layer_slice(lllite_w, i), cond_emb=cond_emb,
+            lllite_strength=lllite_strength)
         if self.record_kv:
           x, kv = x
         x = x.astype(jnp.float32)
@@ -444,6 +477,38 @@ def stack_block_params(converted, num_layers):
       continue
     stacked[k] = v
   return stacked
+
+
+def unstack_block_params(params, num_layers):
+  """Inverse of stack_block_params: ('scan','b',*rest) -> ('transformer_blocks_i', *rest).
+
+  A generic utility for moving a stacked param tree back to the unrolled layout, e.g. to
+  run the per-layer block loop for debugging or per-block inspection. LLLite does NOT need
+  it: its weights ride the scan as a per-layer input (see stack_lllite_weights).
+  """
+  from flax.traverse_util import flatten_dict, unflatten_dict
+  try:
+    flat = flatten_dict(params)
+  except (TypeError, ValueError):
+    flat = dict(params)
+
+  out = {}
+  seen_scan = False
+  for key, value in flat.items():
+    if len(key) >= 2 and key[0] == "scan" and key[1] == "b":
+      seen_scan = True
+      rest = tuple(key[2:])
+      n = int(value.shape[0])
+      if n != num_layers:
+        raise ValueError(f"unstack_block_params: {key} has {n} layers, expected {num_layers}")
+      for i in range(num_layers):
+        out[(f"transformer_blocks_{i}",) + rest] = value[i]
+    else:
+      out[key] = value
+  if not seen_scan:
+    raise ValueError("unstack_block_params: no ('scan','b',...) leaves found; params are "
+                     "already per-block or in an unexpected layout")
+  return unflatten_dict(out)
 
 
 def _aesthetic_get(available, name):
