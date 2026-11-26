@@ -11,41 +11,6 @@ import os
 import threading
 import time
 import hashlib
-
-# Content root. Colab keeps the historical /content; ANIMA_CONTENT_ROOT lets the same
-# script run (and be tested) on a normal machine without touching any other default.
-CROOT = os.environ.get("ANIMA_CONTENT_ROOT", "/content")
-LOG = open(os.path.join(CROOT, "anima_server.log"), "a", buffering=1)
-def log(msg):
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
-    LOG.write(line + "\n")
-
-def rss_gb():
-    try:
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmRSS"):
-                    return int(line.split()[1]) / 1e6
-    except Exception:
-        pass
-    # Non-Linux fallback (local CPU runs of this same script): keep the field meaningful.
-    try:
-        import psutil
-        return psutil.Process().memory_info().rss / 1e9
-    except Exception:
-        return 0.0
-
-def hbm_stats():
-    try:
-        ms = jax.devices()[0].memory_stats() or {}
-        return {"in_use_gb": round(ms.get("bytes_in_use", 0) / 1e9, 2),
-                "peak_gb": round(ms.get("peak_bytes_in_use", 0) / 1e9, 2),
-                "limit_gb": round(ms.get("bytes_limit", 0) / 1e9, 2)}
-    except Exception:
-        return {}
-
-log("=== SERVER boot: imports ===")
 import os
 import json
 import math
@@ -53,62 +18,8 @@ import numpy as np
 import gc
 import traceback
 import faulthandler
-# Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
-# It dumps the live stack of every thread once, which is what localizes a stall.
-faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
-# A dump on SIGUSR1 lets a stall be inspected without killing the process:
-#   kill -USR1 <pid>   -> every thread's stack goes to the log.
-try:
-    import signal as _signal
-    faulthandler.register(_signal.SIGUSR1, all_threads=True)
-except Exception:
-    pass
 import jax
-jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
-
-# Persistent XLA executable cache: the 52s VAE + 16s transformer warmup
-# compiles are pure compile cost, keyed on SHAPES not weight values, so a
-# server reboot (LoRA Apply, watchdog restart) can load them instead of
-# recompiling. The cache key includes JAX/libtpu versions + topology, so a
-# fresh VM allocation recompiles once — that is expected and cheap-ish.
-# Drive is used ONLY when actually mounted (cold_start / anima_job do not
-# mount it, and an unmounted makedirs would silently create a dead local
-# directory under /content); otherwise fall back to the VM-local path, which
-# still spans server reboots within this VM's life.
-XLA_CACHE = os.environ.get("ANIMA_XLA_CACHE", "")
-# One Drive tree for both caches: /content/drive/MyDrive/anima_cache/{hf,xla}.
-# This default only exists so a forgotten env var cannot silently lose the
-# cache; the agenda sets ANIMA_XLA_CACHE explicitly. The pre-unification
-# /content/drive/MyDrive/anima_xla_cache stays readable as a fallback so
-# entries written before the tree was unified are not thrown away.
-DRIVE_XLA = "/content/drive/MyDrive/anima_cache/xla"
-LEGACY_DRIVE_XLA = "/content/drive/MyDrive/anima_xla_cache"
-if not XLA_CACHE:
-    if os.path.isdir("/content/drive/MyDrive"):
-        XLA_CACHE = DRIVE_XLA
-    elif os.path.isdir(LEGACY_DRIVE_XLA):
-        XLA_CACHE = LEGACY_DRIVE_XLA
-    else:
-        XLA_CACHE = "/content/anima_xla_cache"
-try:
-    os.makedirs(XLA_CACHE, exist_ok=True)
-    jax.config.update("jax_compilation_cache_dir", XLA_CACHE)
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
-    jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
-    _persistent = XLA_CACHE.startswith("/content/drive/")
-    log(f"XLA cache: {XLA_CACHE} (drive={_persistent} persistent={_persistent})")
-    if not _persistent:
-        # Loud on purpose: a silent fallback here means the ~68 s of warmup
-        # compiles is paid every single session and nobody notices.
-        log("XLA cache WARNING: NOT persistent -- this directory lives on the VM "
-            "and is lost at the next allocation; set ANIMA_XLA_CACHE="
-            + DRIVE_XLA + " to keep it")
-except Exception as e:
-    log(f"XLA cache disabled ({type(e).__name__}: {e}); compiling every boot")
-    XLA_CACHE = ""
 import jax.numpy as jnp
-log("matmul precision: BF16_BF16_F32 (bf16 operands, fp32 accumulate; activations stay fp32)")
-
 from maxdiffusion.models.anima_cosmos_flax import FlaxAnimaCosmosTransformer, convert_anima_aesthetic_weights
 from maxdiffusion.models.anima_text_conditioner_flax import (
     AnimaTextConditionerConfig, FlaxAnimaTextConditioner,
@@ -129,40 +40,42 @@ from maxdiffusion.schedulers.scheduling_flow_match_flax import (
 from flax import nnx
 from flax.traverse_util import flatten_dict as _flatten_dict
 from huggingface_hub import snapshot_download
+import shutil
+from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
+from tokenizers import Tokenizer as _RawTokenizer
+import maxdiffusion.anima_prompt_control as prompt_control
 
-log(f"devices: {jax.devices()}")
-log(f"HBM at boot: {hbm_stats()}")
+def log(msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    LOG.write(line + "\n")
 
-# ---------------------------------------------------------------------------
-# All weight conversion runs with CPU as the default device.
-#
-# The converters build their trees leaf-by-leaf with jnp.asarray. With the TPU as
-# the default device each leaf becomes its own host->TPU transfer: measured 227.9s
-# for the transformer instead of 60.6s. One explicit device_put at the end is far
-# cheaper, and it keeps the HBM peak at 3.91 GB instead of 10.21 GB.
-#
-# There is deliberately NO msgpack parameter cache here. Measured on the real tree,
-# flax_serialization.to_bytes + write costs 76s for the 6.6 GB stacked transformer
-# tree (45.9s serialize + 30.1s write) while re-converting the whole thing takes
-# ~10s, so caching is a net loss. The old VAE cache write was also a latent crash
-# ("TypeError: can not serialize 'State' object") that killed the server outright
-# whenever the cache was invalid.
-# ---------------------------------------------------------------------------
-# The project's Colab venv installs a TPU-only jax build, where jax.devices("cpu")
-# raises "Unknown backend cpu". Fall back to the default device so the host-side
-# weight conversion still runs (it just happens on the TPU device instead).
-try:
-    _CPU = jax.devices("cpu")[0]
-except (RuntimeError, ValueError):
-    _CPU = jax.devices()[0]
-    log(f"no CPU backend in this jax build; host conversion uses {_CPU.device_kind}")
 
-CACHE_DIR = os.path.join(CROOT, "anima_cache")  # retained for the HF cache only; no param cache
-REQ_PATH = os.path.join(CROOT, "anima_request.json")
-PROG_PATH = os.path.join(CROOT, "anima_progress.json")
-SNAP_PATH = os.path.join(CROOT, "anima_snap.png")
-# The client creates this file to cancel the running generation.
-INTERRUPT_PATH = os.path.join(CROOT, "anima_interrupt")
+def rss_gb():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        pass
+    # Non-Linux fallback (local CPU runs of this same script): keep the field meaningful.
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1e9
+    except Exception:
+        return 0.0
+
+
+def hbm_stats():
+    try:
+        ms = jax.devices()[0].memory_stats() or {}
+        return {"in_use_gb": round(ms.get("bytes_in_use", 0) / 1e9, 2),
+                "peak_gb": round(ms.get("peak_bytes_in_use", 0) / 1e9, 2),
+                "limit_gb": round(ms.get("bytes_limit", 0) / 1e9, 2)}
+    except Exception:
+        return {}
+
 
 def _json_public(value):
     """Drop private runtime handles before writing request/progress JSON."""
@@ -185,75 +98,6 @@ def write_prog(**kw):
     except Exception:
         pass
 
-t_all = time.perf_counter()
-# Weight cache: the two snapshot_download calls below used to hardcode
-# /content/hf_cache, which ignored HF_HOME entirely -- so weights pre-fetched
-# into Drive were never used and every session paid the ~5.6 GB download again.
-# ANIMA_HF_CACHE wins, then HF_HOME, then the old VM-local path.
-HF_CACHE = (os.environ.get("ANIMA_HF_CACHE") or os.environ.get("HF_HOME")
-            or "/content/hf_cache")
-os.makedirs(HF_CACHE, exist_ok=True)
-log(f"weight cache (HF): {HF_CACHE} (persistent={HF_CACHE.startswith('/content/drive/')})")
-# Weight sources are overridable from the notebook's "links" cell via env; empty
-# = the standard Anima aesthetic family. Each is an HF repo id that
-# snapshot_download / from_pretrained can resolve (the base repo must carry the
-# tokenizer / text_encoder / t5_tokenizer subfolders the loader reads).
-BASE_REPO = os.environ.get("ANIMA_BASE_REPO", "circlestone-labs/Anima-Base-v1.0-Diffusers").strip()
-AESTHETIC_REPO = os.environ.get("ANIMA_AESTHETIC_REPO", "circlestone-labs/Anima").strip()
-AESTHETIC_FILE = os.environ.get("ANIMA_AESTHETIC_FILE",
-                                "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors").strip()
-log(f"weight sources: base={BASE_REPO} | aesthetic={AESTHETIC_REPO}/{AESTHETIC_FILE}")
-snapshot_dir = snapshot_download(BASE_REPO, cache_dir=HF_CACHE)
-aesthetic_snapshot = snapshot_download(AESTHETIC_REPO, cache_dir=HF_CACHE,
-                                       allow_patterns=[AESTHETIC_FILE])
-import shutil
-aesthetic_path = os.path.join(CROOT, os.path.basename(AESTHETIC_FILE))
-_src = os.path.join(aesthetic_snapshot, AESTHETIC_FILE)
-if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
-    shutil.copyfile(_src, aesthetic_path)
-log(f"base weights at {snapshot_dir}")
-log(f"aesthetic transformer+conditioner: {aesthetic_path} ({os.path.getsize(aesthetic_path)/1e9:.2f} GB)")
-
-log("=== SERVER: torch tokenizer + TPU Qwen3 load (once) ===")
-t0 = time.perf_counter()
-from transformers import AutoConfig as HFAutoConfig, AutoTokenizer
-from tokenizers import Tokenizer as _RawTokenizer
-tok = AutoTokenizer.from_pretrained(BASE_REPO, subfolder="tokenizer")
-_t5 = _RawTokenizer.from_file(os.path.join(snapshot_dir, "t5_tokenizer", "tokenizer.json"))
-_t5.enable_padding(pad_id=0, pad_token="<pad>", length=512)
-_t5.enable_truncation(max_length=512)
-pc = HFAutoConfig.from_pretrained(BASE_REPO, subfolder="text_encoder")
-rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
-qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
-    intermediate_size=pc.intermediate_size, num_hidden_layers=pc.num_hidden_layers,
-    num_attention_heads=pc.num_attention_heads, num_key_value_heads=pc.num_key_value_heads,
-    head_dim=getattr(pc, "head_dim", pc.hidden_size // pc.num_attention_heads),
-    rms_norm_eps=pc.rms_norm_eps, rope_theta=rope_theta,
-    max_position_embeddings=pc.max_position_embeddings, dtype=jnp.bfloat16,
-    max_layer_to_run=None, is_causal=True)
-qwen3_model = FlaxQwen3Model(qcfg)
-qv = jax.eval_shape(qwen3_model.init, jax.random.key(0),
-                    jax.ShapeDtypeStruct((1, 512), jnp.int32),
-                    jax.ShapeDtypeStruct((1, 512), jnp.int32))
-with jax.default_device(_CPU):
-    qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qcfg)
-del qv
-gc.collect()
-qwen3_params = jax.device_put(qwen3_params, jax.devices()[0])
-qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
-log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
-
-# --- prompt control begin -----------------------------------------------------
-# Weighting AND scheduling come from maxdiffusion.anima_prompt_control, which
-# implements the ComfyUI core weighting syntax and the asagi4/comfyui-prompt-control
-# scheduling grammar. The old inline parser only understood "(text:weight)" and
-# could not schedule, so it is gone.
-import maxdiffusion.anima_prompt_control as prompt_control
-
-PROMPT_STYLE = (os.environ.get("ANIMA_PROMPT_STYLE", "comfy").strip().lower()
-                or "comfy")
-# T5 is our text encoder, and prompt-control documents BREAK as a no-op for T5;
-# CAT is the operator that actually splits/concatenates conditioning.
 
 def token_weights(offsets, cw, text):
     """Per-token weight = mean char weight over the token's span (leading spaces ignored)."""
@@ -266,7 +110,7 @@ def token_weights(offsets, cw, text):
         if b > a:
             tw[k] = float(cw[a:b].mean())
     return tw
-# --- prompt control end ---
+
 
 def _encode_text_list(pairs):
     """[(clean_text, per_char_weights)] -> (qhidden, qmask, t5ids, t5mask), batched.
@@ -382,49 +226,8 @@ def encode_texts(prompt, neg, steps=30, style=None, tags=None, seed=0):
     log(f"prompt control [{style}]: pos {prompt_control.describe(pos_plan)} | "
         f"neg {prompt_control.describe(neg_plan)}")
     return (pos_ctxs, pos_map, pos_plan), (neg_ctxs, neg_map, neg_plan)
-log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
 
-log("=== SERVER: conditioner ===")
-t0 = time.perf_counter()
-cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
-conditioner = FlaxAnimaTextConditioner(cond_cfg)
-cv = jax.eval_shape(conditioner.init, jax.random.key(1),
-                    jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
-                    jax.ShapeDtypeStruct((1, 8), jnp.int32))
-with jax.default_device(_CPU):
-    cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
-del cv
-gc.collect()
-log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
 
-log("=== SERVER: transformer (scan_blocks=True) ===")
-t0 = time.perf_counter()
-transformer = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True)
-# Shape-only init: the converters read .shape, never values, so eval_shape gives the
-# full parameter tree in ~0.2s with negligible RSS (vs ~40s and a multi-GB dummy tree).
-tv = jax.eval_shape(
-    transformer.init, jax.random.key(2),
-    jax.ShapeDtypeStruct((1, 16, 1, 8, 8), jnp.float32),
-    jax.ShapeDtypeStruct((1,), jnp.float32),
-    jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
-)
-t_shape = time.perf_counter() - t0
-t0 = time.perf_counter()
-try:
-    with jax.default_device(_CPU):
-        t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
-                                                   dtype=jnp.bfloat16, num_layers=28)
-except Exception:
-    log("transformer: conversion raised:\n" + traceback.format_exc())
-    raise
-t_conv = time.perf_counter() - t0
-del tv
-gc.collect()
-log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
-
-# --- Optional LoRA merge (must happen on CPU before device_put) ---
-# ANIMA_LORAS is a JSON list of {"path": ..., "scale": ...} merged in one pass.
-# ANIMA_LORA_PATH / ANIMA_LORA_SCALE remain supported for a single LoRA.
 def swap_loras(specs):
     """Rebuild t_params from the pristine as-booted weights with `specs` merged.
 
@@ -484,48 +287,6 @@ def _lora_specs():
             specs.append((p, float(os.environ.get("ANIMA_LORA_SCALE", "1.0"))))
     return specs
 
-lora_specs = [(p, s) for p, s in _lora_specs() if os.path.exists(p)]
-missing = [(p, s) for p, s in _lora_specs() if not os.path.exists(p)]
-for p, _ in missing:
-    log(f"WARNING: LoRA path not found, skipping: {p}")
-
-if lora_specs:
-    log("merging %d LoRA(s): %s" % (len(lora_specs),
-        ", ".join(f"{os.path.basename(p)}@{s}" for p, s in lora_specs)))
-    t_lora0 = time.perf_counter()
-    try:
-        t_params, lora_stats = load_and_merge_anima_loras(
-            t_params, lora_specs, dtype=jnp.bfloat16)
-        log(f"LoRA merged: {lora_stats['merged']} layer-targets, "
-            f"{lora_stats['skipped']} skipped | format={lora_stats.get('format')} "
-            f"targets={lora_stats.get('targets')} "
-            f"convention={lora_stats.get('convention')} "
-            f"in {time.perf_counter()-t_lora0:.2f}s")
-        # A partially applied LoRA still produces a plausible image, so an
-        # unexpected skip count must be loud rather than silent.
-        if lora_stats.get("skipped"):
-            log(f"WARNING: {lora_stats['skipped']} layer-targets were skipped; "
-                f"the LoRA is only partially applied")
-        for _d in lora_stats.get("details", [])[:10]:
-            log(f"  lora: {_d}")
-    except Exception:
-        log("LoRA merge failed:\n" + traceback.format_exc())
-        raise
-else:
-    log("no LoRA configured (ANIMA_LORAS / ANIMA_LORA_PATH) or file not found")
-
-# What is merged into the weights right now. swap_loras maintains this; seeding
-# it from the boot spec matters because the diff below compares against it -- an
-# empty seed would make the first prompt re-merge a LoRA that is already loaded,
-# and would make a tag-free prompt look like it needed nothing when the boot
-# LoRA was still resident.
-_LORA_SPECS = list(lora_specs)
-
-# Directories scanned for <lora:name:scale> resolution. Both are accepted: the
-# UI's own folder and the one the benchmark tooling downloads into.
-LORA_DIRS = [d for d in (os.environ.get("ANIMA_LORA_DIR", "").strip(),
-                         os.path.join(CROOT, "anima_lora"), os.path.join(CROOT, "loras")) if d]
-
 
 def installed_lora_files():
     """Every .safetensors under LORA_DIRS, cheapest-first ordered."""
@@ -539,59 +300,14 @@ def installed_lora_files():
                     out.append(os.path.join(root, f))
     return sorted(set(out))
 
-t0 = time.perf_counter()
-# Keep the as-booted tree alive on the host: it is what every later hot-swap
-# rebuilds from. jax.device_put does not consume the host arrays, so this holds
-# a reference rather than making a copy, and HBM is unchanged.
-_T_PARAMS_PRISTINE = t_params
-t_params = jax.device_put(t_params, jax.devices()[0])
-log(f"transformer params -> TPU in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
 
-log("=== SERVER: VAE ===")
-t0 = time.perf_counter()
-vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
-_st = nnx.state(vae, nnx.Param)
-_fs = dict(nnx.to_flat_state(_st))
-_ft = {k: v.value for k, v in _fs.items()}
-with jax.default_device(_CPU):
-    _conv = load_qwen_image_vae(snapshot_dir, _ft)
-    _cf = _flatten_dict(_conv)
-    _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
-    _nf, _miss = {}, []
-    for _k, _vs in _fs.items():
-        _p = "/".join(str(x) for x in _k)
-        if _p in _cf_by_path:
-            _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
-        else:
-            _miss.append(_p)
-assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
-nnx.update(vae, nnx.State.from_flat_path(_nf))
-del _ft, _conv, _cf, _cf_by_path, _nf, _st, _fs
-gc.collect()
-log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
-
-@jax.jit
 def cond_forward(c_params, source_hidden, source_mask, target_ids, target_mask):
     return conditioner.apply({"params": c_params}, source_hidden_states=source_hidden,
                              target_input_ids=target_ids,
                              source_attention_mask=source_mask,
                              target_attention_mask=target_mask)
 
-# --- The one transformer forward -------------------------------------------------------
-# Four near-identical jitted bodies used to live here (plain, snapref, lllite, lllite+snapref),
-# differing only in which kwargs they forwarded. They are one compiled body plus thin
-# adapters now, so a new control combination is a call rather than another function.
-#
-# Why this stays cheap on a live Gradio server serving varied requests: jax.jit keys its
-# executables on the *pytree structure* of the arguments. Absent features are omitted instead
-# of passed as a sentinel, so each mode traces once and is cached thereafter -- switching
-# modes on a running server reuses the compiled graph rather than recompiling. The opposite
-# shape, one graph with every feature always present, would compile snapref and lllite into
-# every request and pay their cost even in plain mode.
-#
-# CFG (two calls + combine) stays eager: a nested jit over both calls duplicates a large HLO
-# and was what previously blew up compile memory.
-@jax.jit
+
 def _transformer_forward(tp, lat, t_vec, ctx, pad, lora=None, refkv=None, refbias=None,
                          lllite_w=None, cond_emb=None, strength=0.0):
     kwargs = {}
@@ -611,25 +327,20 @@ def transformer_forward(tp, lat, t_vec, ctx, pad):
     """Plain forward: no LoRA, no reference, no control."""
     return _transformer_forward(tp, lat, t_vec, ctx, pad)
 
-# --- SnapRef (reference adapter) -------------------------------------------------------
-# Nothing here runs unless a request carries "snapref".
-# A second module instance whose scan emits every layer's self-attention (k, v): the
-# reference pass needs those, the target pass does not, so they cannot share one instance.
-_SNAPREF_RECORDER = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, record_kv=True)
-
 
 def snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
     """LoRA and/or reference; refkv=None disables the reference half of the pair."""
     return _transformer_forward(tp, lat, t_vec, ctx, pad, lora=lora, refkv=refkv,
                                 refbias=refbias)
 
-@jax.jit
+
 def snapref_reference_forward(tp, lat, ctx, pad, cos, sin, mode_vec, lora):
     # record_kv is a Module field, not a call argument: a separate instance is what makes the
     # scan emit every layer's self-attention (k, v) instead of the residual stream alone.
     return _SNAPREF_RECORDER.apply({"params": tp}, lat,
                                    jnp.zeros((lat.shape[0],), jnp.float32), ctx, None, pad,
                                    rope_override=(cos, sin), t_embed_add=mode_vec, lora=lora)
+
 
 def lllite_forward(tp, lat, t_vec, ctx, pad, lllite_w, cond_emb, strength):
     """LLLite control only. The per-layer module weights ride as a scan input, exactly
@@ -647,16 +358,6 @@ def lllite_snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias
     return _transformer_forward(tp, lat, t_vec, ctx, pad, lora=lora, refkv=refkv,
                                 refbias=refbias, lllite_w=lllite_w,
                                 cond_emb=cond_emb, strength=strength)
-
-# --- LLLite control (ControlNet-LLLite: 3D pose / outline / regional) -------------------
-# Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
-_LLLITE_CACHE = {}
-
-# Exactly the control combinations the generate path supports. The definition lives in
-# anima_control_modes so the server and its tests cannot disagree about the rules.
-# "regional+lllite" is excluded on purpose: regional prediction replaces the base prediction
-# per region, so a whole-image control would be silently dropped rather than applied.
-assert SUPPORTED_CONTROL_COMBOS, "control-mode table must not be empty"
 
 
 def resolve_lllite(name):
@@ -718,26 +419,10 @@ def lllite_cfg_prediction(latents, timestep, context, neg_context, pad, guidance
             + jnp.float32(guidance) * (nc.astype(jnp.float32) - nu.astype(jnp.float32)))
 
 
-# --- pixel head decoder (optional) ------------------------------------------------------
-# A 25M-parameter ConvNeXt readout over the input of the DiT's final_layer.linear. It
-# replaces the VAE decode, whose decoder activations are the single largest transient in a
-# 1024px run (~8.7 GB measured), with a small head plus one 2048-wide feature tensor.
-PIXEL_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
-                          os.path.join(CROOT, "anima_pixel_heads")) if d and os.path.isdir(d)]
-DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "pixel").strip().lower()
-# Skip the base CFG pair when active regions fully tile the canvas (the blend cancels it
-# exactly). Kept switchable so the optimisation can be A/B'd against the old maths.
-REGIONAL_FAST = (os.environ.get("ANIMA_REGIONAL_FAST", "1").strip().lower()
-                 not in ("0", "false", "no", "off"))
-PIXEL_HEAD_DEFAULT = (os.environ.get("ANIMA_PIXEL_HEAD") or "").strip()
-
-_PIXEL_TAP = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, return_final_feat=True)
-_PIXEL_HEADS = {}
-
-@jax.jit
 def pixel_tap_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias):
     return _PIXEL_TAP.apply({"params": tp}, lat, t_vec, ctx, None, pad,
                             lora=lora, ref_kv=refkv, ref_bias=refbias)
+
 
 def installed_pixel_heads():
     out = []
@@ -747,6 +432,7 @@ def installed_pixel_heads():
                 if f.lower().endswith(".safetensors"):
                     out.append(os.path.join(root, f))
     return sorted(set(out))
+
 
 def resolve_pixel_head(name):
     want = (name or PIXEL_HEAD_DEFAULT or "").strip()
@@ -766,6 +452,7 @@ def resolve_pixel_head(name):
     raise anima_pixel_head.PixelHeadError(
         f"pixel head not found: {want} (have {[os.path.basename(f) for f in files]})")
 
+
 def get_pixel_head(name):
     path = resolve_pixel_head(name)
     if path not in _PIXEL_HEADS:
@@ -779,6 +466,7 @@ def get_pixel_head(name):
             f"(width {info['width']}, depth {info['depth']}, up {info['up']}, "
             f"patch {info['patch']}px, channels {info['channels']}) | {hbm_stats()}")
     return _PIXEL_HEADS[path]
+
 
 def pixel_features(latents, timestep, context, neg_context, pad, guidance, snap_cfg):
     """CFG-combined final-layer features f_u + g*(f_c - f_u), as the node does.
@@ -805,6 +493,7 @@ def pixel_features(latents, timestep, context, neg_context, pad, guidance, snap_
     _, fu = pixel_tap_forward(t_params, latents, t_vec, neg_context, pad, lora, None, None)
     return fu + jnp.asarray(np.float32(guidance)) * (fc - fu)
 
+
 def pixel_decode_images(feats, x_t, head_name):
     """Features (B, tokens, d_feat) + the last x_t -> list of B uint8 HxWx3 arrays."""
     fn, params, info = get_pixel_head(head_name)
@@ -820,6 +509,7 @@ def pixel_decode_images(feats, x_t, head_name):
         out.append((arr * 255.0).round().astype(np.uint8))
     return out
 
+
 def snapref_encode_latent(z):
     """Reference pixels (1,3,1,H,W) -> sampler-space latent, jitted on one active shape."""
     global _SNAPREF_ENC_KEY
@@ -834,9 +524,6 @@ def snapref_encode_latent(z):
             _m, q, vae.latents_mean, vae.latents_std)[0])
     return _SNAPREF_ENC[key](z)
 
-_SNAPREF_ENC = {}
-_SNAPREF_ENC_CACHE = {}
-_SNAPREF_ENC_KEY = None
 
 def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
     t_vec = jnp.broadcast_to(timestep / jnp.float32(1000.0), (latents.shape[0],)).astype(jnp.float32)
@@ -845,17 +532,6 @@ def cfg_prediction(latents, timestep, context, neg_context, pad, guidance):
     nc32 = nc.astype(jnp.float32)
     nu32 = nu.astype(jnp.float32)
     return nu32 + jnp.float32(guidance) * (nc32 - nu32)
-
-# --- SnapRef session: reference prep + reference-aware CFG -------------------------------
-SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
-                            os.path.join(CROOT, "anima_snapref"),
-                            os.path.join(os.path.dirname(LORA_DIRS[0]), "snapref"))
-                if d]
-_SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
-_SNAPREF_ACTIVE_ADAPTER = None
-_SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
-_SNAPREF_HOST_CACHE = {}         # key -> host-side prepared result; never TPU-resident
-_SNAPREF_HOST_CACHE_MAX = max(1, int(os.environ.get("ANIMA_SNAPREF_HOST_CACHE_MAX", "8")))
 
 
 def _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout):
@@ -875,6 +551,7 @@ def _snapref_cache_key(ad, cfg, active, target_hw, megapixels, layout):
     payload = repr((ad.path, target_hw, layout, megapixels, cfg.get("mode") or "cs",
                     cfg.get("ref_caption") or "", cfg.get("strength", 0.0), refs)).encode()
     return hashlib.sha256(payload).hexdigest()
+
 
 def clear_snapref_runtime():
     """Release request-scoped reference K/V without evicting reusable XLA executables."""
@@ -908,6 +585,7 @@ def installed_snapref_files():
                     out.append(os.path.join(root, f))
     return sorted(set(out))
 
+
 def resolve_snapref_adapter(name):
     """Accept an absolute path, a bare file name, or '' (the only installed file)."""
     files = installed_snapref_files()
@@ -923,6 +601,7 @@ def resolve_snapref_adapter(name):
         if os.path.basename(f) == name or os.path.basename(f).rsplit(".", 1)[0] == name:
             return f
     raise anima_snapref.SnapRefError(f"SnapRef adapter not found: {name} (have {[os.path.basename(f) for f in files]})")
+
 
 def get_snapref_adapter(name):
     global _SNAPREF_ACTIVE_ADAPTER
@@ -941,6 +620,7 @@ def get_snapref_adapter(name):
             f"streams {list(ad.stream_names())}, ref_t {ad.ref_t}, modes {list(ad.modes)}, "
             f"mode_embed {None if ad.mode_embed is None else ad.mode_embed.shape})")
     return _SNAPREF_ADAPTERS[path]
+
 
 def _open_reference_image(path):
     from PIL import Image, ImageOps
@@ -993,12 +673,14 @@ def _load_stitched_reference_pixels(paths, megapixels):
     arr = np.transpose(arr, (2, 0, 1))[None, :, None]
     return jnp.asarray(arr * 2.0 - 1.0), (w, h)
 
+
 def _snapref_cond_tensor(text):
     """Encode the optional appearance caption the same way the positive prompt is encoded."""
     pairs = [(text or "", np.ones(max(1, len(text or "")), np.float32))]
     qh, qmask, t5ids, t5mask = _encode_text_list(pairs)[0]
     return cond_forward(cond_params, jnp.asarray(qh, dtype=jnp.float32), jnp.asarray(qmask),
                         jnp.asarray(t5ids), jnp.asarray(t5mask))
+
 
 def prepare_snapref(cfg, target_hw):
     """Encode the reference(s) once per run: one reference pass, cached per-block K/V."""
@@ -1122,6 +804,7 @@ def prepare_snapref(cfg, target_hw):
                 for p in refs
             ][:len(records)]}
 
+
 def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negative="",
                      common=None):
     """Prepare regional text; SnapRef K/V is deliberately lazy per active interval."""
@@ -1223,6 +906,7 @@ def snapref_cfg_prediction(latents, timestep, context, neg_context, pad, guidanc
         out = anima_snapref.snapref_correct(out, cond_ref, cfg.get("correction") or "apg")
     return out
 
+
 def decode_latents(latents):
     """Decode a (B,16,1,h,w) latent batch -> list of B uint8 HxWx3 arrays.
     Each sample is decoded on its own, so the (1,...)-shaped VAE executable that warmup
@@ -1246,6 +930,7 @@ def decode_latents(latents):
         out.append((img[0] * 255.0).round().astype(np.uint8))
     return out
 
+
 def grid_cols(n, w, h):
     """Column count whose grid is closest to a 3:2 landscape, with a small penalty per empty cell."""
     best = None
@@ -1255,6 +940,7 @@ def grid_cols(n, w, h):
         if best is None or score < best[0]:
             best = (score, cols)
     return best[1]
+
 
 def make_grid_u8(imgs):
     if len(imgs) == 1:
@@ -1267,6 +953,7 @@ def make_grid_u8(imgs):
         r, c = divmod(k, cols)
         canvas[r * h:(r + 1) * h, c * w:(c + 1) * w] = im
     return canvas
+
 
 def save_u8(u8, path):
     """Save a numpy RGB (H, W, 3) array as a lossless PNG.
@@ -1282,122 +969,12 @@ def save_u8(u8, path):
     img.save(tmp)
     os.replace(tmp, path)
 
-# (batch, H, W) shapes the transformer has compiled for, (H, W) shapes the VAE has, and the VAE
-# shapes whose PREVIEW decode failed during the CURRENT request. A new shape means a one-time XLA
-# compile, which the UI is told about so it does not look frozen. _vae_failed is reset per request
-# on purpose: it exists so the give-up path stops re-advertising a compile for a shape that just
-# failed, NOT to blacklist that shape for the server's whole life -- a later request at the same
-# shape pays the same real compile and must still say so.
-_tf_compiled = set(); _vae_compiled = set(); _vae_failed = set()
-
-# Preview bookkeeping, at module level, with _pv_state() defined here rather than inside the
-# request body. The request loop is itself module level, so EVERY progress record can carry the
-# state -- including "starting" and the transformer "compiling" record, which fire before the
-# denoise loop, and "decode"/"error", which fire after it. A closure defined inside the request
-# body would raise NameError in the request's own error handler whenever a request died before
-# that def -- exactly the case where the client most needs to know whether previews had failed.
-#
-# preview_fails counts CONSECUTIVE failures (it drives the give-up policy) and resets on success;
-# preview_fails_total is cumulative, so a recovered transient failure still shows in "done".
-prev_ok = 0
-prev_fail = 0
-prev_fails_total = 0
-prev_err = ""
-prev_giveup = False
-_pv_expected = 0
-
 
 def _pv_state():
     return {"preview_ok": prev_ok, "preview_fails": prev_fail,
             "preview_fails_total": prev_fails_total, "preview_total": _pv_expected,
             "preview_gaveup": prev_giveup, "preview_error": prev_err or None}
-log("=== SERVER: warming executables at production shape (1024px) ===")
-try:
-    t0 = time.perf_counter()
-    # Warmup shape. Colab/TPU keeps 1024; ANIMA_WARMUP_PX lets the same script be exercised
-    # at a smaller production shape (a CPU box cannot compile 1024px in reasonable time).
-    # A request at a different size simply pays its own compile, exactly as before.
-    _WPX = int(os.environ.get("ANIMA_WARMUP_PX", "1024"))
-    _sched = FlaxFlowMatchScheduler()
-    _st8 = FlowMatchSchedulerState.create()
-    _sr = np.linspace(1.0, 1.0 / 4, 4).astype(np.float32)
-    _st8 = _sched.set_timesteps(_st8, sigmas=jnp.asarray(_sr))
-    _ts = np.asarray(_st8.timesteps); _sg = np.asarray(_st8.sigmas[:-1])
-    # Warm the transformer at the real 1024px latent/pad shapes so the first user
-    # generation does not pay the XLA compile.
-    _lat = jnp.asarray(np.random.default_rng(0).standard_normal(
-        (1, 16, 1, _WPX // 8, _WPX // 8)).astype(np.float32))
-    _pad = jnp.zeros((1, 1, _WPX, _WPX), dtype=jnp.float32)
-    # These dtypes must match the real generation path exactly or XLA compiles a
-    # SECOND executable for the first real request. They did not: the real context
-    # is bf16 (cast after the conditioner) and the real latents are fp32. Warmup
-    # therefore warmed an fp32-context/fp32-latent signature the server never uses,
-    # and the first generation paid both compiles again (~124s vs 21s measured).
-    _ctx = jnp.zeros((1, 512, 1024), dtype=jnp.bfloat16)
-    for _i in range(2):
-        _pred = cfg_prediction(_lat, jnp.asarray(np.float32(_ts[_i])), _ctx, _ctx, _pad, 4.0)
-        _sn = _sg[_i + 1] if _i + 1 < 4 else 0.0
-        _lat = _lat + jnp.asarray(np.float32(_sn - _sg[_i])) * _pred
-    _lat.block_until_ready()
-    _tf_compiled.add((1, _WPX, _WPX))
-    del _lat, _pad, _ctx, _pred
-    gc.collect()
-    log(f"warmup: transformer forward compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
-    t0 = time.perf_counter()
-    # Warm the decoder the default path will actually call. Pixel decode is the default, and
-    # the VAE compile is the single most expensive part of boot (~52s at 1024px), so
-    # compiling the VAE when every request decodes with the pixel head was a fixed boot tax
-    # for an executable nobody runs. The VAE still compiles on first use for anyone who
-    # selects it (or when no pixel head is installed), which is the pre-existing behaviour.
-    if DECODE_MODE == "pixel":
-        _ph_name = os.environ.get("ANIMA_PIXEL_HEAD", "") or ""
-        _warmed = False
-        if _ph_name:
-            try:
-                _fn, _pp, _pinfo = get_pixel_head(_ph_name)
-                # Same shapes the real path uses (see pixel_decode_images): patchified
-                # latent tokens, not the raw (16, h, w) latent, and feats on the token grid.
-                _gh = (_WPX // 8) // 2
-                _wlat = anima_pixel_head.lat_patches(_lat[0, :, 0])
-                _wfeats = jnp.zeros((_gh, _gh, _pinfo["d_feat"]), dtype=jnp.float32)
-                _wimg = _fn(_pp, _wfeats, _wlat)
-                _wimg = jnp.clip(_wimg * 0.5 + 0.5, 0.0, 1.0)
-                _warr = np.asarray(jnp.transpose(_wimg, (1, 2, 0)))
-                _vae_compiled.add((_WPX, _WPX))
-                _warmed = True
-                log(f"warmup: pixel decode compiled+ran at {_WPX}px in "
-                    f"{time.perf_counter()-t0:.1f}s; out {_warr.shape}; {hbm_stats()}")
-                del _wlat, _wfeats, _wimg, _warr
-            except Exception as _we:
-                log(f"warmup: pixel head warmup skipped ({type(_we).__name__}: {_we}); "
-                    f"the first request will compile it")
-        if not _warmed:
-            log("warmup: no pixel head warmed; first decode will compile its own executable")
-    else:
-        # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
-        # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
-        # the latent dtype, so a bf16 warmup compiles an executable the server never
-        # calls -- the first real preview then recompiled the VAE (~50s, matching this
-        # warmup's own compile time).
-        _wz = jnp.zeros((1, 16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)
-        _wv = decode_latents(_wz)
-        log(f"warmup: VAE decode compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
-        _vae_compiled.add((_WPX, _WPX))
-        del _wz, _wv
-    gc.collect()
-    log(f"warmup done; executables compiled; host RSS {rss_gb():.2f} GB")
-except Exception:
-    log("warmup raised:\n" + traceback.format_exc())
-    raise
 
-log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
-if XLA_CACHE:
-    try:
-        _n = len(os.listdir(XLA_CACHE))
-    except Exception:
-        _n = -1
-    log(f"xla cache: {_n} entries at {XLA_CACHE}")
-write_prog(stage="ready", step=0, steps=0, gen_id="warmup")
 
 def default_req():
     return {"prompt": "masterpiece, best quality, 1girl",
@@ -1405,26 +982,6 @@ def default_req():
             "height": 1024, "width": 1024, "steps": 30, "guidance": 4.0,
             # -1 = pick a random seed; the server resolves it and reports the value.
             "seed": -1, "preview_every": 5, "out": "/content/anima_perstep.png"}
-
-if not os.path.exists(REQ_PATH):
-    json.dump({**default_req(), "go": False}, open(REQ_PATH, "w"))
-
-last_mtime = 0.0
-last_gen_id = ""          # id of the last request we actually ran
-
-# --- stall watchdog -----------------------------------------------------------------
-# Observed failure mode: the process stays alive and keeps the TPU, but stops picking
-# up new requests, with nothing in the log. A file mtime cannot be trusted to reappear,
-# so treat "main loop has not iterated for STALL_IDLE_S while no run is in flight" as a
-# stall: dump every thread's stack (so the cause is on record) and exit non-zero so the
-# supervisor restarts a healthy process instead of leaving a zombie on the device.
-_HEARTBEAT = {"t": time.time()}
-_RUN_ACTIVE = {"on": False}
-# Booting the model (transformer params, VAE merge, warmup) legitimately takes minutes
-# and does not touch the main loop, so the watchdog must not be armed until the loop is
-# actually watching for requests. Without this the watchdog kills the server mid-boot.
-_ARMED = {"on": False}
-STALL_IDLE_S = float(os.environ.get("ANIMA_STALL_IDLE_S", "180") or 180)
 
 
 def _stall_watchdog():
@@ -1443,16 +1000,6 @@ def _stall_watchdog():
             os._exit(1)
 
 
-try:
-    _t = threading.Thread(target=_stall_watchdog, name="stall-watchdog", daemon=True)
-    _t.start()
-except Exception as _e:
-    log(f"stall watchdog unavailable ({type(_e).__name__}: {_e})")
-
-# Boot is finished and the loop is about to watch for requests: only now can a quiet
-# main loop be called a stall.
-_ARMED["on"] = True
-_HEARTBEAT["t"] = time.time()
 def handle_request(d, gen_id):
     """Prepare, denoise, decode and record one request.
 
@@ -1921,6 +1468,7 @@ def handle_request(d, gen_id):
         _RUN_ACTIVE["on"] = False
     return True
 
+
 def serve():
     """Watch for requests and handle them, one at a time, until the process dies."""
     global _pv_expected, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, last_mtime
@@ -2008,4 +1556,553 @@ def serve():
             last_mtime = os.path.getmtime(REQ_PATH)
 
 
-serve()
+def boot():
+    """Load the models and compile the executables. Called once, before serve().
+
+    Nothing above this line runs on import, so the module can be imported by tests
+    without pulling 6.6 GB of weights."""
+    global CROOT, DECODE_MODE, INTERRUPT_PATH, LOG, LORA_DIRS, PIXEL_DIRS, PIXEL_HEAD_DEFAULT, PROG_PATH, PROMPT_STYLE, REGIONAL_FAST, REQ_PATH, SNAPREF_DIRS, SNAP_PATH, STALL_IDLE_S, _ARMED, _HEARTBEAT, _LLLITE_CACHE, _LORA_SPECS, _PIXEL_HEADS, _PIXEL_TAP, _RUN_ACTIVE, _SNAPREF_ACTIVE_ADAPTER, _SNAPREF_ADAPTERS, _SNAPREF_ENC, _SNAPREF_ENC_CACHE, _SNAPREF_ENC_KEY, _SNAPREF_HOST_CACHE, _SNAPREF_HOST_CACHE_MAX, _SNAPREF_RECORDER, _SNAPREF_STATE, _T_PARAMS_PRISTINE, _pv_expected, _t5, _tf_compiled, _vae_compiled, _vae_failed, cond_params, conditioner, last_mtime, prev_err, prev_fail, prev_fails_total, prev_giveup, prev_ok, qwen3_jit, qwen3_model, qwen3_params, t_params, tok, transformer, vae
+
+    """The Anima generation runtime: model boot, request handling and the IPC serve loop.
+
+    Lifted verbatim out of a code = r'''...''' string in scripts/anima_aesthetic_server.py.
+    The logic is untouched; what changes is that this is now a real file, so tracebacks carry
+    file:line, linters can read it, and edits are edits rather than string surgery.
+
+    Run as a module:  python -m maxdiffusion.runtime.pipeline
+    """
+
+
+    # Content root. Colab keeps the historical /content; ANIMA_CONTENT_ROOT lets the same
+    # script run (and be tested) on a normal machine without touching any other default.
+    CROOT = os.environ.get("ANIMA_CONTENT_ROOT", "/content")
+    LOG = open(os.path.join(CROOT, "anima_server.log"), "a", buffering=1)
+
+
+
+    log("=== SERVER boot: imports ===")
+    # Diagnostic only: exit=False so the watchdog can never kill a long-lived server.
+    # It dumps the live stack of every thread once, which is what localizes a stall.
+    faulthandler.dump_traceback_later(int(os.environ.get("ANIMA_SERVER_TIMEOUT_S", "1800")), exit=False)
+    # A dump on SIGUSR1 lets a stall be inspected without killing the process:
+    #   kill -USR1 <pid>   -> every thread's stack goes to the log.
+    try:
+        import signal as _signal
+        faulthandler.register(_signal.SIGUSR1, all_threads=True)
+    except Exception:
+        pass
+    jax.config.update("jax_default_matmul_precision", "BF16_BF16_F32")
+
+    # Persistent XLA executable cache: the 52s VAE + 16s transformer warmup
+    # compiles are pure compile cost, keyed on SHAPES not weight values, so a
+    # server reboot (LoRA Apply, watchdog restart) can load them instead of
+    # recompiling. The cache key includes JAX/libtpu versions + topology, so a
+    # fresh VM allocation recompiles once — that is expected and cheap-ish.
+    # Drive is used ONLY when actually mounted (cold_start / anima_job do not
+    # mount it, and an unmounted makedirs would silently create a dead local
+    # directory under /content); otherwise fall back to the VM-local path, which
+    # still spans server reboots within this VM's life.
+    XLA_CACHE = os.environ.get("ANIMA_XLA_CACHE", "")
+    # One Drive tree for both caches: /content/drive/MyDrive/anima_cache/{hf,xla}.
+    # This default only exists so a forgotten env var cannot silently lose the
+    # cache; the agenda sets ANIMA_XLA_CACHE explicitly. The pre-unification
+    # /content/drive/MyDrive/anima_xla_cache stays readable as a fallback so
+    # entries written before the tree was unified are not thrown away.
+    DRIVE_XLA = "/content/drive/MyDrive/anima_cache/xla"
+    LEGACY_DRIVE_XLA = "/content/drive/MyDrive/anima_xla_cache"
+    if not XLA_CACHE:
+        if os.path.isdir("/content/drive/MyDrive"):
+            XLA_CACHE = DRIVE_XLA
+        elif os.path.isdir(LEGACY_DRIVE_XLA):
+            XLA_CACHE = LEGACY_DRIVE_XLA
+        else:
+            XLA_CACHE = "/content/anima_xla_cache"
+    try:
+        os.makedirs(XLA_CACHE, exist_ok=True)
+        jax.config.update("jax_compilation_cache_dir", XLA_CACHE)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+        jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
+        _persistent = XLA_CACHE.startswith("/content/drive/")
+        log(f"XLA cache: {XLA_CACHE} (drive={_persistent} persistent={_persistent})")
+        if not _persistent:
+            # Loud on purpose: a silent fallback here means the ~68 s of warmup
+            # compiles is paid every single session and nobody notices.
+            log("XLA cache WARNING: NOT persistent -- this directory lives on the VM "
+                "and is lost at the next allocation; set ANIMA_XLA_CACHE="
+                + DRIVE_XLA + " to keep it")
+    except Exception as e:
+        log(f"XLA cache disabled ({type(e).__name__}: {e}); compiling every boot")
+        XLA_CACHE = ""
+    log("matmul precision: BF16_BF16_F32 (bf16 operands, fp32 accumulate; activations stay fp32)")
+
+
+    log(f"devices: {jax.devices()}")
+    log(f"HBM at boot: {hbm_stats()}")
+
+    # ---------------------------------------------------------------------------
+    # All weight conversion runs with CPU as the default device.
+    #
+    # The converters build their trees leaf-by-leaf with jnp.asarray. With the TPU as
+    # the default device each leaf becomes its own host->TPU transfer: measured 227.9s
+    # for the transformer instead of 60.6s. One explicit device_put at the end is far
+    # cheaper, and it keeps the HBM peak at 3.91 GB instead of 10.21 GB.
+    #
+    # There is deliberately NO msgpack parameter cache here. Measured on the real tree,
+    # flax_serialization.to_bytes + write costs 76s for the 6.6 GB stacked transformer
+    # tree (45.9s serialize + 30.1s write) while re-converting the whole thing takes
+    # ~10s, so caching is a net loss. The old VAE cache write was also a latent crash
+    # ("TypeError: can not serialize 'State' object") that killed the server outright
+    # whenever the cache was invalid.
+    # ---------------------------------------------------------------------------
+    # The project's Colab venv installs a TPU-only jax build, where jax.devices("cpu")
+    # raises "Unknown backend cpu". Fall back to the default device so the host-side
+    # weight conversion still runs (it just happens on the TPU device instead).
+    try:
+        _CPU = jax.devices("cpu")[0]
+    except (RuntimeError, ValueError):
+        _CPU = jax.devices()[0]
+        log(f"no CPU backend in this jax build; host conversion uses {_CPU.device_kind}")
+
+    CACHE_DIR = os.path.join(CROOT, "anima_cache")  # retained for the HF cache only; no param cache
+    REQ_PATH = os.path.join(CROOT, "anima_request.json")
+    PROG_PATH = os.path.join(CROOT, "anima_progress.json")
+    SNAP_PATH = os.path.join(CROOT, "anima_snap.png")
+    # The client creates this file to cancel the running generation.
+    INTERRUPT_PATH = os.path.join(CROOT, "anima_interrupt")
+
+
+
+
+    t_all = time.perf_counter()
+    # Weight cache: the two snapshot_download calls below used to hardcode
+    # /content/hf_cache, which ignored HF_HOME entirely -- so weights pre-fetched
+    # into Drive were never used and every session paid the ~5.6 GB download again.
+    # ANIMA_HF_CACHE wins, then HF_HOME, then the old VM-local path.
+    HF_CACHE = (os.environ.get("ANIMA_HF_CACHE") or os.environ.get("HF_HOME")
+                or "/content/hf_cache")
+    os.makedirs(HF_CACHE, exist_ok=True)
+    log(f"weight cache (HF): {HF_CACHE} (persistent={HF_CACHE.startswith('/content/drive/')})")
+    # Weight sources are overridable from the notebook's "links" cell via env; empty
+    # = the standard Anima aesthetic family. Each is an HF repo id that
+    # snapshot_download / from_pretrained can resolve (the base repo must carry the
+    # tokenizer / text_encoder / t5_tokenizer subfolders the loader reads).
+    BASE_REPO = os.environ.get("ANIMA_BASE_REPO", "circlestone-labs/Anima-Base-v1.0-Diffusers").strip()
+    AESTHETIC_REPO = os.environ.get("ANIMA_AESTHETIC_REPO", "circlestone-labs/Anima").strip()
+    AESTHETIC_FILE = os.environ.get("ANIMA_AESTHETIC_FILE",
+                                    "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors").strip()
+    log(f"weight sources: base={BASE_REPO} | aesthetic={AESTHETIC_REPO}/{AESTHETIC_FILE}")
+    snapshot_dir = snapshot_download(BASE_REPO, cache_dir=HF_CACHE)
+    aesthetic_snapshot = snapshot_download(AESTHETIC_REPO, cache_dir=HF_CACHE,
+                                           allow_patterns=[AESTHETIC_FILE])
+    aesthetic_path = os.path.join(CROOT, os.path.basename(AESTHETIC_FILE))
+    _src = os.path.join(aesthetic_snapshot, AESTHETIC_FILE)
+    if not os.path.exists(aesthetic_path) or os.path.getsize(aesthetic_path) != os.path.getsize(_src):
+        shutil.copyfile(_src, aesthetic_path)
+    log(f"base weights at {snapshot_dir}")
+    log(f"aesthetic transformer+conditioner: {aesthetic_path} ({os.path.getsize(aesthetic_path)/1e9:.2f} GB)")
+
+    log("=== SERVER: torch tokenizer + TPU Qwen3 load (once) ===")
+    t0 = time.perf_counter()
+    tok = AutoTokenizer.from_pretrained(BASE_REPO, subfolder="tokenizer")
+    _t5 = _RawTokenizer.from_file(os.path.join(snapshot_dir, "t5_tokenizer", "tokenizer.json"))
+    _t5.enable_padding(pad_id=0, pad_token="<pad>", length=512)
+    _t5.enable_truncation(max_length=512)
+    pc = HFAutoConfig.from_pretrained(BASE_REPO, subfolder="text_encoder")
+    rope_theta = getattr(pc, "rope_theta", None) or pc.rope_parameters["rope_theta"]
+    qcfg = FlaxQwen3Config(vocab_size=pc.vocab_size, hidden_size=pc.hidden_size,
+        intermediate_size=pc.intermediate_size, num_hidden_layers=pc.num_hidden_layers,
+        num_attention_heads=pc.num_attention_heads, num_key_value_heads=pc.num_key_value_heads,
+        head_dim=getattr(pc, "head_dim", pc.hidden_size // pc.num_attention_heads),
+        rms_norm_eps=pc.rms_norm_eps, rope_theta=rope_theta,
+        max_position_embeddings=pc.max_position_embeddings, dtype=jnp.bfloat16,
+        max_layer_to_run=None, is_causal=True)
+    qwen3_model = FlaxQwen3Model(qcfg)
+    qv = jax.eval_shape(qwen3_model.init, jax.random.key(0),
+                        jax.ShapeDtypeStruct((1, 512), jnp.int32),
+                        jax.ShapeDtypeStruct((1, 512), jnp.int32))
+    with jax.default_device(_CPU):
+        qwen3_params = load_and_convert_qwen3_weights(os.path.join(snapshot_dir, "text_encoder"), qv["params"], qcfg)
+    del qv
+    gc.collect()
+    qwen3_params = jax.device_put(qwen3_params, jax.devices()[0])
+    qwen3_jit = jax.jit(lambda p, ids, mask: qwen3_model.apply({"params": p}, ids, mask)[0])
+    log(f"Qwen3 TPU model ready in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
+
+
+    PROMPT_STYLE = (os.environ.get("ANIMA_PROMPT_STYLE", "comfy").strip().lower()
+                    or "comfy")
+    # T5 is our text encoder, and prompt-control documents BREAK as a no-op for T5;
+    # CAT is the operator that actually splits/concatenates conditioning.
+
+    # --- prompt control end ---
+
+
+
+    log(f"text/Qwen3 TPU ready in {time.perf_counter()-t0:.1f}s")
+
+    log("=== SERVER: conditioner ===")
+    t0 = time.perf_counter()
+    cond_cfg = AnimaTextConditionerConfig(dtype=jnp.float32, param_dtype=jnp.float32)
+    conditioner = FlaxAnimaTextConditioner(cond_cfg)
+    cv = jax.eval_shape(conditioner.init, jax.random.key(1),
+                        jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
+                        jax.ShapeDtypeStruct((1, 8), jnp.int32))
+    with jax.default_device(_CPU):
+        cond_params = convert_anima_aesthetic_adapter_weights(aesthetic_path, cv["params"], dtype=jnp.float32)
+    del cv
+    gc.collect()
+    log(f"conditioner converted in {time.perf_counter()-t0:.1f}s")
+
+    log("=== SERVER: transformer (scan_blocks=True) ===")
+    t0 = time.perf_counter()
+    transformer = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True)
+    # Shape-only init: the converters read .shape, never values, so eval_shape gives the
+    # full parameter tree in ~0.2s with negligible RSS (vs ~40s and a multi-GB dummy tree).
+    tv = jax.eval_shape(
+        transformer.init, jax.random.key(2),
+        jax.ShapeDtypeStruct((1, 16, 1, 8, 8), jnp.float32),
+        jax.ShapeDtypeStruct((1,), jnp.float32),
+        jax.ShapeDtypeStruct((1, 8, 1024), jnp.float32),
+    )
+    t_shape = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    try:
+        with jax.default_device(_CPU):
+            t_params = convert_anima_aesthetic_weights(aesthetic_path, tv["params"],
+                                                       dtype=jnp.bfloat16, num_layers=28)
+    except Exception:
+        log("transformer: conversion raised:\n" + traceback.format_exc())
+        raise
+    t_conv = time.perf_counter() - t0
+    del tv
+    gc.collect()
+    log(f"transformer: eval_shape {t_shape:.2f}s + convert {t_conv:.1f}s")
+
+
+
+
+    lora_specs = [(p, s) for p, s in _lora_specs() if os.path.exists(p)]
+    missing = [(p, s) for p, s in _lora_specs() if not os.path.exists(p)]
+    for p, _ in missing:
+        log(f"WARNING: LoRA path not found, skipping: {p}")
+
+    if lora_specs:
+        log("merging %d LoRA(s): %s" % (len(lora_specs),
+            ", ".join(f"{os.path.basename(p)}@{s}" for p, s in lora_specs)))
+        t_lora0 = time.perf_counter()
+        try:
+            t_params, lora_stats = load_and_merge_anima_loras(
+                t_params, lora_specs, dtype=jnp.bfloat16)
+            log(f"LoRA merged: {lora_stats['merged']} layer-targets, "
+                f"{lora_stats['skipped']} skipped | format={lora_stats.get('format')} "
+                f"targets={lora_stats.get('targets')} "
+                f"convention={lora_stats.get('convention')} "
+                f"in {time.perf_counter()-t_lora0:.2f}s")
+            # A partially applied LoRA still produces a plausible image, so an
+            # unexpected skip count must be loud rather than silent.
+            if lora_stats.get("skipped"):
+                log(f"WARNING: {lora_stats['skipped']} layer-targets were skipped; "
+                    f"the LoRA is only partially applied")
+            for _d in lora_stats.get("details", [])[:10]:
+                log(f"  lora: {_d}")
+        except Exception:
+            log("LoRA merge failed:\n" + traceback.format_exc())
+            raise
+    else:
+        log("no LoRA configured (ANIMA_LORAS / ANIMA_LORA_PATH) or file not found")
+
+    # What is merged into the weights right now. swap_loras maintains this; seeding
+    # it from the boot spec matters because the diff below compares against it -- an
+    # empty seed would make the first prompt re-merge a LoRA that is already loaded,
+    # and would make a tag-free prompt look like it needed nothing when the boot
+    # LoRA was still resident.
+    _LORA_SPECS = list(lora_specs)
+
+    # Directories scanned for <lora:name:scale> resolution. Both are accepted: the
+    # UI's own folder and the one the benchmark tooling downloads into.
+    LORA_DIRS = [d for d in (os.environ.get("ANIMA_LORA_DIR", "").strip(),
+                             os.path.join(CROOT, "anima_lora"), os.path.join(CROOT, "loras")) if d]
+
+
+
+    t0 = time.perf_counter()
+    # Keep the as-booted tree alive on the host: it is what every later hot-swap
+    # rebuilds from. jax.device_put does not consume the host arrays, so this holds
+    # a reference rather than making a copy, and HBM is unchanged.
+    _T_PARAMS_PRISTINE = t_params
+    t_params = jax.device_put(t_params, jax.devices()[0])
+    log(f"transformer params -> TPU in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
+
+    log("=== SERVER: VAE ===")
+    t0 = time.perf_counter()
+    vae = AutoencoderKLWan(nnx.Rngs(0), dtype=jnp.bfloat16, weights_dtype=jnp.bfloat16)
+    _st = nnx.state(vae, nnx.Param)
+    _fs = dict(nnx.to_flat_state(_st))
+    _ft = {k: v.value for k, v in _fs.items()}
+    with jax.default_device(_CPU):
+        _conv = load_qwen_image_vae(snapshot_dir, _ft)
+        _cf = _flatten_dict(_conv)
+        _cf_by_path = {"/".join(str(x) for x in k): v for k, v in _cf.items()}
+        _nf, _miss = {}, []
+        for _k, _vs in _fs.items():
+            _p = "/".join(str(x) for x in _k)
+            if _p in _cf_by_path:
+                _nf[_k] = _vs.replace(jnp.asarray(_cf_by_path[_p], dtype=_vs.value.dtype))
+            else:
+                _miss.append(_p)
+    assert not _miss, f"VAE merge incomplete: {_miss[:8]}"
+    nnx.update(vae, nnx.State.from_flat_path(_nf))
+    del _ft, _conv, _cf, _cf_by_path, _nf, _st, _fs
+    gc.collect()
+    log(f"vae converted+merged in {time.perf_counter()-t0:.1f}s")
+
+
+
+
+
+    # --- SnapRef (reference adapter) -------------------------------------------------------
+    # Nothing here runs unless a request carries "snapref".
+    # A second module instance whose scan emits every layer's self-attention (k, v): the
+    # reference pass needs those, the target pass does not, so they cannot share one instance.
+    _SNAPREF_RECORDER = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, record_kv=True)
+
+
+
+
+
+
+
+    # --- LLLite control (ControlNet-LLLite: 3D pose / outline / regional) -------------------
+    # Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
+    _LLLITE_CACHE = {}
+
+    # Exactly the control combinations the generate path supports. The definition lives in
+    # anima_control_modes so the server and its tests cannot disagree about the rules.
+    # "regional+lllite" is excluded on purpose: regional prediction replaces the base prediction
+    # per region, so a whole-image control would be silently dropped rather than applied.
+    assert SUPPORTED_CONTROL_COMBOS, "control-mode table must not be empty"
+
+
+
+
+
+
+
+
+
+
+    # --- pixel head decoder (optional) ------------------------------------------------------
+    # A 25M-parameter ConvNeXt readout over the input of the DiT's final_layer.linear. It
+    # replaces the VAE decode, whose decoder activations are the single largest transient in a
+    # 1024px run (~8.7 GB measured), with a small head plus one 2048-wide feature tensor.
+    PIXEL_DIRS = [d for d in (os.environ.get("ANIMA_PIXEL_DIR", "").strip(),
+                              os.path.join(CROOT, "anima_pixel_heads")) if d and os.path.isdir(d)]
+    DECODE_MODE = (os.environ.get("ANIMA_DECODE") or "pixel").strip().lower()
+    # Skip the base CFG pair when active regions fully tile the canvas (the blend cancels it
+    # exactly). Kept switchable so the optimisation can be A/B'd against the old maths.
+    REGIONAL_FAST = (os.environ.get("ANIMA_REGIONAL_FAST", "1").strip().lower()
+                     not in ("0", "false", "no", "off"))
+    PIXEL_HEAD_DEFAULT = (os.environ.get("ANIMA_PIXEL_HEAD") or "").strip()
+
+    _PIXEL_TAP = FlaxAnimaCosmosTransformer(layers=28, scan_blocks=True, return_final_feat=True)
+    _PIXEL_HEADS = {}
+
+
+
+
+
+
+
+
+    _SNAPREF_ENC = {}
+    _SNAPREF_ENC_CACHE = {}
+    _SNAPREF_ENC_KEY = None
+
+
+    # --- SnapRef session: reference prep + reference-aware CFG -------------------------------
+    SNAPREF_DIRS = [d for d in (os.environ.get("ANIMA_SNAPREF_DIR", "").strip(),
+                                os.path.join(CROOT, "anima_snapref"),
+                                os.path.join(os.path.dirname(LORA_DIRS[0]), "snapref"))
+                    if d]
+    _SNAPREF_ADAPTERS = {}          # current adapter path -> SnapRefAdapter (lazy)
+    _SNAPREF_ACTIVE_ADAPTER = None
+    _SNAPREF_STATE = {"kv": None}   # cached reference K/V of the current run
+    _SNAPREF_HOST_CACHE = {}         # key -> host-side prepared result; never TPU-resident
+    _SNAPREF_HOST_CACHE_MAX = max(1, int(os.environ.get("ANIMA_SNAPREF_HOST_CACHE_MAX", "8")))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # (batch, H, W) shapes the transformer has compiled for, (H, W) shapes the VAE has, and the VAE
+    # shapes whose PREVIEW decode failed during the CURRENT request. A new shape means a one-time XLA
+    # compile, which the UI is told about so it does not look frozen. _vae_failed is reset per request
+    # on purpose: it exists so the give-up path stops re-advertising a compile for a shape that just
+    # failed, NOT to blacklist that shape for the server's whole life -- a later request at the same
+    # shape pays the same real compile and must still say so.
+    _tf_compiled = set(); _vae_compiled = set(); _vae_failed = set()
+
+    # Preview bookkeeping, at module level, with _pv_state() defined here rather than inside the
+    # request body. The request loop is itself module level, so EVERY progress record can carry the
+    # state -- including "starting" and the transformer "compiling" record, which fire before the
+    # denoise loop, and "decode"/"error", which fire after it. A closure defined inside the request
+    # body would raise NameError in the request's own error handler whenever a request died before
+    # that def -- exactly the case where the client most needs to know whether previews had failed.
+    #
+    # preview_fails counts CONSECUTIVE failures (it drives the give-up policy) and resets on success;
+    # preview_fails_total is cumulative, so a recovered transient failure still shows in "done".
+    prev_ok = 0
+    prev_fail = 0
+    prev_fails_total = 0
+    prev_err = ""
+    prev_giveup = False
+    _pv_expected = 0
+
+
+    log("=== SERVER: warming executables at production shape (1024px) ===")
+    try:
+        t0 = time.perf_counter()
+        # Warmup shape. Colab/TPU keeps 1024; ANIMA_WARMUP_PX lets the same script be exercised
+        # at a smaller production shape (a CPU box cannot compile 1024px in reasonable time).
+        # A request at a different size simply pays its own compile, exactly as before.
+        _WPX = int(os.environ.get("ANIMA_WARMUP_PX", "1024"))
+        _sched = FlaxFlowMatchScheduler()
+        _st8 = FlowMatchSchedulerState.create()
+        _sr = np.linspace(1.0, 1.0 / 4, 4).astype(np.float32)
+        _st8 = _sched.set_timesteps(_st8, sigmas=jnp.asarray(_sr))
+        _ts = np.asarray(_st8.timesteps); _sg = np.asarray(_st8.sigmas[:-1])
+        # Warm the transformer at the real 1024px latent/pad shapes so the first user
+        # generation does not pay the XLA compile.
+        _lat = jnp.asarray(np.random.default_rng(0).standard_normal(
+            (1, 16, 1, _WPX // 8, _WPX // 8)).astype(np.float32))
+        _pad = jnp.zeros((1, 1, _WPX, _WPX), dtype=jnp.float32)
+        # These dtypes must match the real generation path exactly or XLA compiles a
+        # SECOND executable for the first real request. They did not: the real context
+        # is bf16 (cast after the conditioner) and the real latents are fp32. Warmup
+        # therefore warmed an fp32-context/fp32-latent signature the server never uses,
+        # and the first generation paid both compiles again (~124s vs 21s measured).
+        _ctx = jnp.zeros((1, 512, 1024), dtype=jnp.bfloat16)
+        for _i in range(2):
+            _pred = cfg_prediction(_lat, jnp.asarray(np.float32(_ts[_i])), _ctx, _ctx, _pad, 4.0)
+            _sn = _sg[_i + 1] if _i + 1 < 4 else 0.0
+            _lat = _lat + jnp.asarray(np.float32(_sn - _sg[_i])) * _pred
+        _lat.block_until_ready()
+        _tf_compiled.add((1, _WPX, _WPX))
+        del _lat, _pad, _ctx, _pred
+        gc.collect()
+        log(f"warmup: transformer forward compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; {hbm_stats()}")
+        t0 = time.perf_counter()
+        # Warm the decoder the default path will actually call. Pixel decode is the default, and
+        # the VAE compile is the single most expensive part of boot (~52s at 1024px), so
+        # compiling the VAE when every request decodes with the pixel head was a fixed boot tax
+        # for an executable nobody runs. The VAE still compiles on first use for anyone who
+        # selects it (or when no pixel head is installed), which is the pre-existing behaviour.
+        if DECODE_MODE == "pixel":
+            _ph_name = os.environ.get("ANIMA_PIXEL_HEAD", "") or ""
+            _warmed = False
+            if _ph_name:
+                try:
+                    _fn, _pp, _pinfo = get_pixel_head(_ph_name)
+                    # Same shapes the real path uses (see pixel_decode_images): patchified
+                    # latent tokens, not the raw (16, h, w) latent, and feats on the token grid.
+                    _gh = (_WPX // 8) // 2
+                    _wlat = anima_pixel_head.lat_patches(_lat[0, :, 0])
+                    _wfeats = jnp.zeros((_gh, _gh, _pinfo["d_feat"]), dtype=jnp.float32)
+                    _wimg = _fn(_pp, _wfeats, _wlat)
+                    _wimg = jnp.clip(_wimg * 0.5 + 0.5, 0.0, 1.0)
+                    _warr = np.asarray(jnp.transpose(_wimg, (1, 2, 0)))
+                    _vae_compiled.add((_WPX, _WPX))
+                    _warmed = True
+                    log(f"warmup: pixel decode compiled+ran at {_WPX}px in "
+                        f"{time.perf_counter()-t0:.1f}s; out {_warr.shape}; {hbm_stats()}")
+                    del _wlat, _wfeats, _wimg, _warr
+                except Exception as _we:
+                    log(f"warmup: pixel head warmup skipped ({type(_we).__name__}: {_we}); "
+                        f"the first request will compile it")
+            if not _warmed:
+                log("warmup: no pixel head warmed; first decode will compile its own executable")
+        else:
+            # fp32, not bf16: the real latents entering decode_latents are fp32 (they come
+            # from an fp32 noise tensor), and decode_latents derives latents_mean/std from
+            # the latent dtype, so a bf16 warmup compiles an executable the server never
+            # calls -- the first real preview then recompiled the VAE (~50s, matching this
+            # warmup's own compile time).
+            _wz = jnp.zeros((1, 16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)
+            _wv = decode_latents(_wz)
+            log(f"warmup: VAE decode compiled+ran at {_WPX}px in {time.perf_counter()-t0:.1f}s; out {_wv[0].shape}; {hbm_stats()}")
+            _vae_compiled.add((_WPX, _WPX))
+            del _wz, _wv
+        gc.collect()
+        log(f"warmup done; executables compiled; host RSS {rss_gb():.2f} GB")
+    except Exception:
+        log("warmup raised:\n" + traceback.format_exc())
+        raise
+
+    log(f"SERVER READY total {(time.perf_counter()-t_all)/60:.1f} min; watching {REQ_PATH}")
+    if XLA_CACHE:
+        try:
+            _n = len(os.listdir(XLA_CACHE))
+        except Exception:
+            _n = -1
+        log(f"xla cache: {_n} entries at {XLA_CACHE}")
+    write_prog(stage="ready", step=0, steps=0, gen_id="warmup")
+
+
+    if not os.path.exists(REQ_PATH):
+        json.dump({**default_req(), "go": False}, open(REQ_PATH, "w"))
+
+    last_mtime = 0.0
+    last_gen_id = ""          # id of the last request we actually ran
+
+    # --- stall watchdog -----------------------------------------------------------------
+    # Observed failure mode: the process stays alive and keeps the TPU, but stops picking
+    # up new requests, with nothing in the log. A file mtime cannot be trusted to reappear,
+    # so treat "main loop has not iterated for STALL_IDLE_S while no run is in flight" as a
+    # stall: dump every thread's stack (so the cause is on record) and exit non-zero so the
+    # supervisor restarts a healthy process instead of leaving a zombie on the device.
+    _HEARTBEAT = {"t": time.time()}
+    _RUN_ACTIVE = {"on": False}
+    # Booting the model (transformer params, VAE merge, warmup) legitimately takes minutes
+    # and does not touch the main loop, so the watchdog must not be armed until the loop is
+    # actually watching for requests. Without this the watchdog kills the server mid-boot.
+    _ARMED = {"on": False}
+    STALL_IDLE_S = float(os.environ.get("ANIMA_STALL_IDLE_S", "180") or 180)
+
+
+
+
+    try:
+        _t = threading.Thread(target=_stall_watchdog, name="stall-watchdog", daemon=True)
+        _t.start()
+    except Exception as _e:
+        log(f"stall watchdog unavailable ({type(_e).__name__}: {_e})")
+
+    # Boot is finished and the loop is about to watch for requests: only now can a quiet
+    # main loop be called a stall.
+    _ARMED["on"] = True
+    _HEARTBEAT["t"] = time.time()
+
+if __name__ == "__main__":
+    boot()
+    serve()
