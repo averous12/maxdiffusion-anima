@@ -32,6 +32,7 @@ maxdiffusion/
 │   │   ├── anima_snapref_flax.py       462 L  SnapRef reference adapter
 │   │   ├── anima_regional.py           267 L  region schedules and masks
 │   │   ├── anima_pixel_head_flax.py    246 L  optional pixel-space decoder
+│   │   ├── anima_control_modes.py      100 L  which control combos are legal (pure, testable)
 │   │   └── anima_text_conditioner_flax.py 101 L  Qwen text conditioner
 │   ├── schedulers/scheduling_flow_match_flax.py   flow-match sigma schedule
 │   └── utils/                                      shared helpers
@@ -83,13 +84,19 @@ constant because it does not vary with `t`, which leaves every denoise call site
 | lllite + snapref | yes | **no** | separate jit on the server |
 | regional + lllite | **refused** | n/a | rejected by design |
 
-`regional + lllite` is refused in the server with
-`SUPPORTED_CONTROL_COMBOS` as the error payload:
+`regional + lllite` is refused in the server with `SUPPORTED_CONTROL_COMBOS` as the error
+payload. The rule itself lives in `models/anima_control_modes.py`, not in the server's
+request loop, so it is testable without booting the runtime:
 
 ```python
 SUPPORTED_CONTROL_COMBOS = ("plain", "regional", "snapref", "lllite",
                             "regional+snapref", "lllite+snapref")
 ```
+
+`resolve_control_modes(request)` returns the canonical mode name plus per-feature flags and
+raises `ControlModeError` (a `ValueError`) for anything else. The server calls it **before**
+encoding references or control maps, so an impossible request costs no TPU time.
+`ops/test_control_modes.py` covers all 15 cases in milliseconds.
 
 Reason: regional prediction replaces the base prediction per region, so a whole-image LLLite
 control would be silently dropped — the image would look controlled while ignoring the
@@ -179,6 +186,7 @@ Proven — reproduced by a command in this repo:
 | LLLite cost on TPU | **2303–2341 ms/step** vs **1896 ms/step** baseline (+21–24%) | TPU run, 20 steps |
 | control changes the image | strength 1.0 vs 0.0 differ on **643,837 px** (mean 39.7, max 255) | TPU sweep, sha256 + pixel diff |
 | letterbox preserves proportions | figure bbox aspect **1.724** vs true **1.720**; stretch gave **1.149** | `preprocess_control(aspect=...)` |
+| control modes resolve correctly | **15/15** cases, 6/6 modes exercised, `regional+lllite` and 3-way refused | `ops/test_control_modes.py` |
 
 Not proven — do not claim these:
 
@@ -197,6 +205,7 @@ Not proven — do not claim these:
 34 scripts. They are diagnostics kept for reproducibility, not an API surface:
 
 * `lllite_parity.py`, `lllite_scan_test.py`, `lllite_full_forward.py`, `lllite_block_hook.py` — the four checks in §5
+* `test_control_modes.py` — the six legal control combinations **and** the refusals, pure CPU, no model
 * `snapref_*` (20 files) — SnapRef probes and browser-driving scripts, including older
   `snapref_scan_probe{,2,3,4}.py` iterations that are superseded
 * `test_*.py` (6) — API-contract, UI-contract and watchdog tests

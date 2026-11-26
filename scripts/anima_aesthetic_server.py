@@ -131,6 +131,8 @@ from maxdiffusion.models import anima_snapref_flax as anima_snapref
 from maxdiffusion.models import anima_regional
 from maxdiffusion.models import anima_pixel_head_flax as anima_pixel_head
 from maxdiffusion.models import anima_lllite_flax as anima_lllite
+from maxdiffusion.models.anima_control_modes import (
+    SUPPORTED_CONTROL_COMBOS, ControlModeError, resolve_control_modes)
 from maxdiffusion.models.qwen3_flax import FlaxQwen3Config, FlaxQwen3Model
 from maxdiffusion.models.qwen3_utils import load_and_convert_qwen3_weights
 from maxdiffusion.models.qwen_image_vae_utils import load_qwen_image_vae
@@ -639,17 +641,11 @@ def lllite_snapref_target_forward(tp, lat, t_vec, ctx, pad, lora, refkv, refbias
 # Same opt-in shape as SnapRef: nothing here runs unless a request carries "lllite".
 _LLLITE_CACHE = {}
 
-# Exactly the control combinations the generate path supports. "regional+lllite" is
-# excluded on purpose: regional prediction replaces the base prediction per region, so a
-# whole-image control would be silently dropped rather than applied.
-SUPPORTED_CONTROL_COMBOS = (
-    "plain",
-    "regional",
-    "snapref",
-    "lllite",
-    "regional+snapref",
-    "lllite+snapref",
-)
+# Exactly the control combinations the generate path supports. The definition lives in
+# anima_control_modes so the server and its tests cannot disagree about the rules.
+# "regional+lllite" is excluded on purpose: regional prediction replaces the base prediction
+# per region, so a whole-image control would be silently dropped rather than applied.
+assert SUPPORTED_CONTROL_COMBOS, "control-mode table must not be empty"
 
 
 def resolve_lllite(name):
@@ -687,9 +683,14 @@ def get_lllite(name, layers=28):
     return _LLLITE_CACHE[key]
 
 
-def lllite_cond_emb(lite, image, height, width):
-    """Control image -> per-token conditioning embedding, sized to the pixel resolution."""
-    arr = anima_lllite.preprocess_control(image, (height, width))
+def lllite_cond_emb(lite, image, height, width, aspect="letterbox"):
+    """Control image -> per-token conditioning embedding, sized to the pixel resolution.
+
+    Defaults to letterbox: stretching a control map to the pixel target changes the figure's
+    proportions (a 0.67-aspect control squashed to 1:1 measured 1.149 against a true 1.720),
+    which quietly degrades every pose the user asks for.
+    """
+    arr = anima_lllite.preprocess_control(image, (height, width), aspect=aspect)
     return anima_lllite.encode_conditioning(lite, jnp.asarray(arr))
 
 
@@ -1644,6 +1645,12 @@ while True:
         timesteps = np.asarray(st.timesteps)
         sigmas = np.asarray(st.sigmas[:-1])
 
+        # Validate the control combination before any encoding work, using the shared rules.
+        # Raises ControlModeError for regional+lllite and any three-way request, so no TPU
+        # time is spent preparing a run that cannot be honoured.
+        modes = resolve_control_modes(d)
+        write_prog(stage="modes", step=0, steps=STEPS, seed=int(SEED), seeds=seeds,
+                   gen_id=gen_id, batch_total=BATCH, note=f"mode {modes['mode']}")
         # SnapRef: opt-in reference adapter. Absent/off keeps the plain path untouched.
         _snap = d.get("snapref") or {}
         snap_info = {}
@@ -1670,7 +1677,9 @@ while True:
             _ll = get_lllite(_lllite.get("model"))
             lllite_info = {
                 "w": _ll["w"],
-                "cond_emb": lllite_cond_emb(_ll, _lllite["image"], H, W),
+                "cond_emb": lllite_cond_emb(_ll, _lllite["image"], H, W,
+                                            aspect=_lllite.get("aspect", "letterbox")),
+                "aspect": _lllite.get("aspect", "letterbox"),
                 "strength": float(_lllite.get("strength", 1.0)),
                 "_base": float(_lllite.get("strength", 1.0)),
                 "start_percent": float(_lllite.get("start_percent", 0.0)),
@@ -1682,13 +1691,6 @@ while True:
             # are requested — one forward then applies pose control and the reference.
             _snap["_lllite"] = lllite_info
         regional_specs = d.get("regional") or d.get("regions") or []
-        # LLLite control is whole-image, but regional mode predicts per region and replaces
-        # the base prediction, so a global control would be silently dropped. Refuse the
-        # combination instead of producing something that looks controlled but is not.
-        if regional_specs and lllite_info:
-            raise ValueError(
-                "regional and lllite cannot be combined. Supported combinations: "
-                + ", ".join(SUPPORTED_CONTROL_COMBOS))
         regional_info = []
         regional_schedule = (anima_regional.normalize_schedule(
             regional_specs, maximum=16, common=d.get("common")) if regional_specs else [])
