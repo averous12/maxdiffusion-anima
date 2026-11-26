@@ -11,7 +11,7 @@ The goal is that a change costs one edit in one place, and that a test can prove
 | Phase | State | Evidence |
 |---|---|---|
 | 0 — lift the string | **done** | launcher 1996 → 27 lines; runtime at `src/maxdiffusion/runtime/pipeline.py`, extracted verbatim (asserted byte-identical); 11/11 imports resolve; compiles |
-| 1 — extract request path | **todo** | depth 16 stands |
+| 1 — extract request path | **blocked** | 540-line loop holds **201 Name stores**, all module globals; classification needs a hash check that needs a TPU run |
 | 2 — one forward | **done** | jitted functions 7 → 4; `ops/test_forward_adapters.py` 7/7, no `None` leaks |
 | 3 — kill globals | **deferred** | P3 corrected below: not a concurrency bug, so this is hygiene, not a defect |
 | 4 — break up `build()` | **todo** | 356 lines |
@@ -128,13 +128,36 @@ pre-refactor server.
 
 *Risk:* low. This is a move, not a rewrite, and the hash check catches any slip.
 
-### Phase 1 — Extract the request path into functions
+### Phase 1 — Extract the request path into functions — **blocked, needs a run to verify**
 
 Split the `while True` body into `parse → validate → prepare → denoise → decode → write`.
 Kill the depth-16 nesting: target max depth 4.
 
-*Acceptance:* max indentation ≤ 4 in the served code (measure with the AST walker already
-used above); same sha256 as Phase 0.
+**What stopped it.** The main loop is 540 lines and contains **201 `Name` stores**. At module
+scope every one of those is a *module global*; inside a function they all become locals. So
+extracting the 470-line generation block is not a re-indentation exercise — each assigned
+name has to be classified as per-request scratch (fine as a local) or cross-request state
+(must stay global or move onto an object). A conservative criterion flags ~100 names, and a
+wrong classification silently stops state persisting between requests.
+
+Two further reasons not to force it:
+
+* The acceptance criterion for this phase is a **sha256 match**, and there is no TPU session
+  available to produce one. Shipping a 470-line move that cannot be hash-checked is the exact
+  failure mode this plan exists to prevent.
+* A Colab notebook drives the server, so a regression here breaks a live path with no
+  in-repo test to catch it (Phase 6 is still todo).
+
+**Revised approach, when a run is available:** don't reintroduce 100 globals. Give the loop an
+explicit state object (`state = {...}` or a small class), pass it to `handle_request(state, d,
+gen_id)`, and partition the 201 stores into per-request locals versus fields on that object.
+That is the version worth doing — a straight function extraction would trade a 16-deep loop
+for a function that mutates a hundred globals, which is not obviously better.
+
+Interim, a smaller extraction is safe and testable without a model: the request intake
+(read JSON, reject `go: false`, merge defaults, dedupe on `gen_id`, mark `running`) is a pure
+function of the request dict plus two pieces of state, and can move to `runtime/request.py`
+with real tests. That reduces the loop without touching model state.
 
 ### Phase 2 — One forward, not seven — **done**
 
