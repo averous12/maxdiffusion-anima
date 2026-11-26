@@ -25,7 +25,7 @@ from maxdiffusion.models import anima_lllite_flax as LL  # noqa: E402
 from maxdiffusion.models import anima_cosmos_flax as AC  # noqa: E402
 from PIL import Image  # noqa: E402
 
-LAYERS = 2
+LAYERS = int(__import__("os").environ.get("LL_LAYERS", "2"))
 LAT_H = LAT_W = 8          # latent grid -> (8/2)^2 = 16 tokens
 TOKENS = (LAT_H // 2) * (LAT_W // 2)
 CTX_LEN = 8
