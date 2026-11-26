@@ -193,9 +193,9 @@ def tf_step(t_params, latents, timestep, ctx, nctx, pad, cond_emb):
     # `lllite` is a Python object holding the module weights, so it is baked in as a
     # compile-time constant; only cond_emb varies per call and rides as an array arg.
     nc = transformer.apply({"params": t_params}, latents, t_vec, ctx, None, pad,
-                           lllite=lllite, cond_emb=cond_emb, lllite_strength=LLLITE_STRENGTH)
+                           lllite_w=lllite_w, cond_emb=cond_emb, lllite_strength=LLLITE_STRENGTH)
     nu = transformer.apply({"params": t_params}, latents, t_vec, nctx, None, pad,
-                           lllite=lllite, cond_emb=cond_emb, lllite_strength=LLLITE_STRENGTH)
+                           lllite_w=lllite_w, cond_emb=cond_emb, lllite_strength=LLLITE_STRENGTH)
     # Preserve the guidance delta before bf16 rounding amplifies small differences.
     pred = nu.astype(jnp.float32) + jnp.float32(GUIDANCE) * (nc.astype(jnp.float32) - nu.astype(jnp.float32))
     return nc, nu, pred.astype(jnp.float32)
@@ -227,16 +227,16 @@ cond_emb.block_until_ready()
 _expected = (H // 16) * (W // 16)
 log(f"lllite cond_emb {cond_emb.shape} expected_tokens={_expected} "
     f"match={cond_emb.shape[1] == _expected}")
-LLLITE_STRENGTH = 1.0
+LLLITE_STRENGTH = float(os.environ.get("LLLITE_STRENGTH", "1.0"))
+OUT_NAME = os.environ.get("LLLITE_OUT", "anima_lllite")
 log(f"lllite strength {LLLITE_STRENGTH}, window {_LL.WorkflowChain().lllite_start_percent}"
     f" -> {_LL.WorkflowChain().lllite_end_percent}")
 
-# The weights were converted into the nn.scan layout ('scan','b',...). LLLite needs the
-# per-layer loop (a scanned body cannot pick a module by a traced block index), so fold
-# the stacked leaves back out to transformer_blocks_i before sampling.
-from maxdiffusion.models.anima_cosmos_flax import unstack_block_params as _unstack
-t_params = _unstack(t_params, 28)
-log(f"params unstacked to per-block; leaves {len(jax.tree_util.tree_leaves(t_params))}")
+# Per-layer module weights ride nn.scan as a scan input with a leading layer axis, the
+# same idiom as SnapRef's LoRA tree — so the 28 blocks stay scanned and nothing unrolls.
+lllite_w = _LL.stack_lllite_weights(lllite, 28)
+log(f"lllite stacked targets {sorted(lllite_w)} "
+    f"layers {tuple(lllite_w['self_attn_q']['down.kernel'].shape)[0]}")
 
 rng = np.random.default_rng(SEED)
 latents = jnp.asarray(rng.standard_normal((1, 16, 1, H // 8, W // 8)).astype(np.float32))
@@ -287,8 +287,8 @@ if img.shape[-1] not in (1, 3):
     img = np.moveaxis(img, 1, -1)
 img_u8 = (img[0] * 255.0).round().astype(np.uint8)
 from PIL import Image
-Image.fromarray(img_u8).save("/content/anima_lllite.png")
-log(f"IMAGE saved /content/anima_lllite.png in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
+Image.fromarray(img_u8).save(f"/content/{OUT_NAME}.png")
+log(f"IMAGE saved /content/{OUT_NAME}.png in {time.perf_counter()-t0:.1f}s; img {img_u8.shape}")
 
 log("=== STAGE 6 skipped (LLLite run) ===")
 raise SystemExit(0)
