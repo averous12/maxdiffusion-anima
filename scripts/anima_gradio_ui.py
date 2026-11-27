@@ -18,6 +18,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 import warnings
@@ -374,6 +375,32 @@ def save_outputs(prog, req):
         return f"saved {count} new file(s) to {d}"
     except Exception as e:  # noqa: BLE001
         return f"<archive failed: {type(e).__name__}: {e}>"
+
+
+def _save_bounded(prog, req, timeout=8.0):
+    """Archive with a hard time limit.
+
+    save_outputs writes to the archive directory, which is usually a Drive (FUSE) mount. A slow
+    or wedged mount used to sit BETWEEN a finished generation and its picture, and because this
+    event runs with concurrency_limit=1 it held the whole queue: the image never appeared and no
+    further request could start. The write still runs, in the background; only the wait is
+    capped, and the caller reports what happened instead of hanging.
+    """
+    box = {}
+
+    def work():
+        try:
+            box["result"] = save_outputs(prog, req)
+        except Exception as exc:      # a daemon thread must never print a traceback at the user
+            box["result"] = f"<archive failed: {type(exc).__name__}: {exc}>"
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return (f"<archive still running after {timeout:g}s -- image is on screen; "
+                f"check {save_dir() or 'the archive dir'}>")
+    return box.get("result")
 
 
 def _preview_fragment(prog, preview_every):
@@ -1414,7 +1441,10 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
                               else f"image {k + 1}")
                              for k, im in enumerate(images)]
             grid = _read_img(prog.get("grid") or FINAL_PATH)
-            saved = save_outputs(prog, req)
+            try:
+                saved = _save_bounded(prog, req)
+            except Exception as exc:            # never let archiving cost the image or the queue
+                saved = f"<archive failed: {type(exc).__name__}: {exc}>"
             if saved:
                 status += f" | {saved}"
             _RUN_ACTIVE["flag"] = False

@@ -2093,7 +2093,13 @@ def boot():
                     # Same shapes the real path uses (see pixel_decode_images): patchified
                     # latent tokens, not the raw (16, h, w) latent, and feats on the token grid.
                     _gh = (_WPX // 8) // 2
-                    _wlat = anima_pixel_head.lat_patches(_lat[0, :, 0])
+                    # Build the latent here: the transformer warmup above deletes `_lat` to
+                    # free it, so reaching for that variable raised UnboundLocalError and the
+                    # head was never warmed -- the first pixel decode then paid its own compile
+                    # (9.2 s measured). This branch only runs when pixel decode is selected,
+                    # which is why the bug hid until the default changed.
+                    _wlat = anima_pixel_head.lat_patches(
+                        jnp.zeros((16, 1, _WPX // 8, _WPX // 8), dtype=jnp.float32)[:, 0])
                     _wfeats = jnp.zeros((_gh, _gh, _pinfo["d_feat"]), dtype=jnp.float32)
                     _wimg = _fn(_pp, _wfeats, _wlat)
                     _wimg = jnp.clip(_wimg * 0.5 + 0.5, 0.0, 1.0)
