@@ -74,6 +74,20 @@ def start(port=7860, log_path=LOG, timeout=90):
                      + open(log_path, errors="replace").read()[-2000:])
 
 
+def bare_host(hostname):
+    """The hostname alone, with any scheme or trailing slash removed.
+
+    The URL is rebuilt as https://<host>, so a value pasted from the browser as
+    "https://anima.example.com/" must not produce "https://https://anima.example.com/".
+    Accepting both forms costs four lines and removes a whole class of silent breakage.
+    """
+    host = (hostname or "").strip().rstrip("/")
+    for scheme in ("https://", "http://"):
+        if host.lower().startswith(scheme):
+            host = host[len(scheme):]
+    return host.rstrip("/")
+
+
 def start_named(token, hostname="", port=7860, log_path=LOG, timeout=120):
     """Run a NAMED tunnel from a connector token and return (process, url).
 
@@ -87,6 +101,8 @@ def start_named(token, hostname="", port=7860, log_path=LOG, timeout=120):
     """
     binp = ensure_cloudflared()
     log = open(log_path, "w")
+
+    hostname = bare_host(hostname)
 
     _t0 = time.time()
     while time.time() - _t0 < timeout:

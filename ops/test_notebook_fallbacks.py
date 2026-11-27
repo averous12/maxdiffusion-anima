@@ -14,6 +14,8 @@ import ast
 import json
 import sys
 
+sys.path.insert(0, "maxdiffusion/scripts")   # anima_cloudflared for the hostname helper
+
 NB = "anima_tpu_project/anima_aesthetic_colab.ipynb"
 
 
@@ -114,6 +116,16 @@ def main():
     print(f"{'PASS' if pushes else 'FAIL'}  repo set -> push runs the sync script once")
     if not pushes:
         fails.append("push with repo")
+
+    # --- hostname accepted bare or pasted as a URL (the URL is rebuilt as https://<host>)
+    import anima_cloudflared as cfu
+    forms = ["anima.example.com", "https://anima.example.com", "http://anima.example.com/",
+             "  anima.example.com/  ", "HTTPS://anima.example.com"]
+    bad = [f for f in forms if cfu.bare_host(f) != "anima.example.com"]
+    print(f"{'PASS' if not bad else 'FAIL'}  hostname accepted bare or as a URL "
+          f"{'(all 5 forms)' if not bad else bad}")
+    if bad:
+        fails.append("hostname forms")
 
     # --- the boot cell must skip the pull entirely when the repo is empty
     boot = cell_with(nb, "xla cache: restoring")
