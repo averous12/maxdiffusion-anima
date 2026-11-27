@@ -66,18 +66,19 @@ def main():
         if not retry_ok:
             fails.append("retry")
 
-        # --- every hostname dead: a clear failure instead of a fake URL
+        # --- every hostname dead: warn and return unverified, never raise. Raising here killed a
+        # boot that had already reached SERVER READY, taking the runtime down with the tunnel.
         cf._spawn_quick = lambda *a, **k: (FakeProc("x"), "https://dead.trycloudflare.com")
         cf._public_ok = lambda url, timeout=4: False
         try:
-            cf.start(port=7860, timeout=5, verify_timeout=2, attempts=2)
-            msg = "<returned anyway -- BAD>"
-            raised = False
+            p2, u2 = cf.start(port=7860, timeout=5, verify_timeout=2, attempts=2)
+            msg, raised = "returned " + u2, False
+            ok_dead = u2 == "https://dead.trycloudflare.com"
         except SystemExit as e:
-            msg, raised = str(e), True
-        print(f"{'PASS' if raised and 'no reachable' in msg else 'FAIL'}  all-dead case raises: "
-              f"{msg[:70]!r}")
-        if not (raised and "no reachable" in msg):
+            msg, raised, ok_dead = str(e), True, False
+        print(f"{'PASS' if ok_dead and not raised else 'FAIL'}  all-dead returns unverified "
+              f"instead of raising: {msg[:60]!r}")
+        if not (ok_dead and not raised):
             fails.append("all dead")
 
         # --- probe semantics: an origin 404 is alive, a 1033/5xx is not

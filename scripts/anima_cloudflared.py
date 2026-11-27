@@ -91,7 +91,7 @@ def _spawn_quick(binp, port, log_path, timeout, append=False):
                      % (timeout, open(log_path, errors="replace").read()[-2000:]))
 
 
-def start(port=7860, log_path=LOG, timeout=90, verify_timeout=45, attempts=2):
+def start(port=7860, log_path=LOG, timeout=90, verify_timeout=90, attempts=2):
     """Start a quick tunnel and return (process, url) for a URL that has been probed.
 
     Returning the first URL cloudflared logs is not the same as returning a working one. Each
@@ -101,8 +101,12 @@ def start(port=7860, log_path=LOG, timeout=90, verify_timeout=45, attempts=2):
     binp = ensure_cloudflared()
     _wait_origin(port, timeout)
     dead = []
+    p = url = None
     for attempt in range(1, attempts + 1):
-        p, url = _spawn_quick(binp, port, log_path, timeout, append=attempt > 1)
+        # Truncate every attempt: appending made URL_RE match the PREVIOUS attempt's hostname, so
+        # the retry probed a corpse and "restarted" nothing. A fresh file is the only way the
+        # matcher can be sure it read this attempt's URL.
+        p, url = _spawn_quick(binp, port, log_path, timeout, append=False)
         t0 = time.time()
         while time.time() - t0 < verify_timeout:
             if _public_ok(url):
@@ -118,8 +122,15 @@ def start(port=7860, log_path=LOG, timeout=90, verify_timeout=45, attempts=2):
             p.wait(timeout=10)
         except Exception:
             pass
-    raise SystemExit("no reachable quick tunnel; cloudflared handed out "
-                     + ", ".join(dead) + " and none of them served")
+
+    # Do not raise. A tunnel is an access path, not the runtime: raising here killed a boot that
+    # had already reached SERVER READY, which took the server, the UI and the session record down
+    # with it. Return the last hostname, unverified, and say so.
+    print("WARNING: no quick tunnel answered within "
+          f"{verify_timeout}s per attempt ({', '.join(dead)}); returning {url} UNVERIFIED. "
+          "The local server is unaffected -- use the notebook/atp exec path, or retry the tunnel.",
+          flush=True)
+    return p, url
 
 
 def bare_host(hostname):
