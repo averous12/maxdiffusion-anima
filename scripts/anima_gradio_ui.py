@@ -717,6 +717,47 @@ REBOOT_TIMEOUT_S = 1500.0
 REBOOT_HINT = "about 4-5 minutes"
 
 
+LLLITE_DIRS = [d for d in (os.environ.get("ANIMA_LLLITE_DIR", "").strip(),
+                           os.path.join(CONTENT, "anima_lllite")) if d]
+
+
+def _installed_lllite():
+    """LLLite checkpoints the runtime can resolve, by filename."""
+    out = []
+    for d in LLLITE_DIRS:
+        if os.path.isdir(d):
+            out += sorted(f for f in os.listdir(d) if f.endswith(".safetensors"))
+    return sorted(set(out))
+
+
+def _default_lllite():
+    have = _installed_lllite()
+    return have[0] if have else None
+
+
+def _control_image_path(img):
+    """A control image as a path the server can open.
+
+    gr.Image(type="filepath") already gives a path; a PIL image or raw bytes are written to a
+    fixed temp file. The server takes lllite.image as a *path* -- handing it an array is what
+    made every server-side LLLite request fail with a (1,1) '<Un21' PIL error.
+    """
+    if img is None:
+        return None
+    if isinstance(img, str):
+        return img if os.path.exists(img) else None
+    tmp = os.path.join(CONTENT, "anima_control_upload.png")
+    try:
+        if isinstance(img, (bytes, bytearray)):
+            with open(tmp, "wb") as f:
+                f.write(bytes(img))
+        else:
+            img.save(tmp)
+        return tmp
+    except Exception:
+        return None
+
+
 def _installed_loras():
     """Files available to merge. Anything else in the dropdown is rejected."""
     try:
@@ -1243,7 +1284,10 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
               snapref_in_uncond=False, snapref_rg_on=False, snapref_rg=4.5,
               snapref_caption="", decode_mode="pixel", pixel_head="", snapref_budget=None,
               regional_json="", regional_common_pos="", regional_common_neg="",
-              regional_end=0.35, *regional_values):
+              regional_end=0.35,
+              lllite_on=False, lllite_image=None, lllite_model="", lllite_strength=1.0,
+              lllite_aspect="letterbox", lllite_start=0.0, lllite_end=1.0,
+              *regional_values):
     W, H = resolve_size(aspect_w, aspect_h, mp_label, width, height)
     batch = max(1, min(MAX_BATCH, int(batch_count or 1)))
     req = {
@@ -1318,6 +1362,21 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
         req["snapref"] = snap_cfg
     else:
         req.pop("snapref", None)
+
+    # LLLite control. Sent as a path: the server coerces it, and handing it pixels was the bug
+    # that made every control request fail with a (1,1) '<Un21' PIL error.
+    if lllite_on:
+        _ctl = _control_image_path(lllite_image)
+        if _ctl:
+            req["lllite"] = {
+                "enabled": True,
+                "image": _ctl,
+                "model": (lllite_model or "").strip(),
+                "strength": float(lllite_strength if lllite_strength is not None else 1.0),
+                "aspect": (lllite_aspect or "letterbox"),
+                "start_percent": float(lllite_start or 0.0),
+                "end_percent": float(lllite_end if lllite_end is not None else 1.0),
+            }
     t_submit = time.time()
     _RUN_ACTIVE["flag"] = True
     _atomic_json(REQ_PATH, req)
@@ -1736,6 +1795,35 @@ def build():
                                                 label="Reference pixel budget (MP, combined)",
                                                 info="Separate references share this. 3.0 = a full megapixel each.")
 
+            with gr.Tab("Control"):
+                gr.Markdown(
+                    "**LLLite control.** Feed a pose or outline image and the model follows it. "
+                    "Prefer **letterbox**: stretching a portrait control into a square distorts "
+                    "the figure enough to make pose adherence impossible to judge. "
+                    "Control **cannot be combined with Regional** — regional replaces the base "
+                    "prediction per box, so a whole-image control would be silently dropped; "
+                    "the request is refused rather than ignored.")
+                lllite_on = gr.Checkbox(value=False, label="Enable LLLite control")
+                lllite_upload = gr.Image(
+                    label="Control image (pose / outline) — the generation follows it",
+                    type="filepath", sources=["upload"], height=260)
+                lllite_model_pick = gr.Dropdown(
+                    choices=_installed_lllite(), value=_default_lllite(),
+                    label="LLLite checkpoint",
+                    info="anima_3dpose = pose, anima_3dpose_outline = line art, "
+                         "anima_regional = region masks.")
+                with gr.Row():
+                    lllite_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
+                                                label="Control strength")
+                    lllite_aspect = gr.Radio(["letterbox", "stretch"], value="letterbox",
+                                             label="Control fit",
+                                             info="letterbox keeps proportions, stretch fills.")
+                with gr.Row():
+                    lllite_start = gr.Slider(0.0, 1.0, value=0.0, step=0.01,
+                                             label="Apply from (fraction of steps)")
+                    lllite_end = gr.Slider(0.0, 1.0, value=1.0, step=0.01,
+                                           label="Apply until")
+
             with gr.Tab("Regional"):
                 gr.Markdown(
                     "Assign a prompt to a box, and optionally give each box its own "
@@ -1841,6 +1929,10 @@ def build():
                           snapref_rg_on, snapref_rg, snapref_caption,
                           decode_mode, pixel_head_pick, snapref_budget, regional_json,
                           regional_common_pos, regional_common_neg, regional_end,
+                          # Control tab -- order must match start_gen's signature exactly,
+                          # and it must sit before the *regional_inputs expansion
+                          lllite_on, lllite_upload, lllite_model_pick, lllite_strength,
+                          lllite_aspect, lllite_start, lllite_end,
                           *_regional_inputs],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests
