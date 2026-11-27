@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 BIN = "/usr/local/bin/cloudflared"
@@ -37,26 +38,41 @@ def ensure_cloudflared(path=BIN):
     return path
 
 
-def start(port=7860, log_path=LOG, timeout=90):
-    """Start a quick tunnel to 127.0.0.1:port and return (process, public_url)."""
-    binp = ensure_cloudflared()
-    log = open(log_path, "w")
+def _public_ok(url, timeout=4):
+    """True if the published URL actually serves something.
 
-    # Make sure the origin is actually answering before we ask cloudflared to proxy it.
-    # cloudflared itself waits, but its error message is just "502 Bad Gateway"; checking
-    # here gives a clearer log and avoids a useless tunnel process.
-    _t0 = time.time()
-    while time.time() - _t0 < timeout:
+    A quick tunnel's hostname is printed by cloudflared before it is usable, and sometimes it
+    never becomes usable at all -- the browser shows Cloudflare error 1033 and the obvious
+    conclusion is "the tunnel expired, run it again". Probing turns that guess into a check.
+    4xx counts as alive: the origin answering "not found" still means the edge is routing.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "anima-tunnel-probe"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= r.status < 500
+    except urllib.error.HTTPError as e:
+        return 200 <= e.code < 500
+    except Exception:
+        return False
+
+
+def _wait_origin(port, timeout):
+    """Hold until the local Gradio server answers, so the tunnel is not proxying a void."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
                 if r.status == 200:
-                    break
+                    return
         except Exception:
             pass
         time.sleep(1)
-    else:
-        raise SystemExit(f"origin http://127.0.0.1:{port}/ did not answer within {timeout}s")
+    raise SystemExit(f"origin http://127.0.0.1:{port}/ did not answer within {timeout}s")
 
+
+def _spawn_quick(binp, port, log_path, timeout, append=False):
+    """Start cloudflared for a quick tunnel and return (process, url) once a URL is logged."""
+    log = open(log_path, "a" if append else "w")
     p = subprocess.Popen(
         [binp, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{port}"],
         stdout=log, stderr=subprocess.STDOUT,
@@ -66,12 +82,44 @@ def start(port=7860, log_path=LOG, timeout=90):
         time.sleep(1)
         txt = open(log_path, errors="replace").read()
         if p.poll() is not None:
-            raise SystemExit(f"cloudflared exited rc={p.returncode}:\n{txt[-2000:]}")
+            raise SystemExit("cloudflared exited rc=%s:\n%s"
+                             % (p.returncode, txt[-2000:]))
         m = URL_RE.search(txt)
         if m:
             return p, m.group(0)
-    raise SystemExit(f"no tunnel URL after {timeout}s:\n"
-                     + open(log_path, errors="replace").read()[-2000:])
+    raise SystemExit("no tunnel URL after %ss:\n%s"
+                     % (timeout, open(log_path, errors="replace").read()[-2000:]))
+
+
+def start(port=7860, log_path=LOG, timeout=90, verify_timeout=45, attempts=2):
+    """Start a quick tunnel and return (process, url) for a URL that has been probed.
+
+    Returning the first URL cloudflared logs is not the same as returning a working one. Each
+    attempt is verified against the public edge; a hostname that never answers is torn down and
+    replaced, which is what "run it twice" was doing by hand.
+    """
+    binp = ensure_cloudflared()
+    _wait_origin(port, timeout)
+    dead = []
+    for attempt in range(1, attempts + 1):
+        p, url = _spawn_quick(binp, port, log_path, timeout, append=attempt > 1)
+        t0 = time.time()
+        while time.time() - t0 < verify_timeout:
+            if _public_ok(url):
+                print(f"tunnel verified: {url} "
+                      f"(attempt {attempt}, {time.time() - t0:.0f}s)", flush=True)
+                return p, url
+            time.sleep(2)
+        dead.append(url)
+        print(f"tunnel {url} never answered within {verify_timeout}s -- restarting it",
+              flush=True)
+        try:
+            p.terminate()
+            p.wait(timeout=10)
+        except Exception:
+            pass
+    raise SystemExit("no reachable quick tunnel; cloudflared handed out "
+                     + ", ".join(dead) + " and none of them served")
 
 
 def bare_host(hostname):
@@ -86,6 +134,20 @@ def bare_host(hostname):
         if host.lower().startswith(scheme):
             host = host[len(scheme):]
     return host.rstrip("/")
+
+
+def named_argv(binp, token):
+    """argv for a named tunnel.
+
+    `--token` is a flag of the `run` SUBCOMMAND, not of `tunnel`: `cloudflared tunnel --token X`
+    answers "Incorrect Usage. flag provided but not defined: -token" and exits, so the connector
+    never starts. `--no-autoupdate` has to come before `run` as well -- after it, cloudflared
+    says the flag is not defined.
+
+    Verified against cloudflared 2026.10.2: this exact order parses, and a bogus token then
+    fails at "Tunnel token is not valid", which is the parser accepting the flags.
+    """
+    return [binp, "tunnel", "--no-autoupdate", "run", "--token", token]
 
 
 def start_named(token, hostname="", port=7860, log_path=LOG, timeout=120):
@@ -116,10 +178,8 @@ def start_named(token, hostname="", port=7860, log_path=LOG, timeout=120):
     else:
         raise SystemExit(f"origin http://127.0.0.1:{port}/ did not answer within {timeout}s")
 
-    p = subprocess.Popen(
-        [binp, "tunnel", "--no-autoupdate", "--token", token],
-        stdout=log, stderr=subprocess.STDOUT,
-    )
+    p = subprocess.Popen(named_argv(binp, token),
+                         stdout=log, stderr=subprocess.STDOUT)
     # With a token there is no URL to scrape -- the hostname lives in the dashboard. Wait for a
     # registered connection instead, which is the point where Cloudflare is actually routing.
     t0 = time.time()
