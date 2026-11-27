@@ -22,7 +22,11 @@ def build_slots(count: int = 4):
     for i in range(count):
         with gr.Accordion(f"Box {i + 1}", open=(i == 0)):
             with gr.Row():
-                enabled = gr.Checkbox(value=(i == 0), label="Include", scale=0)
+                # Off by default. It used to be value=(i == 0), which silently enabled one
+                # box covering the left half (x=0, w=0.5) with a blank prompt -- so every
+                # untouched generation was routed through the regional path and nobody had
+                # asked for it. Regional is now opt-in: tick Include.
+                enabled = gr.Checkbox(value=False, label="Include", scale=0)
                 mode = gr.Dropdown(["char", "style", "cs"], value="char",
                                    label="Ref mode", scale=0)
                 start = gr.Slider(0.0, 1.0, value=0.0, step=0.05, label="Start")

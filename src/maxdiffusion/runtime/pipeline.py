@@ -2097,7 +2097,12 @@ def boot():
                     _wimg = _fn(_pp, _wfeats, _wlat)
                     _wimg = jnp.clip(_wimg * 0.5 + 0.5, 0.0, 1.0)
                     _warr = np.asarray(jnp.transpose(_wimg, (1, 2, 0)))
-                    _vae_compiled.add((_WPX, _WPX))
+                    # Deliberately NOT recorded in _vae_compiled: that set means "a real VAE
+                    # decode executable exists for this size", and here only the pixel head was
+                    # compiled. Stamping it made the first preview skip its "compiling VAE
+                    # decode" status line while it silently paid the same ~52 s compile -- the
+                    # boot tax reappeared mid-generation wearing a denoise status. Previews
+                    # always decode through the VAE, so they must announce that compile.
                     _warmed = True
                     log(f"warmup: pixel decode compiled+ran at {_WPX}px in "
                         f"{time.perf_counter()-t0:.1f}s; out {_warr.shape}; {hbm_stats()}")
