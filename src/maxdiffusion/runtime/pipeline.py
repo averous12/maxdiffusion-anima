@@ -877,7 +877,13 @@ def prepare_regional(regions, target_hw, steps, style, tags, seed, default_negat
             snap = dict(snap, adapter=snap["ref_adapter"])
             item["snapref"] = snap
         if snap and snap.get("enabled", True) and snap.get("images"):
-            item["snapcfg"] = snap
+            # A COPY per region. The denoise loop pops "_kv"/"_sizes"/"_weights" off a region's
+            # snapcfg when that region ends (see the _leaving branch), and every region used to
+            # hold the very same dict as the request's global snapref. So with regional_end < 1
+            # the first region to close stripped "_sizes" from the global payload and the next
+            # step died in snapref_cfg_prediction with KeyError: '_sizes'. Each region also owns
+            # its own reference bank, which a shared dict could never express.
+            item["snapcfg"] = dict(snap)
         prepared.append(item)
     return prepared
 
