@@ -111,6 +111,9 @@ def assemble(values, include_refs: bool = True):
             "start": float(d.get("start") or 0.0),
             "end": float(d.get("end") or 1.0),
             "enabled": True,
+            # 1-based widget number, so a validation message can name the box the user
+            # actually ticked. Ignored by the server's canonicaliser.
+            "slot": index + 1,
         }
         negative = (d.get("negative") or "").strip()
         if negative:

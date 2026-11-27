@@ -502,8 +502,10 @@ Assign a prompt to a box, optionally with its own reference. See *Regional promp
 
 REGIONAL_HELP = """\
 ### How it works
-Each checked box is a rectangle on the canvas with its own prompt. The server blends the
-boxes together with masks:
+Each checked box is a rectangle on the canvas with its own prompt. **A checked box needs a
+prompt** — its own, or the common prompt above the boxes, which is prepended to it. A checked
+box with neither carries nothing and is refused with the box named rather than being silently
+ignored. The server blends the boxes together with masks:
 
 ```
 pred = base + Σ mᵢ·(branchᵢ − base) / max(Σm, 1)
@@ -1335,6 +1337,20 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
             return (f"region editor invalid: {exc}", _upd(), progress_bar_html(0, "idle"),
                     _upd(), _upd(), _upd())
         if regions:
+            # A region whose prompt is empty (and which has no common prompt to fall back on)
+            # is rejected by the server with "region 0 prompt is empty" -- after the request was
+            # already submitted, naming an index the UI never shows. Catch it here and name the
+            # box. The runtime joins the common prompt with the box prompt, so a blank box is
+            # only wrong when both are blank.
+            _common = (regional_common_pos or "").strip()
+            _blank = [r.get("slot", i + 1) for i, r in enumerate(regions)
+                      if not (_common + (r.get("prompt") or "")).strip()]
+            if _blank:
+                _names = ", ".join(f"Box {b}" for b in _blank)
+                return (f"{_names}: Include is ticked but there is no prompt, so the region "
+                        f"would carry nothing. Type a box prompt, set the common prompt, or "
+                        f"untick Include.",
+                        _upd(), progress_bar_html(0, "idle"), _upd(), _upd(), _upd())
             req["regional"] = regions
     if (regional_common_pos or "").strip() or (regional_common_neg or "").strip():
         req.setdefault("common", {})
