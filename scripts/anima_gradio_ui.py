@@ -714,6 +714,7 @@ _REBOOT = {"active": False, "t0": 0.0, "proc": None, "names": [], "scale": 1.0}
 # not rewritten on every timer tick.
 _DL_HANDLED = {"key": None}
 REBOOT_TIMEOUT_S = 1500.0
+SWAP_TIMEOUT_S = 180.0          # a merge is seconds; this only bounds a dead/absent server
 REBOOT_HINT = "about 4-5 minutes"
 
 
@@ -1025,14 +1026,20 @@ def remove_loras(prompt_text):
 
 
 def apply_loras(names, scale):
-    """Send LoRA config to the /lora_swap endpoint instead of restarting the server.
+    """Hot-swap LoRAs through the server's request file.
 
-    Uses HTTP POST to http://localhost:8000/lora_swap with the payload:
-      {"prompt": "...", "loras": [{"name": "foo.safetensors", "scale": 1.0}], "negative_prompt": "..."}
+    The runtime opens no HTTP port: it watches REQ_PATH. So this writes a `lora_swap` control
+    request and waits for `stage=lora-swapped`. The previous version POSTed to
+    localhost:8000/lora_swap, which nothing serves, so the button could only ever report a
+    connection error.
+
+    `lora_swap` is a control request, not a generation: the server merges, records
+    lora-swapped, and returns to watching. The prompt is untouched, and a prompt tag
+    <lora:name:0.8> remains the way to select a LoRA for one generation.
+
     Returns (state html, generate-button update).
     """
     import gradio as gr
-    import requests
 
     if _RUN_ACTIVE["flag"]:
         return (_lora_state_html("a generation is running — interrupt it first"),
@@ -1050,53 +1057,33 @@ def apply_loras(names, scale):
         return _lora_state_html("none of those files exist in " + LORA_DIR), gr.update()
 
     scale = float(scale if scale is not None else 1.0)
-    # Read current prompt from the request file to preserve user edits
-    try:
-        req = _read_json(REQ_PATH, {})
-        prompt = req.get("prompt", "")
-        neg_prompt = req.get("negative_prompt", "")
-    except Exception:
-        prompt = ""
-        neg_prompt = ""
+    specs = [{"path": os.path.join(LORA_DIR, n), "scale": scale} for n in chosen]
 
-    payload = {
-        "prompt": prompt,
-        "negative_prompt": neg_prompt
-    }
-    if chosen:
-        payload["loras"] = [{"name": n, "scale": scale} for n in chosen]
-    else:
-        payload["loras"] = []
-
+    gen_id = uuid.uuid4().hex
     try:
-        resp = requests.post("http://localhost:8000/lora_swap", json=payload, timeout=60)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("swapped"):
-            names_list = [n for n in chosen]
-            label = ", ".join(f"{n}@{scale:g}" for n in names_list) if names_list else "no LoRA"
-            return (_lora_state_html(f"✅ Hot-swapped: {label} in {result.get('merge_time', '?')}s"),
-                    gr.update())
-        else:
-            unresolved = result.get("unresolved", [])
-            if unresolved:
-                return (_lora_state_html(f"⚠️ Safe fallback: {', '.join(unresolved)} not found"),
-                        gr.update())
-            else:
-                return (_lora_state_html("ℹ️ No change needed — same LoRA set already active"),
-                        gr.update())
-    except requests.exceptions.Timeout:
-        return (_lora_state_html("❌ Request timed out — check if the server is running"),
-                gr.update())
-    except requests.exceptions.ConnectionError:
-        return (_lora_state_html("❌ Cannot connect to server — is it running?"),
-                gr.update())
-    except requests.exceptions.HTTPError as e:
-        return (_lora_state_html(f"❌ Server error: {e}"),
-                gr.update())
+        _atomic_json(REQ_PATH, {"go": True, "gen_id": gen_id, "lora_swap": specs})
     except Exception as e:
-        return (_lora_state_html(f"❌ Unexpected error: {type(e).__name__}: {e}"),
-                gr.update())
+        return (_lora_state_html(f"❌ could not write the request: {e}"), gr.update())
+
+    t0 = time.time()
+    while time.time() - t0 < SWAP_TIMEOUT_S:
+        time.sleep(0.5)
+        prog = _read_json(PROG_PATH, {})
+        if prog.get("gen_id") and prog["gen_id"] != gen_id:
+            continue
+        stage = prog.get("stage")
+        if stage == "lora-swapped":
+            label = ", ".join(f"{n}@{scale:g}" for n in chosen) if chosen else "no LoRA (base)"
+            secs = prog.get("swap_seconds")
+            merged = prog.get("merged")
+            return (_lora_state_html(
+                f"✅ Hot-swapped: {label} in {secs}s (merged {merged})"), gr.update())
+        if stage == "error":
+            return (_lora_state_html(f"❌ swap failed: {prog.get('error')}"), gr.update())
+
+    return (_lora_state_html(
+        "❌ no response — is the server running? (swap needs the runtime watching "
+        f"{REQ_PATH})"), gr.update())
 
 
 def _reboot_state(stage=None):
