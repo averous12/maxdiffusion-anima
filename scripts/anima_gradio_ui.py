@@ -9,7 +9,8 @@ Features
   * Prompt weighting: (tag:1.3). Parsed and applied on the server, where the tokenizer is.
   * Resolution from an aspect ratio (W:H, editable, with a live shape preview), locked to
     0.5 / 1.0 / 1.5 MP, or "Custom size" for typing pixel dimensions directly.
-  * The live preview is a real VAE decode of the in-progress latents (a grid when batching).
+  * The live preview is a real VAE decode of the in-progress latents (a grid when batching),
+    off by default because that decode is the expensive part.
 """
 import io
 import json
@@ -454,9 +455,10 @@ TABS_HELP = """\
 - **Steps** — denoising steps. 30–50 suits Base and Aesthetic; Turbo wants 8–12.
 - **CFG guidance** — 4–5 on Base/Aesthetic; **1.0** on Turbo.
 - **Seed** — `-1` picks a random seed and reports the value, so a good result is reproducible.
-- **Batch count** — up to **8** images in one run. They advance step by step together; image *k* uses `seed + k`.
+- **Batch size (per run)** — up to **8** images in ONE pass, advancing step by step together; image *k* uses `seed + k`. This is the memory knob: 4 at 1024 px with SnapRef and control both on ran out of memory, while 1 does not.
+- **Batch count (consecutive runs)** — how many times to repeat the run. Each run gets its own images and no extra memory, so size 1 x count 4 gives four images where size 4 x count 1 needed four times the RAM.
 - **Aspect preset / Image size** — quick ratio and megapixel targets. Width and Height are derived and read-only unless size is **Custom**.
-- **VAE preview every N steps** — live preview; every preview decodes the whole batch, so it costs time.
+- **VAE preview every N steps** — live preview, **off by default**. Every preview decodes the whole batch, and in pixel decode the first one also compiles the VAE (~50 s at 1024 px) inside the run.
 - **Generate / Interrupt** — Interrupt stops before the final decode, so no misleading half-image is written.
 - **Status** — the live stage line: denoise step, batch, seeds, preview counts.
 - **Result / Individual images** — the last image plus a gallery with each seed.
@@ -574,7 +576,7 @@ Measured at 1024², 8 steps: plain ≈ 0.6 s/step, three regional boxes ≈ 2.2 
 ### Keeping it fast
 - Fewer boxes is the only lever that matters much; 2 boxes ≈ 3× plain.
 - Reference megapixel budget trades fidelity for speed and memory — 0.25 MP per box is usually enough.
-- Previews decode the whole batch every time they fire; `0` disables them.
+- Previews decode the whole batch every time they fire; `0` disables them and is the default, because in pixel mode the first preview compiles the VAE mid-run.
 - Turbo wants far fewer steps, which is the largest saving available.
 """
 
@@ -1432,9 +1434,86 @@ def start_gen(prompt, neg, aspect_w, aspect_h, mp_label, width, height, steps, s
            progress_bar_html(0, "timeout"), *IDLE, [])
 
 
+# --- consecutive runs ----------------------------------------------------------------
+# `runs` is deliberately NOT a parameter of start_gen. It sits in the button's positional
+# inputs right after lllite_end, and this wrapper removes it before forwarding, so start_gen
+# keeps the exact signature the runtime contract expects. Deriving its index from start_gen's
+# own signature keeps the two in step when parameters move.
+def _runs_index():
+    import inspect
+    return list(inspect.signature(start_gen).parameters).index("lllite_end") + 1
+
+
+def _gallery_items(v):
+    """The image items carried by a gallery update, or []."""
+    if isinstance(v, dict):
+        val = v.get("value")
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def _merge_gallery(acc, v):
+    """Prepend earlier runs' images, so starting a new run never erases the gallery."""
+    import gradio as gr
+
+    merged = list(acc) + _gallery_items(v)
+    if not merged:
+        return v
+    return gr.update(visible=True, value=merged)
+
+
+def start_gen_runs(*args):
+    """Run the same request `runs` times, one after another.
+
+    This is the batching split: batch size is how many images share ONE pass and therefore
+    drives peak memory; runs is how many passes. Four images in one pass need four copies of
+    the activations -- which is exactly what OOMs once SnapRef and control are both on -- while
+    four runs of one image never need more than one.
+
+    The server persists between requests (weights, SnapRef encodings and merged LoRAs all stay
+    loaded), so a second run costs its denoise, not a reload. Each run gets its own gen_id,
+    progress record and archived filenames.
+    """
+    import gradio as gr
+
+    args = list(args)
+    runs = 1
+    idx = _runs_index()
+    if len(args) > idx:
+        try:
+            runs = int(args.pop(idx) or 1)
+        except (TypeError, ValueError):
+            runs = 1
+    runs = max(1, min(16, runs))
+
+    if runs == 1:
+        yield from start_gen(*args)
+        return
+
+    acc = []
+    last = None
+    done = 0
+    for _ in range(runs):
+        for outs in start_gen(*args):
+            last = outs
+            outs = list(outs)
+            outs[5] = _merge_gallery(acc, outs[5])
+            yield tuple(outs)
+        done += 1
+        if last is not None:
+            acc = list(acc) + _gallery_items(last[5])
+    if last is not None:
+        outs = list(last)
+        outs[1] = f"{outs[1]} · {done} consecutive runs"
+        outs[5] = gr.update(visible=True, value=acc)
+        yield tuple(outs)
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
+
+
 def disable_compression_for_sse():
     """Stop Gradio's Brotli middleware from buffering the queue event stream.
 
@@ -1663,8 +1742,15 @@ def build():
         with gr.Row(elem_id="anima-quick-settings"):
             steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
             batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
-                                    label="Batch count",
-                                    info="Images generated together, step by step. Image k uses seed + k.")
+                                    label="Batch size (per run)",
+                                    info="Images in ONE pass, step by step — this is what drives "
+                                         "memory. Image k uses seed + k. Lower it when SnapRef "
+                                         "or control is on: 4 at 1024 px with both was OOM.")
+            runs = gr.Slider(1, 16, value=1, step=1,
+                             label="Batch count (consecutive runs)",
+                             info="How many times to repeat the run, one after another. Each run "
+                                  "keeps its own images and no extra memory, so 1 x 4 produces "
+                                  "four images where 4 x 1 would need four times the RAM.")
             guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
                                  label="CFG guidance")
             seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
@@ -1687,9 +1773,11 @@ def build():
                                        interactive=False)
                 shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
                 gr.Markdown("### Sampling & prompt options")
-                preview_every = gr.Slider(0, 10, value=5, step=1,
+                preview_every = gr.Slider(0, 10, value=0, step=1,
                                           label="VAE preview every N steps (0 = off)",
-                                          info="Each preview decodes every image in the batch.")
+                                          info="Off by default: in pixel decode the first preview "
+                                               "compiles the VAE (~50 s at 1024 px), so leaving "
+                                               "it on pays that cost mid-run.")
                 with gr.Row():
                     prompt_style = gr.Radio(list(PROMPT_STYLES), value="comfy",
                                             label="Prompt style",
@@ -1908,7 +1996,7 @@ def build():
         demo.load(restore_settings, inputs=[settings], outputs=setting_inputs,
                   show_progress="hidden")
 
-        btn.click(start_gen,
+        btn.click(start_gen_runs,
                   inputs=[prompt, neg, aspect_w, aspect_h, mp_target, width, height, steps,
                           seed, guidance, preview_every, batch_count, prompt_style, tags,
                           snapref_on, snapref_adapter, snapref_upload, snapref_mode, snapref_layout,
@@ -1920,6 +2008,7 @@ def build():
                           # and it must sit before the *regional_inputs expansion
                           lllite_on, lllite_upload, lllite_model_pick, lllite_strength,
                           lllite_aspect, lllite_start, lllite_end,
+                          runs,          # consumed by start_gen_runs, not start_gen
                           *_regional_inputs],
                   outputs=[result, status, progress, btn, stop, gallery],
                   concurrency_limit=1)  # one TPU: never interleave two requests

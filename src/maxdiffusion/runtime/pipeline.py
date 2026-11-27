@@ -1036,7 +1036,7 @@ def default_req():
             "negative_prompt": "worst quality, low quality, blurry",
             "height": 1024, "width": 1024, "steps": 30, "guidance": 4.0,
             # -1 = pick a random seed; the server resolves it and reports the value.
-            "seed": -1, "preview_every": 5, "out": "/content/anima_perstep.png"}
+            "seed": -1, "preview_every": 0, "out": "/content/anima_perstep.png"}
 
 
 def _stall_watchdog():
@@ -1129,7 +1129,8 @@ def handle_request(d, gen_id):
         BATCH = max(1, min(8, int(d.get("batch_count", 1) or 1)))
         H, W, STEPS, GUIDANCE, SEED = d["height"], d["width"], d["steps"], d["guidance"], d["seed"]
         OUT = d["out"]
-        PREV_EVERY = int(d.get("preview_every", 5) or 0)
+        PREV_EVERY = int(d.get("preview_every", 0) or 0)   # no previews unless asked: in pixel
+        # decode the first preview compiles the VAE (~50 s at 1024 px)
         # Compute the expected preview count up front and log it, so "off" is explicit in the
         # server log rather than a silent truthiness fall-through (preview_every=0 and a
         # missing/None value both mean "no previews", which is invisible to the client).
