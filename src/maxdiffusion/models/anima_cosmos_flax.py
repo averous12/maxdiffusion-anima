@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Any, Optional, Tuple
 
 import jax
@@ -109,6 +110,57 @@ class _AdaLN(nn.Module):
     return (y * (1 + scale[:, None, :]) + shift[:, None, :]).astype(x.dtype), gate[:, None, :].astype(x.dtype)
 
 
+# Query-block size for attention.
+#
+# Memory in this module is dominated by the fp32 score tensor [B, heads, S, S + ref]: it is
+# quadratic in the token count and linear in the batch. At 1024 px with SnapRef attached it is
+# 2.13 GB at B=1 and 8.52 GB at B=4, on a 16 GB chip -- which is why batch 4 ran out of memory
+# and batch 1 did not.
+#
+# Splitting the QUERIES into blocks divides that by the number of blocks with no approximation
+# whatsoever: softmax normalises over the key axis, so every query row is independent and its
+# result cannot depend on which other rows share the call. 512 blocks take B=4 from 8.52 GB to
+# 1.06 GB. Scores stay fp32 throughout -- this buys memory with time, never precision.
+# 0 disables blocking and restores the single-shot path.
+ATTN_QCHUNK = int(os.environ.get("ANIMA_ATTN_QCHUNK", "512") or 0)
+
+
+def _attend_block(q32, k32, v32, ref_bias, mask, d):
+  """One block of exact fp32 attention. q32 is already fp32."""
+  scores = jnp.einsum("bqhd,bkhd->bhqk", q32, k32) / math.sqrt(d)
+  if ref_bias is not None:
+    scores = scores + ref_bias.astype(jnp.float32)[None, None, None, :]
+  if mask is not None:
+    scores = jnp.where(mask[:, None, None, :].astype(bool), scores, -1e4)
+  return jnp.einsum("bhqk,bkhd->bqhd",
+                    nn.softmax(scores, axis=-1).astype(jnp.float32), v32)
+
+
+def _attend(q, k, v, ref_bias=None, mask=None, chunk=None):
+  """Self/cross attention with fp32 scores, optionally blocked over queries.
+
+  Returns [B, S, heads, head_dim], the same shape and dtype as the single-shot einsums.
+  """
+  d = q.shape[-1]
+  q32 = q.astype(jnp.float32)
+  k32 = k.astype(jnp.float32)
+  v32 = v.astype(jnp.float32)
+  block = ATTN_QCHUNK if chunk is None else int(chunk)
+  s_len = q.shape[1]
+  if block <= 0 or block >= s_len:
+    return _attend_block(q32, k32, v32, ref_bias, mask, d)
+  b, h, hd = q.shape[0], q.shape[2], q.shape[3]
+  nblk = -(-s_len // block)
+  pad = nblk * block - s_len
+  if pad:
+    q32 = jnp.pad(q32, ((0, 0), (0, pad), (0, 0), (0, 0)))
+  # (B, nblk, block, H, D) -> (nblk, B, block, H, D) so the block axis can be mapped
+  qb = q32.reshape(b, nblk, block, h, hd).transpose(1, 0, 2, 3, 4)
+  y = jax.lax.map(lambda blk: _attend_block(blk, k32, v32, ref_bias, mask, d), qb)
+  y = y.transpose(1, 0, 2, 3, 4).reshape(b, nblk * block, h, hd)
+  return y[:, :s_len]
+
+
 class _Attention(nn.Module):
   hidden: int
   heads: int
@@ -155,12 +207,7 @@ class _Attention(nn.Module):
       v_r = jnp.broadcast_to(v_r, (v.shape[0],) + v_r.shape[1:]).astype(v.dtype)
       k = jnp.concatenate([k_r, k], axis=1)
       v = jnp.concatenate([v_r, v], axis=1)
-    scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) / math.sqrt(d)
-    if ref_bias is not None:
-      scores = scores + ref_bias.astype(jnp.float32)[None, None, None, :]
-    if mask is not None:
-      scores = jnp.where(mask[:, None, None, :].astype(bool), scores, -1e4)
-    y = jnp.einsum("bhqk,bkhd->bqhd", nn.softmax(scores, axis=-1).astype(jnp.float32), v.astype(jnp.float32))
+    y = _attend(q, k, v, ref_bias=ref_bias, mask=mask)
     b, q_len, h, d = y.shape
     y = y.reshape(b, q_len, h * d)
     out = self._proj(y, "to_out", lora, self.hidden)
