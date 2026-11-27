@@ -993,11 +993,17 @@ def decode_latents(latents):
 
 
 def grid_cols(n, w, h):
-    """Column count whose grid is closest to a 3:2 landscape, with a small penalty per empty cell."""
+    """Column count closest to 3:2, preferring a layout that tiles exactly.
+
+    Empty cells are painted black, and at 0.15 each the 3:2 preference outvoted them: a 4-image
+    batch came out 3 wide with two black holes (score 0.30 for 3x2 vs 0.405 for 2x2) and read as
+    "two results are missing". Exact tiling is what a user sees as "four results", so holes cost
+    0.6 -- still cheap enough that 5 images prefer 3+2 with one hole over a 1x5 strip.
+    """
     best = None
     for cols in range(1, n + 1):
         rows = -(-n // cols)
-        score = abs(math.log((cols * w) / (rows * h) / 1.5)) + 0.15 * (rows * cols - n)
+        score = abs(math.log((cols * w) / (rows * h) / 1.5)) + 0.6 * (rows * cols - n)
         if best is None or score < best[0]:
             best = (score, cols)
     return best[1]
