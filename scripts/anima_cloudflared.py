@@ -74,6 +74,51 @@ def start(port=7860, log_path=LOG, timeout=90):
                      + open(log_path, errors="replace").read()[-2000:])
 
 
+def start_named(token, hostname="", port=7860, log_path=LOG, timeout=120):
+    """Run a NAMED tunnel from a connector token and return (process, url).
+
+    A quick tunnel (`start`) gets a random *.trycloudflare.com name that changes on every
+    restart, which is useless as a bookmark and means a new URL in every log line. A named
+    tunnel is created once in the Cloudflare dashboard with a public hostname pointing at
+    http://localhost:7860; its connector token is then reusable here, and the URL stays put.
+
+    The token is what the dashboard shows under the tunnel's "Install connector" step. It is a
+    credential: passed here it is never written to the log.
+    """
+    binp = ensure_cloudflared()
+    log = open(log_path, "w")
+
+    _t0 = time.time()
+    while time.time() - _t0 < timeout:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+                if r.status == 200:
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+    else:
+        raise SystemExit(f"origin http://127.0.0.1:{port}/ did not answer within {timeout}s")
+
+    p = subprocess.Popen(
+        [binp, "tunnel", "--no-autoupdate", "--token", token],
+        stdout=log, stderr=subprocess.STDOUT,
+    )
+    # With a token there is no URL to scrape -- the hostname lives in the dashboard. Wait for a
+    # registered connection instead, which is the point where Cloudflare is actually routing.
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        time.sleep(1)
+        txt = open(log_path, errors="replace").read()
+        if p.poll() is not None:
+            # Never echo the tail verbatim: it can contain the token.
+            raise SystemExit(f"cloudflared exited rc={p.returncode} (see {log_path})")
+        if "Registered tunnel connection" in txt or "Connection registered" in txt:
+            url = f"https://{hostname}" if hostname else "(named tunnel: hostname is in the dashboard)"
+            return p, url
+    raise SystemExit(f"named tunnel did not register within {timeout}s (see {log_path})")
+
+
 def stop(p):
     if p and p.poll() is None:
         p.terminate()
