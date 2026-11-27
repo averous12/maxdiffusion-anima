@@ -93,13 +93,38 @@ def main():
         ran_ok = len(calls) == 3
         final_gallery = ui._gallery_items(out[-1][5])
         merged_ok = len(final_gallery) == 3
-        status_ok = "3 consecutive runs" in str(out[-1][1])
+        status_ok = "run 3/3" in str(out[-1][1])
         print(f"{'PASS' if ran_ok else 'FAIL'}  runs=3 calls start_gen three times ({len(calls)})")
         print(f"{'PASS' if merged_ok else 'FAIL'}  gallery keeps all images "
               f"({len(final_gallery)} of 3)")
         print(f"{'PASS' if status_ok else 'FAIL'}  status reports the run count: {out[-1][1]!r}")
         if not (ran_ok and merged_ok and status_ok):
             fails.append("runs=3 behaviour")
+
+        # --- batch size 1: the gallery is empty and hidden, the image is only in the result
+        # slot. Consecutive runs must still accumulate every image into one visible gallery,
+        # otherwise each run wipes the previous one and only the last survives.
+        calls.clear()
+
+        def fake_single(*args):
+            calls.append(list(args))
+            n = len(calls)
+            yield (f"img{n}.png", f"status {n}", None, None, None,
+                   gr.update(visible=False, value=[]))
+
+        ui.start_gen = fake_single
+        payload[idx] = 4
+        out = list(ui.start_gen_runs(*payload))
+        items = ui._gallery_items(out[-1][5])
+        visible = out[-1][5].get("visible")
+        ok_single = len(items) == 4 and visible is True and all(
+            str(items[k][0]) == f"img{k + 1}.png" for k in range(4))
+        print(f"{'PASS' if ok_single else 'FAIL'}  batch size 1 x 4 runs fills one visible gallery "
+              f"({len(items)} items, visible={visible})")
+        if not ok_single:
+            fails.append("gallery at batch 1")
+
+        ui.start_gen = fake_gen
 
         # --- unknown/blank runs value must not explode
         calls.clear()

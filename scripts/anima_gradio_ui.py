@@ -1463,6 +1463,26 @@ def _merge_gallery(acc, v):
     return gr.update(visible=True, value=merged)
 
 
+def _run_items(outs):
+    """The (image, caption) pairs one finished run actually produced.
+
+    start_gen only fills the gallery when batch size > 1; a single-image run puts its picture in
+    the result panel and yields an EMPTY, hidden gallery. So consecutive runs at batch size 1
+    would each clear the gallery and leave only the last image visible. When the gallery is
+    empty, take the run's image from the result slot instead.
+    """
+    items = _gallery_items(outs[5])
+    if items:
+        return items
+    res = outs[0]
+    img = res.get("value") if isinstance(res, dict) else res
+    if img is None:
+        return []
+    if isinstance(img, list):
+        return [(x, "") for x in img]
+    return [(img, "")]
+
+
 def start_gen_runs(*args):
     """Run the same request `runs` times, one after another.
 
@@ -1502,12 +1522,14 @@ def start_gen_runs(*args):
             yield tuple(outs)
         done += 1
         if last is not None:
-            acc = list(acc) + _gallery_items(last[5])
-    if last is not None:
-        outs = list(last)
-        outs[1] = f"{outs[1]} · {done} consecutive runs"
-        outs[5] = gr.update(visible=True, value=acc)
-        yield tuple(outs)
+            # Harvest this run's images even when it used batch size 1, then show the whole
+            # accumulated gallery: the result panel is overwritten by the next run, the gallery
+            # is the only place every run survives.
+            acc = list(acc) + [(im, cap or f"run {done}") for im, cap in _run_items(last)]
+            agg = list(last)
+            agg[1] = f"{last[1]} · run {done}/{runs}"
+            agg[5] = gr.update(visible=True, value=acc)
+            yield tuple(agg)
 
 # ---------------------------------------------------------------------------
 # UI
