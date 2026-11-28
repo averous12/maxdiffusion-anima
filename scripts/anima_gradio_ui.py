@@ -1806,32 +1806,33 @@ def build():
                 status = gr.Textbox(label="Status", interactive=False, show_label=False,
                                     placeholder="Ready", elem_id="anima-status")
 
-        gr.Markdown("### Quick settings")
-        with gr.Row(elem_id="anima-quick-settings"):
-            steps = gr.Slider(4, 50, value=30, step=1, label="Steps",
-                              info="More steps, more detail, slower.")
-            guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
-                                 label="Prompt strength",
-                                 info="How strictly it follows your words.")
-            seed = gr.Number(value=RANDOM_SEED, label="Seed", precision=0,
-                                 info="-1 picks a random one.")
-            preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Aspect ratio",
-                                 info="Fills the size above.")
-            mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Image size",
-                                 info="Custom size is in Settings.")
-
-        # Their own row, not a cell in the one above: both answer "how many images", and they
-        # trade memory against time in opposite directions, which only reads clearly side by side
-        # and at a sensible width -- squeezed into the 7-item row the labels wrapped to three lines.
-        with gr.Group(elem_id="anima-batch-group"):
-            gr.Markdown("**Batch**")
+        # One bordered block, two rows. Six controls in a single row crushed every one of them:
+        # Batch got a third of the width and the rest wrapped their labels. Two rows keep Batch
+        # inside quick settings and still leave each control a readable width.
+        with gr.Group(elem_id="anima-quick-settings"):
+            gr.Markdown("### Quick settings")
             with gr.Row():
-                batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
-                                        label="Batch size",
-                                        info="Images drawn together in one pass. More memory.")
-                runs = gr.Slider(1, 16, value=1, step=1,
-                                 label="Batch count",
-                                 info="How many times to run it. No extra memory.")
+                steps = gr.Slider(4, 50, value=30, step=1, label="Steps",
+                                  info="More steps, more detail, slower.")
+                guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
+                                     label="Prompt strength",
+                                     info="How strictly it follows your words.")
+                seed = gr.Number(value=RANDOM_SEED, label="Seed", precision=0,
+                                 info="-1 picks a random one.")
+            with gr.Row():
+                with gr.Group(elem_id="anima-batch-group"):
+                    gr.Markdown("**Batch**")
+                    with gr.Row():
+                        batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
+                                                label="Batch size",
+                                                info="Drawn together in one pass. More memory.")
+                        runs = gr.Slider(1, 16, value=1, step=1,
+                                         label="Batch count",
+                                         info="Runs again. No extra memory.")
+                preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Aspect ratio",
+                                     info="Fills the size below.")
+                mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Image size",
+                                     info="Custom size is in Settings.")
 
         with gr.Tabs(elem_id="anima-tabs"):
             with gr.Tab("Settings"):
