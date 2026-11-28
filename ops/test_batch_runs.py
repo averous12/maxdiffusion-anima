@@ -36,19 +36,19 @@ def main():
         return None, None
 
     # --- defaults
-    v, lab = slider_default("VAE preview")
+    v, lab = slider_default("Preview every")
     ok = v == 0
     print(f"{'PASS' if ok else 'FAIL'}  preview default is off  ({lab!r} = {v})")
     if not ok:
         fails.append("preview default")
 
-    v, lab = slider_default("Batch count (consecutive runs)", exact=True)
+    v, lab = slider_default("Times to run", exact=True)
     ok = v == 1
     print(f"{'PASS' if ok else 'FAIL'}  runs default is 1  ({lab!r} = {v})")
     if not ok:
         fails.append("runs default")
 
-    v, lab = slider_default("Batch size (per run)", exact=True)
+    v, lab = slider_default("Images at once", exact=True)
     ok = v == 1
     print(f"{'PASS' if ok else 'FAIL'}  batch size default is 1  ({lab!r} = {v})")
     if not ok:

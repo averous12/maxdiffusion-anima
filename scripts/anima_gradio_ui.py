@@ -468,7 +468,7 @@ Schedules can be nested. For example: `a [red:[blue::0.7]:0.5] cat`.
 ### Comments and literal characters
 `#` starts a comment through the end of that line. Escape syntax characters with a backslash, including `\\#`, `\\:`, `\\\\`, `\\(`, `\\)`, `\\[`, `\\]`, `\\{`, and `\\}`. Quoted text also keeps operators such as `AND` literal.
 
-### LoRAs
+### LoRA
 Add a LoRA from the LoRAs tab or use a prompt tag such as `<lora:style-name:0.8>`. LoRA strength stays fixed for the whole generation because the weights are merged before sampling. Changing the active LoRA or its strength requires a re-merge; per-step LoRA schedules are not supported.
 
 **Not supported:** `MASK`, `COUPLE`, `CUT`, per-encoder `TE()` prompts, `SDXL()`, `NOISE()`, macros, and Jinja templates. Regional prompting is supported — see the **Regional** tab and the regional section below.
@@ -496,24 +496,24 @@ TABS_HELP = """\
 - **Prompt style** — Comfy, A1111 or Safe (see *Prompt syntax*).
 - **Tags** — enables `[first:second:TAG]` selection inside a prompt.
 
-### LoRAs tab
-- **Search LoRAs** and **Installed LoRAs** — find and pick a LoRA.
-- **Strength for selected LoRA** — its weight; fixed for the whole run.
-- **Add from link** — HuggingFace or CivitAI; downloads and validates into the LoRA directory.
-- **Refresh library** / **Remove tags from prompt** — resync the list, or strip `<lora:...>` tags from the prompt.
-- **Restart server with base weights** — drops the merged LoRA so the next run is clean.
+### LoRA tab
+- **Search** and **Installed** — find and pick a LoRA.
+- **Strength** — its weight; fixed for the whole run.
+- **Add from a link** — HuggingFace or CivitAI; downloads and validates into the LoRA directory.
+- **Refresh** / **Remove from prompt** — resync the list, or strip `<lora:...>` tags from the prompt.
+- **Back to base model** — drops the merged LoRA so the next run is clean.
 LoRA strength is fixed for the whole run: weights are merged before sampling, so per-step LoRA schedules are not supported.
 
-### Decode tab
-- **Decode path** — `pixel` reads the DiT's final features through a small conv head and is the default; `vae` is the fallback and always works. A missing head degrades to VAE automatically instead of failing mid-run.
-- **Pixel head file** — place `.safetensors` heads in `anima_pixel_heads/`.
+### Output (Settings tab)
+- **Decoder** — `pixel` reads the DiT's final features through a small conv head and is the default; `vae` is the fallback and always works. A missing head degrades to VAE automatically instead of failing mid-run.
+- **Pixel decoder file** — place `.safetensors` heads in `anima_pixel_heads/`.
 
 ### SnapRef tab — reference images
-- **Use SnapRef** — off by default; plain generation is unchanged when it is off.
-- **Reference images** — one to three, previewed in **Selected references**. **Adapter version** selects the release (v1a, v2a-pre2, v2s).
-- **Reference mode** — `cs` = character + style, `char` = character only, `style` = style only.
-- **Reference layout** — `separate` encodes each card on its own; `stitch` joins them side by side into one reference.
-- **Reference 1 weight**, **Reference 2 weight**, **Reference 3 weight** — per-reference strength.
+- **Use a reference** — off by default; plain generation is unchanged when it is off.
+- **Reference images** — one to three, previewed in **Your references**. **Reference model** selects the release (v1a, v2a-pre2, v2s).
+- **What to copy** — `cs` = character + style, `char` = character only, `style` = style only.
+- **Layout** — `separate` encodes each card on its own; `stitch` joins them side by side into one reference.
+- **Weight 1**, **Weight 2**, **Weight 3** — per-reference strength.
 
 Inside **Advanced SnapRef settings**:
 - **Reference strength** and **Fidelity** — overall reference influence.
@@ -521,7 +521,7 @@ Inside **Advanced SnapRef settings**:
 - **Enable reference guidance** with **Reference guidance strength** — extra guidance toward the reference; costs an extra model call per step.
 - **Guidance correction** — `apg`, `rescale` or `none`.
 - **Reference caption (optional)** — a short text description of what to transfer.
-- **Reference pixel budget (MP, combined)** — total reference resolution; 3.0 = a full megapixel each. Lower is faster and lighter.
+- **Reference detail** — total reference resolution; 3.0 = a full megapixel each. Lower is faster and lighter.
 
 ### Regional tab — different prompts in different places
 Assign a prompt to a box, optionally with its own reference. See *Regional prompting* below for the rules that matter.
@@ -548,8 +548,8 @@ That is where style drift and seams come from, and it is exactly what the covera
 preview warns about.
 
 ### The common block
-**Common prompt — prepended to every checked box** and
-**Common negative — prepended to every checked box** are prepended to each checked box's
+**Common prompt** and
+**Common negative** are prepended to each checked box's
 text. Put the quality preamble and `@artist` tags there once. It is not prepended to the
 main Prompt box, which is authored as a complete prompt.
 
@@ -1787,118 +1787,91 @@ def build():
         with gr.Row(elem_id="anima-main"):
             with gr.Column(scale=1, elem_id="anima-prompt-column"):
                 prompt = gr.Textbox(value=FERN_PROMPT, lines=5, label="Prompt",
-                                    placeholder="prompt — supports (weights:1.3) "
-                                                "and [before:after:0.5] schedules")
+                                    placeholder="Describe the image — (stronger:1.3) "
+                                                "and [from:to:0.5] also work")
                 neg = gr.Textbox(value=FERN_NEG, lines=2,
-                                 label="Negative prompt (weights work here too)")
+                                 label="What to avoid")
                 with gr.Row(elem_id="anima-actions"):
                     btn = gr.Button("Generate", variant="primary", size="lg", scale=4)
                     stop = gr.Button("Interrupt", variant="stop", size="lg", scale=4,
                                      visible=False)
             with gr.Column(scale=1, elem_id="anima-result-column"):
-                result = gr.Image(label="Result", height=440, elem_id="anima-result")
+                result = gr.Image(label="Your image", height=440, elem_id="anima-result")
                 # A batch temporarily replaces the single-image result in this slot.
-                gallery = gr.Gallery(label="Individual images (with seeds)", columns=3,
+                gallery = gr.Gallery(label="Batch images", columns=3,
                                      height=440, object_fit="contain", visible=False,
                                      elem_id="anima-gallery")
                 progress = gr.HTML(progress_bar_html(0, "idle"),
                                    elem_id="anima-progress")
                 status = gr.Textbox(label="Status", interactive=False, show_label=False,
-                                    placeholder="idle", elem_id="anima-status")
+                                    placeholder="Ready", elem_id="anima-status")
 
         gr.Markdown("### Quick settings")
         with gr.Row(elem_id="anima-quick-settings"):
-            steps = gr.Slider(4, 50, value=30, step=1, label="Steps")
-            batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
-                                    label="Batch size (per run)",
-                                    info="Images in ONE pass, step by step — this is what drives "
-                                         "memory. Image k uses seed + k. Lower it when SnapRef "
-                                         "or control is on: 4 at 1024 px with both was OOM.")
-            runs = gr.Slider(1, 16, value=1, step=1,
-                             label="Batch count (consecutive runs)",
-                             info="How many times to repeat the run, one after another. Each run "
-                                  "keeps its own images and no extra memory, so 1 x 4 produces "
-                                  "four images where 4 x 1 would need four times the RAM.")
+            steps = gr.Slider(4, 50, value=30, step=1, label="Steps",
+                              info="More steps, more detail, slower.")
             guidance = gr.Slider(1.0, 8.0, value=4.0, step=0.5,
-                                 label="CFG guidance")
-            seed = gr.Number(value=RANDOM_SEED, label="Seed (-1 = random)", precision=0)
-            preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Aspect preset",
-                                 info="Quick-fill the ratio")
+                                 label="Prompt strength",
+                                 info="How strictly it follows your words.")
+            seed = gr.Number(value=RANDOM_SEED, label="Seed", precision=0,
+                                 info="-1 picks a random one.")
+            preset = gr.Dropdown(list(ASPECT_PRESETS), value=None, label="Aspect ratio",
+                                 info="Fills the size above.")
             mp_target = gr.Radio(MP_CHOICES, value="1.0 MP", label="Image size",
-                                 info="Custom size is available in Settings.")
+                                 info="Custom size is in Settings.")
+
+        # Their own row, not a cell in the one above: both answer "how many images", and they
+        # trade memory against time in opposite directions, which only reads clearly side by side
+        # and at a sensible width -- squeezed into the 7-item row the labels wrapped to three lines.
+        with gr.Group(elem_id="anima-batch-group"):
+            gr.Markdown("**How many images**")
+            with gr.Row():
+                batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
+                                        label="Images at once",
+                                        info="One pass together. More memory.")
+                runs = gr.Slider(1, 16, value=1, step=1,
+                                 label="Times to run",
+                                 info="One after another. No extra memory.")
 
         with gr.Tabs(elem_id="anima-tabs"):
             with gr.Tab("Settings"):
-                gr.Markdown("### Resolution")
+                gr.Markdown("### Size")
                 with gr.Row():
-                    aspect_w = gr.Number(value=1, label="Aspect W", minimum=0.1)
-                    aspect_h = gr.Number(value=1, label="Aspect H", minimum=0.1)
-                    swap = gr.Button("Swap W/H", size="sm")
+                    aspect_w = gr.Number(value=1, label="Ratio W", minimum=0.1)
+                    aspect_h = gr.Number(value=1, label="Ratio H", minimum=0.1)
+                    swap = gr.Button("Swap", size="sm")
                 with gr.Row():
-                    width = gr.Number(value=w0, label="Width (px)", precision=0,
+                    width = gr.Number(value=w0, label="Width", precision=0,
                                       interactive=False)
-                    height = gr.Number(value=h0, label="Height (px)", precision=0,
+                    height = gr.Number(value=h0, label="Height", precision=0,
                                        interactive=False)
                 shape_preview = gr.HTML(preview_html(1, 1, "1.0 MP", w0, h0))
-                gr.Markdown("### Sampling & prompt options")
+                gr.Markdown("### Sampling")
                 preview_every = gr.Slider(0, 10, value=0, step=1,
-                                          label="VAE preview every N steps (0 = off)",
-                                          info="Off by default: in pixel decode the first preview "
-                                               "compiles the VAE (~50 s at 1024 px), so leaving "
-                                               "it on pays that cost mid-run.")
+                                          label="Preview every N steps",
+                                          info="Shows progress images. Off is faster.")
                 with gr.Row():
                     prompt_style = gr.Radio(list(PROMPT_STYLES), value="comfy",
                                             label="Prompt style",
-                                            info="Comfy = core rules; a1111 adds [x] / {x}; safe treats plain parentheses literally.")
-                    tags = gr.Textbox(value="", label="Tags (for [a:b:TAG] selection)",
-                                      info="Space or comma separated, e.g. SECOND_PASS")
+                                            info="Only change this if you paste A1111 prompts.")
+                    tags = gr.Textbox(value="", label="Tags",
+                                      info="Used by [a:b:TAG] switching.")
 
-            with gr.Tab("LoRAs"):
-                gr.Markdown("### LoRA library")
-                lora_query = gr.Textbox(label="Search LoRAs", placeholder="Filter by filename…",
-                                        show_label=False)
-                lora_pick = gr.Radio(choices=_installed_loras(), value=None,
-                                     label="Installed LoRAs", interactive=True,
-                                     elem_id="anima-lora-cards")
-                lora_menu = gr.HTML(_lora_menu_html(""))
-                with gr.Row():
-                    lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
-                                           label="Strength for selected LoRA")
-                    lora_refresh = gr.Button("Refresh library", size="sm")
-                    lora_remove = gr.Button("Remove tags from prompt", size="sm")
-                # Downloading is safe during generation; only a merge touches weights.
-                lora_url = gr.Textbox(
-                    label="Add from link (HuggingFace or CivitAI)",
-                    placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors or https://civitai.com/models/12345",
-                    info="Downloads and validates into the LoRA directory.")
-                lora_add = gr.Button("Download & validate", variant="secondary")
-                lora_state = gr.HTML(_lora_state_html())
-                gr.Markdown(
-                    "Strength lives in the prompt, A1111 style: `<lora:name:0.8>`. "
-                    "The server merges only when the set or strength changes. "
-                    "`<lora:none>` returns to the base model.")
-                lora_restart = gr.Button("Restart server with base weights",
-                                         size="sm", variant="stop")
-
-            with gr.Tab("Decode"):
-                gr.Markdown("**VAE decode** (default) or a **pixel head**: a 25M-parameter readout "
-                            "of the DiT's final-layer features that skips the VAE entirely — "
-                            "much lower HBM during decode, and no VAE load needed for the output.")
+                gr.Markdown("### Output")
                 _heads = pixel_head_names()
-                decode_mode = gr.Radio(["pixel", "vae"], value="pixel", label="Decode path",
-                                       info="pixel reads the DiT's final features; vae is the fallback")
+                decode_mode = gr.Radio(["pixel", "vae"], value="pixel", label="Decoder",
+                                       info="Pixel is the fast one. VAE is the classic.")
                 pixel_head_pick = gr.Dropdown(
                     choices=_heads or ["(none found)"],
                     value=_heads[0] if _heads else "(none found)",
-                    label="Pixel head file",
-                    info="Place .safetensors heads in anima_pixel_heads/")
-
+                    label="Pixel decoder file",
+                    info="Files live in anima_pixel_heads/.")
             with gr.Tab("SnapRef"):
-                gr.Markdown("Upload one or more reference images. Choose a mode; advanced tuning stays tucked away.")
-                snapref_on = gr.Checkbox(value=False, label="Use SnapRef")
+                gr.Markdown("Give the model a face or a look to copy.")
+                snapref_on = gr.Checkbox(value=False, label="Use a reference")
                 snapref_upload = gr.File(label="Reference images", file_count="multiple",
                                          file_types=["image"], type="filepath")
-                snapref_preview = gr.Gallery(value=[], label="Selected references", columns=4,
+                snapref_preview = gr.Gallery(value=[], label="Your references", columns=4,
                                              height=190, object_fit="contain", allow_preview=True,
                                              elem_id="anima-snapref-preview",
                                              elem_classes="snapref-preview")
@@ -1906,89 +1879,76 @@ def build():
                 snapref_adapter = gr.Radio(
                     choices=adapters or ["(none found)"],
                     value=adapters[0] if adapters else "(none found)",
-                    label="Adapter version")
-                snapref_mode = gr.Radio(["cs", "char", "style"], value="cs", label="Reference mode",
-                                        info="cs = character + style · char = character only · style = style only (v2s)")
-                with gr.Accordion("Advanced SnapRef settings", open=False):
+                    label="Reference model")
+                snapref_mode = gr.Radio(["cs", "char", "style"], value="cs", label="What to copy",
+                                        info="cs = person + style · char = person · style = look only")
+                with gr.Accordion("Fine tuning", open=False):
                     snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
-                                              label="Reference layout",
-                                              info="Separate encodes each card; stitch joins them side by side.")
+                                              label="Layout",
+                                              info="Separate reads each image on its own.")
                     snapref_weight_1 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
-                                                 label="Reference 1 weight")
+                                                 label="Weight 1")
                     snapref_weight_2 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
-                                                 label="Reference 2 weight")
+                                                 label="Weight 2")
                     snapref_weight_3 = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
-                                                 label="Reference 3 weight")
+                                                 label="Weight 3")
                     snapref_weights = gr.State([1.0, 1.0, 1.0])
                     snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1,
-                                                 label="Reference strength")
+                                                 label="Influence")
                     snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
-                                                 label="Fidelity")
+                                                 label="Faithfulness")
                     snapref_in_uncond = gr.Checkbox(value=False,
-                                                    label="Also apply reference to negative branch")
-                    snapref_rg_on = gr.Checkbox(value=False, label="Enable reference guidance",
-                                                info="Adds an extra model call per denoise step.")
+                                                    label="Also guide the negative side")
+                    snapref_rg_on = gr.Checkbox(value=False, label="Extra reference pass",
+                                                info="Slower, often closer.")
                     snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1,
-                                           label="Reference guidance strength")
+                                           label="Reference guidance")
                     snapref_correction = gr.Radio(["apg", "rescale", "none"], value="apg",
-                                                  label="Guidance correction")
-                    snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption (optional)",
+                                                  label="Correction")
+                    snapref_caption = gr.Textbox(value="", lines=1, label="Describe the reference",
                                                  placeholder="blue hair, red jacket")
                     snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
-                                                label="Reference pixel budget (MP, combined)",
-                                                info="Separate references share this. 3.0 = a full megapixel each.")
+                                                label="Reference detail",
+                                                info="3.0 = full detail for one image.")
 
             with gr.Tab("Control"):
-                gr.Markdown(
-                    "**LLLite control.** Feed a pose or outline image and the model follows it. "
-                    "Prefer **letterbox**: stretching a portrait control into a square distorts "
-                    "the figure enough to make pose adherence impossible to judge. "
-                    "Control **cannot be combined with Regional** — regional replaces the base "
-                    "prediction per box, so a whole-image control would be silently dropped; "
-                    "the request is refused rather than ignored.")
-                lllite_on = gr.Checkbox(value=False, label="Enable LLLite control")
+                gr.Markdown("Feed a pose or outline image and the model follows it. "
+                            "Not available together with Regional.")
+                lllite_on = gr.Checkbox(value=False, label="Use a control image")
                 lllite_upload = gr.Image(
-                    label="Control image (pose / outline) — the generation follows it",
+                    label="Control image",
                     type="filepath", sources=["upload"], height=260)
                 lllite_model_pick = gr.Dropdown(
                     choices=_installed_lllite(), value=_default_lllite(),
-                    label="LLLite checkpoint",
-                    info="anima_3dpose = pose, anima_3dpose_outline = line art, "
-                         "anima_regional = region masks.")
+                    label="Control type",
+                    info="Pose, outline, or region mask.")
                 with gr.Row():
                     lllite_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
-                                                label="Control strength")
+                                                label="Strength")
                     lllite_aspect = gr.Radio(["letterbox", "stretch"], value="letterbox",
-                                             label="Control fit",
-                                             info="letterbox keeps proportions, stretch fills.")
+                                             label="Fit",
+                                             info="Letterbox keeps shape. Stretch fills.")
                 with gr.Row():
                     lllite_start = gr.Slider(0.0, 1.0, value=0.0, step=0.01,
-                                             label="Apply from (fraction of steps)")
+                                             label="Start")
                     lllite_end = gr.Slider(0.0, 1.0, value=1.0, step=0.01,
-                                           label="Apply until")
+                                           label="End")
 
             with gr.Tab("Regional"):
-                gr.Markdown(
-                    "Assign a prompt to a box, and optionally give each box its own "
-                    "reference. The **common** block is prepended to every checked box, so "
-                    "the quality preamble and `@artist` tags are written once instead of "
-                    "repeated per box.")
+                gr.Markdown("Give each box its own prompt. Common text is added to every box.")
                 regional_common_pos = gr.Textbox(
                     value="masterpiece, best quality, amazing quality, very aesthetic, "
                           "absurdres, highres, extremely detailed, intricate details, "
                           "year 2025, newest, safe",
-                    lines=2, label="Common prompt — prepended to every checked box",
-                    info="Quality preamble and @artist tags belong here, once.")
+                    lines=2, label="Common prompt",
+                    info="Added to every box.")
                 regional_common_neg = gr.Textbox(
                     value="worst quality, low quality, blurry, bad anatomy",
-                    lines=1, label="Common negative — prepended to every checked box")
+                    lines=1, label="Common negative")
                 regional_end = gr.Slider(
                     0.10, 1.00, value=0.35, step=0.05,
-                    label="Regional routing window",
-                    info="Share of steps that use the boxes, for boxes with no schedule of "
-                         "their own. A box with an explicit start/end keeps its own window. "
-                         "Composition settles early: 0.35 is faster and avoids the boxes "
-                         "fighting into one split figure.")
+                    label="Box window",
+                    info="How long the boxes guide the image. 0.35 is a good default.")
                 _regional_slots = regional_ui.build_slots(4)
                 _regional_inputs = regional_ui.ordered_inputs(_regional_slots)
 
@@ -2013,11 +1973,36 @@ def build():
                     regional_common_pos.value, regional_common_neg.value,
                     *resolve_size(aspect_w.value, aspect_h.value, mp_target.value,
                                   width.value, height.value)))
-                regional_preview_btn = gr.Button("Refresh preview", size="sm")
+                regional_preview_btn = gr.Button("Refresh", size="sm")
                 regional_json = gr.Textbox(
-                    value="", lines=4, label="Advanced: raw regional JSON (overrides the editor)",
+                    value="", lines=4, label="Advanced: raw JSON (overrides the boxes)",
                     placeholder='{"common":{"prompt":"..."},"stages":[...]}',
                     info="Filled in, this replaces the editor boxes for that request.")
+
+            with gr.Tab("LoRA"):
+                gr.Markdown("### Styles")
+                lora_query = gr.Textbox(label="Search", placeholder="Filter by filename…",
+                                        show_label=False)
+                lora_pick = gr.Radio(choices=_installed_loras(), value=None,
+                                     label="Installed", interactive=True,
+                                     elem_id="anima-lora-cards")
+                lora_menu = gr.HTML(_lora_menu_html(""))
+                with gr.Row():
+                    lora_scale = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
+                                           label="Strength")
+                    lora_refresh = gr.Button("Refresh", size="sm")
+                    lora_remove = gr.Button("Remove from prompt", size="sm")
+                # Downloading is safe during generation; only a merge touches weights.
+                lora_url = gr.Textbox(
+                    label="Add from a link",
+                    placeholder="https://huggingface.co/user/repo/blob/main/x.safetensors or https://civitai.com/models/12345",
+                    info="HuggingFace or CivitAI.")
+                lora_add = gr.Button("Download", variant="secondary")
+                lora_state = gr.HTML(_lora_state_html())
+                gr.Markdown("Strength is written in the prompt: `<lora:name:0.8>`. "
+                            "`<lora:none>` goes back to the base model.")
+                lora_restart = gr.Button("Back to base model",
+                                         size="sm", variant="stop")
 
             with gr.Tab("Help"):
                 gr.Markdown(
