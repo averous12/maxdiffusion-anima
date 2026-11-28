@@ -482,8 +482,8 @@ TABS_HELP = """\
 - **Steps** — denoising steps. 30–50 suits Base and Aesthetic; Turbo wants 8–12.
 - **CFG guidance** — 4–5 on Base/Aesthetic; **1.0** on Turbo.
 - **Seed** — `-1` picks a random seed and reports the value, so a good result is reproducible.
-- **Batch size (per run)** — up to **8** images in ONE pass, advancing step by step together; image *k* uses `seed + k`. This is the memory knob: 4 at 1024 px with SnapRef and control both on ran out of memory, while 1 does not.
-- **Batch count (consecutive runs)** — how many times to repeat the run. Each run gets its own images and no extra memory, so size 1 x count 4 gives four images where size 4 x count 1 needed four times the RAM.
+- **Batch size** — up to **8** images in ONE pass, advancing step by step together; image *k* uses `seed + k`. This is the memory knob: 4 at 1024 px with SnapRef and control both on ran out of memory, while 1 does not.
+- **Batch count** — how many times to repeat the run. Each run gets its own images and no extra memory, so size 1 x count 4 gives four images where size 4 x count 1 needed four times the RAM.
 - **Aspect preset / Image size** — quick ratio and megapixel targets. Width and Height are derived and read-only unless size is **Custom**.
 - **VAE preview every N steps** — live preview, **off by default**. Every preview decodes the whole batch, and in pixel decode the first one also compiles the VAE (~50 s at 1024 px) inside the run.
 - **Generate / Interrupt** — Interrupt stops before the final decode, so no misleading half-image is written.
