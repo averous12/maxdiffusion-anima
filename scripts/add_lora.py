@@ -9,7 +9,9 @@ Accepted links:
   https://huggingface.co/<owner>/<repo>/tree/main/<file>.safetensors   (converted)
   https://huggingface.co/<owner>/<repo>                                (file picked via the HF API)
   https://civitai.com/models/<id>[?modelVersionId=<v>]                 (converted to the API route)
-  https://civitai.com/api/download/models/<id>
+  https://civitai.com/api/download/models/<id>[?fileId=<f>]
+  Any civitai mirror works the same way (civitai.red, ...) -- the host is preserved, and
+  ?fileId= is kept because it selects WHICH file of a version to fetch.
   any direct https URL ending in .safetensors
 
 Every download is validated before it is advertised: the safetensors header must
@@ -37,7 +39,11 @@ CHUNK = 1 << 16
 # files only. HF accepts a Bearer header; CivitAI wants the token in the query
 # string on its download route.
 HF_TOKEN = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
-CIVITAI_TOKEN = (os.environ.get("ANIMA_CIVITAI_TOKEN") or "").strip()
+CIVITAI_TOKEN = (os.environ.get("ANIMA_CIVITAI_TOKEN")
+                 or os.environ.get("CIVITAI_TOKEN") or "").strip()
+# Both names on purpose: boot.py exports ANIMA_CIVITAI_TOKEN, the notebook config form and
+# secrets.env use CIVITAI_TOKEN. Reading only one of them meant a correctly configured
+# session still sent no token and every gated CivitAI download came back 401.
 
 
 def write_state(**kw):
@@ -93,28 +99,47 @@ def resolve_url(url, name_hint=""):
         return None, (sanitize_name(name_hint) if name_hint else None)
 
     # ---- CivitAI -----------------------------------------------------------
-    m = re.search(r"civitai\.com/(?:models|api/download/models)/(\d+)", u)
+    # The host is kept, not rewritten: civitai.com and its mirrors (civitai.red and friends) serve
+    # the same API, and a user on a mirror may not be able to reach .com at all. Matching only
+    # "\.com" is what made a civitai.red link fall through to "unrecognised link".
+    m = re.search(r"civitai\.[a-z]+/(?:models|api/download/models)/(\d+)", u)
     if m:
         model_id = m.group(1)
-        if "/api/download/" in u:
-            return u.split("?")[0], sanitize_name(
-                name_hint or f"civitai_{model_id}")
-        q = u.split("?", 1)[1] if "?" in u else ""
+        hm = re.search(r"https?://([^/\s]+)", u)
+        host = hm.group(1) if hm else "civitai.com"
         params = {}
+        q = u.split("?", 1)[1] if "?" in u else ""
         for part in q.split("&"):
             if "=" in part:
                 k, v = part.split("=", 1)
                 params[k] = v
+        file_id = params.get("fileId") or params.get("fileid") or ""
+        token = params.get("token", "") or CIVITAI_TOKEN
+
+        if "/api/download/" in u:
+            # This already IS the download route. Keep what selects the file -- fileId, type --
+            # and what authorises it. The old code returned u.split("?")[0], which silently
+            # downloaded the wrong file whenever a model version holds more than one.
+            query = []
+            if file_id:
+                query.append(f"fileId={file_id}")
+            if params.get("type"):
+                query.append(f"type={params['type']}")
+            if token:
+                query.append(f"token={token}")
+            dl = f"https://{host}/api/download/models/{model_id}"
+            if query:
+                dl += "?" + "&".join(query)
+            suffix = f"_f{file_id}" if file_id else ""
+            return dl, sanitize_name(name_hint or f"civitai_{model_id}{suffix}")
+
         version = params.get("modelVersionId") or params.get("version") or ""
-        dl = f"https://civitai.com/api/download/models/{model_id}"
         query = []
         if version:
             query.append(f"version={version}")
-        user_token = params.get("token", "")
-        if user_token:
-            query.append(f"token={user_token}")   # keep a token the user put in the link
-        elif CIVITAI_TOKEN:
-            query.append(f"token={CIVITAI_TOKEN}")  # otherwise use the session token
+        if token:
+            query.append(f"token={token}")     # session token, or one the user put in the link
+        dl = f"https://{host}/api/download/models/{model_id}"
         if query:
             dl += "?" + "&".join(query)
         return dl, sanitize_name(name_hint or f"civitai_{model_id}")
@@ -188,6 +213,10 @@ def download(dl_url, target):
     # already folded into dl_url's query string by resolve_url.
     if "huggingface.co" in dl_url and HF_TOKEN:
         hdrs["Authorization"] = f"Bearer {HF_TOKEN}"
+    elif "civitai." in dl_url and CIVITAI_TOKEN:
+        # Some mirrors honour only the header and drop ?token= on redirect; sending both costs
+        # nothing and keeps the token out of the redirect Location that ends up in error text.
+        hdrs["Authorization"] = f"Bearer {CIVITAI_TOKEN}"
     req = urllib.request.Request(dl_url, headers=hdrs)
     tmp = target + ".part"
     with urllib.request.urlopen(req, timeout=60) as r:
