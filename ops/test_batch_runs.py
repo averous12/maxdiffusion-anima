@@ -42,13 +42,13 @@ def main():
     if not ok:
         fails.append("preview default")
 
-    v, lab = slider_default("Times to run", exact=True)
+    v, lab = slider_default("Batch count", exact=True)
     ok = v == 1
     print(f"{'PASS' if ok else 'FAIL'}  runs default is 1  ({lab!r} = {v})")
     if not ok:
         fails.append("runs default")
 
-    v, lab = slider_default("Images at once", exact=True)
+    v, lab = slider_default("Batch size", exact=True)
     ok = v == 1
     print(f"{'PASS' if ok else 'FAIL'}  batch size default is 1  ({lab!r} = {v})")
     if not ok:

@@ -510,8 +510,8 @@ LoRA strength is fixed for the whole run: weights are merged before sampling, so
 
 ### SnapRef tab — reference images
 - **Use a reference** — off by default; plain generation is unchanged when it is off.
-- **Reference images** — one to three, previewed in **Your references**. **Reference model** selects the release (v1a, v2a-pre2, v2s).
-- **What to copy** — `cs` = character + style, `char` = character only, `style` = style only.
+- **Reference images** — one to three, previewed in **Selected references**. **Reference model** selects the release (v1a, v2a-pre2, v2s).
+- **Reference mode** — `cs` = character + style, `char` = character only, `style` = style only.
 - **Layout** — `separate` encodes each card on its own; `stitch` joins them side by side into one reference.
 - **Weight 1**, **Weight 2**, **Weight 3** — per-reference strength.
 
@@ -521,7 +521,7 @@ Inside **Advanced SnapRef settings**:
 - **Enable reference guidance** with **Reference guidance strength** — extra guidance toward the reference; costs an extra model call per step.
 - **Guidance correction** — `apg`, `rescale` or `none`.
 - **Reference caption (optional)** — a short text description of what to transfer.
-- **Reference detail** — total reference resolution; 3.0 = a full megapixel each. Lower is faster and lighter.
+- **Reference budget** — total reference resolution; 3.0 = a full megapixel each. Lower is faster and lighter.
 
 ### Regional tab — different prompts in different places
 Assign a prompt to a box, optionally with its own reference. See *Regional prompting* below for the rules that matter.
@@ -1824,14 +1824,14 @@ def build():
         # trade memory against time in opposite directions, which only reads clearly side by side
         # and at a sensible width -- squeezed into the 7-item row the labels wrapped to three lines.
         with gr.Group(elem_id="anima-batch-group"):
-            gr.Markdown("**How many images**")
+            gr.Markdown("**Batch**")
             with gr.Row():
                 batch_count = gr.Slider(1, MAX_BATCH, value=1, step=1,
-                                        label="Images at once",
-                                        info="One pass together. More memory.")
+                                        label="Batch size",
+                                        info="Images drawn together in one pass. More memory.")
                 runs = gr.Slider(1, 16, value=1, step=1,
-                                 label="Times to run",
-                                 info="One after another. No extra memory.")
+                                 label="Batch count",
+                                 info="How many times to run it. No extra memory.")
 
         with gr.Tabs(elem_id="anima-tabs"):
             with gr.Tab("Settings"):
@@ -1871,7 +1871,7 @@ def build():
                 snapref_on = gr.Checkbox(value=False, label="Use a reference")
                 snapref_upload = gr.File(label="Reference images", file_count="multiple",
                                          file_types=["image"], type="filepath")
-                snapref_preview = gr.Gallery(value=[], label="Your references", columns=4,
+                snapref_preview = gr.Gallery(value=[], label="Selected references", columns=4,
                                              height=190, object_fit="contain", allow_preview=True,
                                              elem_id="anima-snapref-preview",
                                              elem_classes="snapref-preview")
@@ -1880,7 +1880,7 @@ def build():
                     choices=adapters or ["(none found)"],
                     value=adapters[0] if adapters else "(none found)",
                     label="Reference model")
-                snapref_mode = gr.Radio(["cs", "char", "style"], value="cs", label="What to copy",
+                snapref_mode = gr.Radio(["cs", "char", "style"], value="cs", label="Reference mode",
                                         info="cs = person + style · char = person · style = look only")
                 with gr.Accordion("Fine tuning", open=False):
                     snapref_layout = gr.Radio(["separate", "stitch"], value="separate",
@@ -1894,25 +1894,26 @@ def build():
                                                  label="Weight 3")
                     snapref_weights = gr.State([1.0, 1.0, 1.0])
                     snapref_strength = gr.Slider(-2.0, 2.0, value=0.0, step=0.1,
-                                                 label="Influence")
+                                                 label="Reference strength")
                     snapref_fidelity = gr.Slider(0.0, 1.0, value=1.0, step=0.05,
-                                                 label="Faithfulness")
+                                                 label="Fidelity")
                     snapref_in_uncond = gr.Checkbox(value=False,
                                                     label="Also guide the negative side")
-                    snapref_rg_on = gr.Checkbox(value=False, label="Extra reference pass",
+                    snapref_rg_on = gr.Checkbox(value=False, label="Reference guidance",
                                                 info="Slower, often closer.")
                     snapref_rg = gr.Slider(1.0, 10.0, value=4.5, step=0.1,
                                            label="Reference guidance")
                     snapref_correction = gr.Radio(["apg", "rescale", "none"], value="apg",
                                                   label="Correction")
-                    snapref_caption = gr.Textbox(value="", lines=1, label="Describe the reference",
+                    snapref_caption = gr.Textbox(value="", lines=1, label="Reference caption",
                                                  placeholder="blue hair, red jacket")
                     snapref_budget = gr.Slider(0.25, 3.0, value=1.0, step=0.25,
-                                                label="Reference detail",
+                                                label="Reference budget",
                                                 info="3.0 = full detail for one image.")
 
             with gr.Tab("Control"):
                 gr.Markdown("Feed a pose or outline image and the model follows it. "
+                            "Pose: a 3D coloured mannequin on a black background. "
                             "Not available together with Regional.")
                 lllite_on = gr.Checkbox(value=False, label="Use a control image")
                 lllite_upload = gr.Image(
@@ -1921,7 +1922,7 @@ def build():
                 lllite_model_pick = gr.Dropdown(
                     choices=_installed_lllite(), value=_default_lllite(),
                     label="Control type",
-                    info="Pose, outline, or region mask.")
+                    info="Pose (3D mannequin on black), outline, or region mask.")
                 with gr.Row():
                     lllite_strength = gr.Slider(0.0, 2.0, value=1.0, step=0.05,
                                                 label="Strength")
@@ -1947,7 +1948,7 @@ def build():
                     lines=1, label="Common negative")
                 regional_end = gr.Slider(
                     0.10, 1.00, value=0.35, step=0.05,
-                    label="Box window",
+                    label="Regional window",
                     info="How long the boxes guide the image. 0.35 is a good default.")
                 _regional_slots = regional_ui.build_slots(4)
                 _regional_inputs = regional_ui.ordered_inputs(_regional_slots)

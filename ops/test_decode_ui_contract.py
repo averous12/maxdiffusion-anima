@@ -100,8 +100,8 @@ def test_generate_event_wires_reference_budget_slider():
   demo = ui.build()
   config = demo.config
   budget_ids = {c["id"] for c in config["components"]
-                if c.get("props", {}).get("label") == "Reference detail"}
-  # The button is wired to start_gen_runs, the wrapper that repeats start_gen "Times to run"
+                if c.get("props", {}).get("label") == "Reference budget"}
+  # The button is wired to start_gen_runs, the wrapper that repeats start_gen "Batch count"
   # times, so match either rather than pinning the wrapper away.
   generate = next(d for d in config["dependencies"]
                   if str(d.get("api_name") or "").startswith("start_gen"))
